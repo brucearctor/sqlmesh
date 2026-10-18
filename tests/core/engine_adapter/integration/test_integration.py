@@ -101,6 +101,7 @@ def test_catalog_operations(ctx: TestContext):
     if (
         ctx.engine_adapter.catalog_support.is_unsupported
         or ctx.engine_adapter.catalog_support.is_single_catalog_only
+        or ctx.dialect == "doris"
     ):
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
@@ -154,7 +155,7 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
         assert len(results.materialized_views) == 0
         assert len(results.non_temp_tables) == 2
 
-    if ctx.engine_adapter.catalog_support.is_unsupported:
+    if ctx.engine_adapter.catalog_support.is_unsupported or ctx.dialect == "doris":
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
         )
@@ -449,8 +450,22 @@ def test_materialized_view(ctx_query_and_df: TestContext):
     source_table = ctx.table("source_table")
     ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
     view = ctx.table("test_view")
-    view_query = exp.select(*ctx.columns_to_types).from_(source_table)
-    ctx.engine_adapter.create_view(view, view_query, materialized=True)
+    # For Doris synchronized materialized views, we need to use only the table name without schema and add the source table name to the table properties
+    if ctx.engine_adapter.dialect == "doris":
+        view = exp.to_table(view.name)
+        # For Doris, select only the first column name from columns_to_types.
+        # Otherwise, Doris will raise an error if the materialized view has the same schema as the base table.
+        first_column = next(iter(ctx.columns_to_types))
+        view_query = exp.select(first_column).from_(source_table)
+        ctx.engine_adapter.create_view(
+            view,
+            view_query,
+            materialized=True,
+            view_properties={"materialized_type": "SYNC", "source_table": source_table},
+        )
+    else:
+        view_query = exp.select(*ctx.columns_to_types).from_(source_table)
+        ctx.engine_adapter.create_view(view, view_query, materialized=True)
     results = ctx.get_metadata_results()
     # Redshift considers the underlying dataset supporting materialized views as a table therefore we get 2
     # tables in the result
@@ -459,13 +474,31 @@ def test_materialized_view(ctx_query_and_df: TestContext):
     else:
         assert len(results.tables) == 1
     assert len(results.views) == 0
-    assert len(results.materialized_views) == 1
-    assert results.materialized_views[0] == view.name
-    ctx.compare_with_current(view, input_data)
+    # Doris information_schema.tables does not show materialized views and cannot query the synchronized materialized view
+    if ctx.engine_adapter.dialect != "doris":
+        assert len(results.materialized_views) == 1
+        assert results.materialized_views[0] == view.name
+        ctx.compare_with_current(view, input_data)
     # Make sure that dropping a materialized view also works
-    ctx.engine_adapter.drop_view(view, materialized=True)
-    results = ctx.get_metadata_results()
-    assert len(results.materialized_views) == 0
+    if ctx.engine_adapter.dialect == "doris":
+        # Wait for the materialized view to be created by retrying drop until it succeeds
+        def drop_view_success():
+            try:
+                ctx.engine_adapter.drop_view(
+                    view,
+                    ignore_if_not_exists=False,
+                    materialized=True,
+                    view_properties={"materialized_type": "SYNC", "source_table": source_table},
+                )
+                return True
+            except Exception:
+                return False
+
+        wait_until(drop_view_success, attempts=5, wait=1)
+    else:
+        ctx.engine_adapter.drop_view(view, materialized=True)
+        results = ctx.get_metadata_results()
+        assert len(results.materialized_views) == 0
 
 
 def test_drop_schema(ctx: TestContext):
@@ -998,8 +1031,12 @@ def test_merge(ctx_query_and_df: TestContext):
     # Athena only supports MERGE on Iceberg tables
     # And it cant fall back to a logical merge on Hive tables because it cant delete records
     table_format = "iceberg" if ctx.dialect == "athena" else None
+    # Doris needs to have a UNIQUE KEY to use MERGE
+    table_properties = {"unique_key": "id"} if ctx.dialect == "doris" else None
 
-    ctx.engine_adapter.create_table(table, ctx.columns_to_types, table_format=table_format)
+    ctx.engine_adapter.create_table(
+        table, ctx.columns_to_types, table_format=table_format, table_properties=table_properties
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -1064,11 +1101,15 @@ def test_merge_source_columns(ctx_query_and_df: TestContext):
     # Athena only supports MERGE on Iceberg tables
     # And it cant fall back to a logical merge on Hive tables because it cant delete records
     table_format = "iceberg" if ctx.dialect == "athena" else None
+    # Doris needs to have a UNIQUE KEY to use MERGE
+    table_properties = {"unique_key": "id"} if ctx.dialect == "doris" else None
 
     columns_to_types = ctx.columns_to_types.copy()
     columns_to_types["ignored_column"] = exp.DataType.build("int")
 
-    ctx.engine_adapter.create_table(table, columns_to_types, table_format=table_format)
+    ctx.engine_adapter.create_table(
+        table, columns_to_types, table_format=table_format, table_properties=table_properties
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01", "ignored_source": "ignored_value"},
@@ -2684,6 +2725,7 @@ def test_dialects(ctx: TestContext):
                 "spark": pd.Timestamp("2020-01-01 00:00:00"),
                 "databricks": pd.Timestamp("2020-01-01 00:00:00"),
                 "starrocks": pd.Timestamp("2020-01-01 00:00:00"),
+                "doris": pd.Timestamp("2020-01-01 00:00:00"),
             },
         ),
         (
@@ -3246,8 +3288,8 @@ def test_value_normalization(
     if column_type == exp.DataType.Type.TIMESTAMPTZ:
         if ctx.dialect == "trino" and ctx.engine_adapter.current_catalog_type == "hive":
             pytest.skip("Trino on Hive doesn't support TIMESTAMP WITH TIME ZONE fields")
-        if ctx.dialect == "fabric":
-            pytest.skip("Fabric doesn't support TIMESTAMP WITH TIME ZONE fields")
+        if ctx.dialect in ("fabric", "doris"):
+            pytest.skip(f"{ctx.dialect} doesn't support TIMESTAMP WITH TIME ZONE fields")
 
     if not isinstance(ctx.engine_adapter, RowDiffMixin):
         pytest.skip(
@@ -3258,8 +3300,8 @@ def test_value_normalization(
 
     # resolve dialect-specific types
     if column_type in (DATA_TYPE.DATETIME, DATA_TYPE.TIMESTAMP, DATA_TYPE.TIMESTAMPTZ):
-        if ctx.dialect in ("mysql", "trino"):
-            # MySQL needs DATETIME(6) instead of DATETIME or subseconds will be truncated.
+        if ctx.dialect in ("mysql", "trino", "doris"):
+            # MySQL and Doris need DATETIME(6) instead of DATETIME or subseconds will be truncated.
             # It also needs TIMESTAMP(6) as the column type for CREATE TABLE or the truncation will occur
             full_column_type = exp.DataType.build(
                 column_type,
@@ -3283,7 +3325,11 @@ def test_value_normalization(
         exp.to_table(ctx.table("test_value_normalization")), dialect=ctx.dialect
     )
     columns_to_types_normalized = {
-        normalize_identifiers(k, dialect=ctx.dialect).sql(dialect=ctx.dialect): v
+        (
+            normalize_identifiers(k, dialect=ctx.dialect).name
+            if ctx.dialect == "doris"
+            else normalize_identifiers(k, dialect=ctx.dialect).sql(dialect=ctx.dialect)
+        ): v
         for k, v in columns_to_types.items()
     }
 
@@ -3941,6 +3987,10 @@ def test_materialized_view_evaluation(ctx: TestContext):
             "which this generic test does not provide; StarRocks MVs are covered by "
             "test_integration_starrocks.py"
         )
+    elif dialect == "doris":
+        pytest.skip(
+            "Skipping doris as synchronous materialized views do not support specifying schema"
+        )
 
     model_name = ctx.table("test_tbl")
     mview_name = ctx.table("test_mview")
@@ -4008,6 +4058,11 @@ def test_unicode_characters(ctx: TestContext, tmp_path: Path):
     # I also think Spark may not support unicode in general but that would need to be verified.
     if not ctx.engine_adapter.QUOTE_IDENTIFIERS_IN_VIEWS:
         pytest.skip("Skipping as these engines have issues with unicode characters in model names")
+    # Doris default setting `enable_unicode_name_support=false` so it is incompatible with unicode characters in model names
+    if ctx.dialect == "doris":
+        pytest.skip(
+            "Skipping as Doris default setting has issues with unicode characters in model names"
+        )
 
     model_name = "客户数据"
     table = ctx.table(model_name).sql(dialect=ctx.dialect)

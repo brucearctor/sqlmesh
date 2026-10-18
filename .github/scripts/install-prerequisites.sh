@@ -28,6 +28,10 @@ elif [ "$ENGINE" == "fabric" ]; then
     rm packages-microsoft-prod.deb
 
     ENGINE_DEPENDENCIES="msodbcsql18"
+elif [ "$ENGINE" == "doris" ]; then
+    ENGINE_DEPENDENCIES="mysql-client"
+    sudo sysctl -w vm.max_map_count=2000000
+    sudo swapoff -a || true
 fi
 
 ALL_DEPENDENCIES="$COMMON_DEPENDENCIES $ENGINE_DEPENDENCIES"

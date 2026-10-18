@@ -104,6 +104,34 @@ db2_ready() {
     done
 }
 
+doris_ready() {
+    probe_port 9030 || return 1
+    HOSTNAME=${DOCKER_HOSTNAME:-127.0.0.1}
+    if [ "$HOSTNAME" = "localhost" ]; then
+        HOSTNAME="127.0.0.1"
+    fi
+    INIT_SQL="ADMIN SET FRONTEND CONFIG ('default_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('enable_unicode_name_support' = 'true');"
+    if command -v mysql > /dev/null 2>&1; then
+        mysql -h "$HOSTNAME" -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
+        mysql -h "$HOSTNAME" -P 9030 -u root -e "$INIT_SQL" 2>/dev/null
+    else
+        python3 -c "
+import pymysql, sys
+conn = pymysql.connect(host='$HOSTNAME', port=9030, user='root', autocommit=True)
+with conn.cursor() as cur:
+    cur.execute('SHOW BACKENDS')
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    alive_idx = cols.index('Alive')
+    if not rows or not any(str(r[alive_idx]).lower() == 'true' for r in rows):
+        sys.exit(1)
+    for cfg in ('default_replication_num', 'force_olap_table_replication_num'):
+        cur.execute(f\"ADMIN SET FRONTEND CONFIG ('{cfg}' = '1')\")
+    cur.execute(\"ADMIN SET FRONTEND CONFIG ('enable_unicode_name_support' = 'true')\")
+" 2>/dev/null
+    fi
+}
+
 echo "Waiting for $ENGINE to be ready..."
 
 READINESS_FUNC="${ENGINE}_ready"

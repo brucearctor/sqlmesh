@@ -80,6 +80,7 @@ ENGINES = [
     IntegrationTestEngine("clickhouse", catalog_types=["standalone", "cluster"]),
     IntegrationTestEngine("risingwave"),
     IntegrationTestEngine("starrocks"),
+    IntegrationTestEngine("doris"),
     # Cloud engines that need paid accounts / special credentials
     IntegrationTestEngine("clickhouse_cloud", cloud=True),
     IntegrationTestEngine("redshift", cloud=True),
@@ -276,6 +277,7 @@ class TestContext:
             if v.sql().lower().startswith("timestamp")
             or (v.sql().lower() == "datetime" and self.dialect == "bigquery")
             or (v.sql().lower() == "datetime" and self.dialect == "starrocks")
+            or (v.sql().lower() == "datetime" and self.dialect == "doris")
         ]
 
     @property
@@ -462,7 +464,7 @@ class TestContext:
                     AND pgc.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
-        elif self.dialect in ["mysql", "snowflake", "starrocks"]:
+        elif self.dialect in ["mysql", "snowflake", "starrocks", "doris"]:
             # Snowflake treats all identifiers as uppercase unless they are lowercase and quoted.
             # They are lowercase and quoted in sushi but not in the inline tests.
             if self.dialect == "snowflake" and snowflake_capitalize_ids:
@@ -473,6 +475,7 @@ class TestContext:
                 "mysql": "table_comment",
                 "snowflake": "comment",
                 "starrocks": "table_comment",
+                "doris": "table_comment",
             }
 
             query = f"""
@@ -594,7 +597,7 @@ class TestContext:
                     AND pgc.relkind = '{"v" if table_kind == "VIEW" else "r"}'
                 ;
             """
-        elif self.dialect in ["mysql", "snowflake", "trino", "starrocks"]:
+        elif self.dialect in ["mysql", "snowflake", "trino", "starrocks", "doris"]:
             # Snowflake treats all identifiers as uppercase unless they are lowercase and quoted.
             # They are lowercase and quoted in sushi but not in the inline tests.
             if self.dialect == "snowflake" and snowflake_capitalize_ids:
@@ -606,6 +609,7 @@ class TestContext:
                 "snowflake": "comment",
                 "trino": "comment",
                 "starrocks": "column_comment",
+                "doris": "column_comment",
             }
 
             query = f"""
