@@ -986,6 +986,17 @@ class DorisEngineAdapter(
             else:
                 raise
 
+    @staticmethod
+    def _sanitize_key_value(val: t.Any) -> t.Any:
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return val
+
     def _delete_by_literal_keys(
         self,
         table_name: TableName,
@@ -1007,17 +1018,7 @@ class DorisEngineAdapter(
         cols = [exp.column(k.name, quoted=True) for k in key_exprs]
         batch_size = self.DEFAULT_BATCH_SIZE
 
-        def _sanitize(val: t.Any) -> t.Any:
-            if val is None:
-                return None
-            try:
-                if pd.isna(val):
-                    return None
-            except (TypeError, ValueError):
-                pass
-            return val
-
-        sanitized_rows = [tuple(_sanitize(v) for v in row) for row in rows]
+        sanitized_rows = [tuple(self._sanitize_key_value(v) for v in row) for row in rows]
 
         if len(cols) == 1:
             col = cols[0]
@@ -1269,6 +1270,20 @@ class DorisEngineAdapter(
 
         return parsed_partitioned_by, partition_kind
 
+    @staticmethod
+    def _to_raw_partition_sql(expr: t.Union[exp.Literal, exp.Var, str, t.Any]) -> exp.Var:
+        if isinstance(expr, exp.Literal):
+            raw_text = str(expr.this)
+        elif isinstance(expr, exp.Var):
+            raw_text = str(expr.this)
+        elif isinstance(expr, str):
+            raw_text = expr
+        else:
+            return expr
+        if ";" in raw_text or "--" in raw_text or "/*" in raw_text:
+            raise SQLMeshError(f"Invalid partition definition expression: {raw_text}")
+        return exp.Var(this=raw_text, quoted=False)
+
     def _build_partitioned_by_exp(
         self,
         partitioned_by: t.List[exp.Expr],
@@ -1309,25 +1324,12 @@ class DorisEngineAdapter(
         if not partitions and not is_auto and not dynamic_partition_enabled:
             return None
 
-        def to_raw_sql(expr: t.Union[exp.Literal, exp.Var, str, t.Any]) -> exp.Var:
-            if isinstance(expr, exp.Literal):
-                raw_text = str(expr.this)
-            elif isinstance(expr, exp.Var):
-                raw_text = str(expr.this)
-            elif isinstance(expr, str):
-                raw_text = expr
-            else:
-                return expr
-            if ";" in raw_text or "--" in raw_text or "/*" in raw_text:
-                raise SQLMeshError(f"Invalid partition definition expression: {raw_text}")
-            return exp.Var(this=raw_text, quoted=False)
-
         create_expressions: t.Optional[t.List[exp.Expr]] = None
         if partitions:
             if isinstance(partitions, exp.Tuple):
-                create_expressions = [to_raw_sql(e) for e in partitions.expressions]
+                create_expressions = [self._to_raw_partition_sql(e) for e in partitions.expressions]
             else:
-                create_expressions = [to_raw_sql(partitions)]
+                create_expressions = [self._to_raw_partition_sql(partitions)]
         elif is_auto or dynamic_partition_enabled:
             create_expressions = []
 

@@ -111,7 +111,10 @@ doris_ready() {
         HOSTNAME="127.0.0.1"
     fi
     INIT_SQL="ADMIN SET FRONTEND CONFIG ('default_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('enable_unicode_name_support' = 'true');"
-    if command -v mysql > /dev/null 2>&1; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'doris-fe-01'; then
+        docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
+        docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "$INIT_SQL" 2>/dev/null
+    elif command -v mysql > /dev/null 2>&1; then
         mysql -h "$HOSTNAME" -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
         mysql -h "$HOSTNAME" -P 9030 -u root -e "$INIT_SQL" 2>/dev/null
     else
