@@ -891,10 +891,19 @@ class DorisEngineAdapter(
         else:
             key_exprs = [lhs.copy()]
 
-        if not key_exprs or not all(isinstance(k, exp.Column) for k in key_exprs):
+        normalized_keys: t.List[exp.Expr] = []
+        for k in key_exprs:
+            if isinstance(k, exp.Column):
+                normalized_keys.append(k)
+            elif isinstance(k, exp.Identifier):
+                normalized_keys.append(exp.Column(this=k.copy()))
+            else:
+                return None
+
+        if not normalized_keys:
             return None
 
-        return key_exprs, subquery, extra_conditions
+        return normalized_keys, subquery, extra_conditions
 
     @staticmethod
     def _unwrap_concat_ws(expr: exp.Expr) -> t.Optional[exp.Expr]:

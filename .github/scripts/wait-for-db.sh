@@ -110,7 +110,7 @@ doris_ready() {
     if [ "$HOSTNAME" = "localhost" ]; then
         HOSTNAME="127.0.0.1"
     fi
-    INIT_SQL="ADMIN SET FRONTEND CONFIG ('default_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1'); ADMIN SET FRONTEND CONFIG ('enable_unicode_name_support' = 'true');"
+    INIT_SQL="ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1');"
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'doris-fe-01'; then
         docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
         docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "$INIT_SQL" 2>/dev/null
@@ -128,9 +128,7 @@ with conn.cursor() as cur:
     alive_idx = cols.index('Alive')
     if not rows or not any(str(r[alive_idx]).lower() == 'true' for r in rows):
         sys.exit(1)
-    for cfg in ('default_replication_num', 'force_olap_table_replication_num'):
-        cur.execute(f\"ADMIN SET FRONTEND CONFIG ('{cfg}' = '1')\")
-    cur.execute(\"ADMIN SET FRONTEND CONFIG ('enable_unicode_name_support' = 'true')\")
+    cur.execute(\"ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1')\")
 " 2>/dev/null
     fi
 }

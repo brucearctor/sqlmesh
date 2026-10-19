@@ -1277,3 +1277,27 @@ def test_adjust_physical_properties_for_incremental(
     assert to_sql_calls(adapter) == [
         "CREATE TABLE IF NOT EXISTS `db`.`incremental_model` (`id` INT, `name` VARCHAR(50)) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10"
     ]
+
+
+def test_merge_with_identifier_unique_key(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+    adapter.merge(
+        target_table="db.target",
+        source_table=parse_one("SELECT id, ds FROM db.src"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+        },
+        unique_key=[exp.to_identifier("id")],
+    )
+    sql_calls = to_sql_calls(adapter)
+    assert any(
+        call.startswith(
+            "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`__temp_target_abcd1234`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id`"
+        )
+        for call in sql_calls
+    )

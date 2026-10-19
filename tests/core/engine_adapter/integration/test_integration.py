@@ -440,6 +440,12 @@ def test_materialized_view(ctx_query_and_df: TestContext):
             "which this generic test does not provide; StarRocks MVs are covered by "
             "test_integration_starrocks.py"
         )
+    if ctx.engine_adapter.dialect == "doris":
+        pytest.skip(
+            "Doris materialized views require engine-specific properties (SYNC source_table or MTMV DISTRIBUTED BY), "
+            "which this generic test does not provide; Doris MVs are covered by "
+            "test_integration_doris.py"
+        )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -450,22 +456,8 @@ def test_materialized_view(ctx_query_and_df: TestContext):
     source_table = ctx.table("source_table")
     ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
     view = ctx.table("test_view")
-    # For Doris synchronized materialized views, we need to use only the table name without schema and add the source table name to the table properties
-    if ctx.engine_adapter.dialect == "doris":
-        view = exp.to_table(view.name)
-        # For Doris, select only the first column name from columns_to_types.
-        # Otherwise, Doris will raise an error if the materialized view has the same schema as the base table.
-        first_column = next(iter(ctx.columns_to_types))
-        view_query = exp.select(first_column).from_(source_table)
-        ctx.engine_adapter.create_view(
-            view,
-            view_query,
-            materialized=True,
-            view_properties={"materialized_type": "SYNC", "source_table": source_table},
-        )
-    else:
-        view_query = exp.select(*ctx.columns_to_types).from_(source_table)
-        ctx.engine_adapter.create_view(view, view_query, materialized=True)
+    view_query = exp.select(*ctx.columns_to_types).from_(source_table)
+    ctx.engine_adapter.create_view(view, view_query, materialized=True)
     results = ctx.get_metadata_results()
     # Redshift considers the underlying dataset supporting materialized views as a table therefore we get 2
     # tables in the result
@@ -474,31 +466,13 @@ def test_materialized_view(ctx_query_and_df: TestContext):
     else:
         assert len(results.tables) == 1
     assert len(results.views) == 0
-    # Doris information_schema.tables does not show materialized views and cannot query the synchronized materialized view
-    if ctx.engine_adapter.dialect != "doris":
-        assert len(results.materialized_views) == 1
-        assert results.materialized_views[0] == view.name
-        ctx.compare_with_current(view, input_data)
+    assert len(results.materialized_views) == 1
+    assert results.materialized_views[0] == view.name
+    ctx.compare_with_current(view, input_data)
     # Make sure that dropping a materialized view also works
-    if ctx.engine_adapter.dialect == "doris":
-        # Wait for the materialized view to be created by retrying drop until it succeeds
-        def drop_view_success():
-            try:
-                ctx.engine_adapter.drop_view(
-                    view,
-                    ignore_if_not_exists=False,
-                    materialized=True,
-                    view_properties={"materialized_type": "SYNC", "source_table": source_table},
-                )
-                return True
-            except Exception:
-                return False
-
-        wait_until(drop_view_success, attempts=5, wait=1)
-    else:
-        ctx.engine_adapter.drop_view(view, materialized=True)
-        results = ctx.get_metadata_results()
-        assert len(results.materialized_views) == 0
+    ctx.engine_adapter.drop_view(view, materialized=True)
+    results = ctx.get_metadata_results()
+    assert len(results.materialized_views) == 0
 
 
 def test_drop_schema(ctx: TestContext):
@@ -1031,12 +1005,8 @@ def test_merge(ctx_query_and_df: TestContext):
     # Athena only supports MERGE on Iceberg tables
     # And it cant fall back to a logical merge on Hive tables because it cant delete records
     table_format = "iceberg" if ctx.dialect == "athena" else None
-    # Doris needs to have a UNIQUE KEY to use MERGE
-    table_properties = {"unique_key": "id"} if ctx.dialect == "doris" else None
 
-    ctx.engine_adapter.create_table(
-        table, ctx.columns_to_types, table_format=table_format, table_properties=table_properties
-    )
+    ctx.engine_adapter.create_table(table, ctx.columns_to_types, table_format=table_format)
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -1101,15 +1071,11 @@ def test_merge_source_columns(ctx_query_and_df: TestContext):
     # Athena only supports MERGE on Iceberg tables
     # And it cant fall back to a logical merge on Hive tables because it cant delete records
     table_format = "iceberg" if ctx.dialect == "athena" else None
-    # Doris needs to have a UNIQUE KEY to use MERGE
-    table_properties = {"unique_key": "id"} if ctx.dialect == "doris" else None
 
     columns_to_types = ctx.columns_to_types.copy()
     columns_to_types["ignored_column"] = exp.DataType.build("int")
 
-    ctx.engine_adapter.create_table(
-        table, columns_to_types, table_format=table_format, table_properties=table_properties
-    )
+    ctx.engine_adapter.create_table(table, columns_to_types, table_format=table_format)
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01", "ignored_source": "ignored_value"},
@@ -4058,7 +4024,7 @@ def test_unicode_characters(ctx: TestContext, tmp_path: Path):
     # I also think Spark may not support unicode in general but that would need to be verified.
     if not ctx.engine_adapter.QUOTE_IDENTIFIERS_IN_VIEWS:
         pytest.skip("Skipping as these engines have issues with unicode characters in model names")
-    # Doris default setting `enable_unicode_name_support=false` so it is incompatible with unicode characters in model names
+    # Doris static fe.conf setting `enable_unicode_name_support` defaults to false (and is not runtime-mutable)
     if ctx.dialect == "doris":
         pytest.skip(
             "Skipping as Doris default setting has issues with unicode characters in model names"

@@ -2851,6 +2851,9 @@ class DorisConnectionConfig(ConnectionConfig):
 
         return init
 
+    def get_catalog(self) -> t.Optional[str]:
+        return self.catalog
+
 
 CONNECTION_CONFIG_TO_TYPE = {
     # Map all subclasses of ConnectionConfig to the value of their `type_` field.

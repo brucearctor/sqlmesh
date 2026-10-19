@@ -98,3 +98,125 @@ def test_doris_iceberg_local_catalog(ctx: TestContext):
         except Exception:
             pass
         adapter.set_current_catalog("internal")
+
+
+def test_materialized_view_sync(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+    from tests.core.engine_adapter.integration import wait_until
+
+    input_data = pd.DataFrame(
+        [
+            {"id": 1, "ds": "2022-01-01"},
+            {"id": 2, "ds": "2022-01-02"},
+            {"id": 3, "ds": "2022-01-03"},
+        ]
+    )
+    source_table = ctx.table("source_table")
+    ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
+    view = exp.to_table("test_sync_mv")
+    first_column = next(iter(ctx.columns_to_types))
+    view_query = exp.select(first_column).from_(source_table)
+    ctx.engine_adapter.create_view(
+        view,
+        view_query,
+        materialized=True,
+        view_properties={
+            "materialized_type": exp.Literal.string("SYNC"),
+            "source_table": source_table,
+        },
+    )
+
+    def drop_view_success() -> bool:
+        try:
+            ctx.engine_adapter.drop_view(
+                view,
+                ignore_if_not_exists=False,
+                materialized=True,
+                view_properties={
+                    "materialized_type": exp.Literal.string("SYNC"),
+                    "source_table": source_table,
+                },
+            )
+            return True
+        except Exception:
+            return False
+
+    wait_until(drop_view_success, attempts=5, wait=1)
+
+
+def test_materialized_view_async_mtmv(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+    from tests.core.engine_adapter.integration import wait_until
+
+    input_data = pd.DataFrame(
+        [
+            {"id": 1, "ds": "2022-01-01"},
+            {"id": 2, "ds": "2022-01-02"},
+            {"id": 3, "ds": "2022-01-03"},
+        ]
+    )
+    source_table = ctx.table("mtmv_source")
+    ctx.engine_adapter.ctas(source_table, ctx.input_data(input_data), ctx.columns_to_types)
+    view = ctx.table("test_async_mtmv")
+    view_query = exp.select(*ctx.columns_to_types).from_(source_table)
+    ctx.engine_adapter.create_view(
+        view,
+        view_query,
+        materialized=True,
+        view_properties={
+            "build": exp.Literal.string("IMMEDIATE"),
+            "refresh": exp.Literal.string("COMPLETE"),
+            "refresh_trigger": exp.Literal.string("ON MANUAL"),
+            "distributed_by": exp.Literal.string("RANDOM BUCKETS AUTO"),
+        },
+    )
+    wait_until(lambda: len(ctx.get_current_data(view)) == len(input_data), attempts=10, wait=1)
+    ctx.compare_with_current(view, input_data)
+    ctx.engine_adapter.drop_view(view, materialized=True)
+
+
+def test_merge_unique_key(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+
+    table = ctx.table("test_merge_uk")
+    ctx.engine_adapter.create_table(
+        table,
+        ctx.columns_to_types,
+        table_properties={"unique_key": exp.Literal.string("id")},
+    )
+    input_data = pd.DataFrame(
+        [
+            {"id": 1, "ds": "2022-01-01"},
+            {"id": 2, "ds": "2022-01-02"},
+            {"id": 3, "ds": "2022-01-03"},
+        ]
+    )
+    ctx.engine_adapter.merge(
+        table,
+        ctx.input_data(input_data),
+        target_columns_to_types=None,
+        unique_key=[exp.to_identifier("id")],
+    )
+    merge_data = pd.DataFrame(
+        [
+            {"id": 2, "ds": "2022-01-10"},
+            {"id": 4, "ds": "2022-01-04"},
+        ]
+    )
+    ctx.engine_adapter.merge(
+        table,
+        ctx.input_data(merge_data),
+        target_columns_to_types=None,
+        unique_key=[exp.to_identifier("id")],
+    )
+    ctx.compare_with_current(
+        table,
+        pd.DataFrame(
+            [
+                {"id": 1, "ds": "2022-01-01"},
+                {"id": 2, "ds": "2022-01-10"},
+                {"id": 3, "ds": "2022-01-03"},
+                {"id": 4, "ds": "2022-01-04"},
+            ]
+        ),
+    )
