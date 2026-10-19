@@ -6,6 +6,7 @@ import logging
 import re
 import typing as t
 
+import pandas as pd  # noqa: TID253
 from sqlglot import exp, parse, parse_one
 
 from sqlmesh.core.dialect import to_schema
@@ -430,12 +431,12 @@ class DorisEngineAdapter(
             if materialized:
                 raise SQLMeshError(
                     f"Doris only supports creating materialized views in the 'internal' catalog, got '{effective_catalog}' "
-                    f"for view '{target_table.sql(dialect=self.dialect)}'."
+                    f"for view '{self._to_sql(target_table)}'."
                 )
             logger.warning(
                 "Skipping view creation for '%s' because Doris does not support creating views in external catalog '%s'. "
                 "Configure `environment_catalog_mapping` in your SQLMesh configuration to route virtual environment views to the 'internal' catalog.",
-                target_table.sql(dialect=self.dialect),
+                self._to_sql(target_table),
                 effective_catalog,
             )
             return
@@ -485,10 +486,11 @@ class DorisEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
         **create_kwargs: t.Any,
     ) -> None:
-        import pandas as pd
-
         query_or_df = self._native_df_to_pandas_df(query_or_df)
 
+        # Inline DataFrames as a SELECT ... FROM VALUES query rather than delegating DataFrame
+        # handling to _get_source_queries_and_columns_to_types, which would otherwise materialize
+        # a temporary table that gets dropped as soon as the SourceQuery context manager exits.
         if isinstance(query_or_df, pd.DataFrame):
             values: t.List[t.Tuple[t.Any, ...]] = list(
                 query_or_df.itertuples(index=False, name=None)
@@ -594,7 +596,10 @@ class DorisEngineAdapter(
                         aliased_selects.append(sel_expr)
                 query.set("expressions", aliased_selects)
 
-            if not target_table.db:
+            # Doris synchronous materialized views are single-table rollup indexes whose DDL syntax
+            # (`CREATE MATERIALIZED VIEW <mv_name> AS SELECT ... FROM <db>.<table>`) forbids a
+            # `<db>.` qualifier on `<mv_name>` and requires an active database on the session.
+            if is_sync_mv and not target_table.db:
                 source_db: t.Optional[str] = None
                 if view_properties and view_properties.get("source_table"):
                     raw_src = view_properties["source_table"]
@@ -610,9 +615,7 @@ class DorisEngineAdapter(
                     if first_tbl and first_tbl.db:
                         source_db = first_tbl.db
                 if source_db:
-                    db_sql = exp.to_identifier(source_db, quoted=True).sql(
-                        dialect=self.dialect, identify=True
-                    )
+                    db_sql = self._to_sql(exp.to_identifier(source_db, quoted=True))
                     self.execute(f"USE {db_sql}")
 
             self.execute(
@@ -645,7 +648,7 @@ class DorisEngineAdapter(
             mat_type = self._extract_str_value(view_properties.get("materialized_type"))
             source_table = view_properties.get("source_table")
             if mat_type and mat_type.upper() == "SYNC" and source_table:
-                view_table_sql = target_table.sql(dialect=self.dialect, identify=True)
+                view_table_sql = self._to_sql(target_table)
                 if isinstance(source_table, exp.Column):
                     source_tbl_exp = exp.table_(
                         source_table.name,
@@ -657,12 +660,12 @@ class DorisEngineAdapter(
                 else:
                     source_table_str = self._extract_str_value(source_table) or str(source_table)
                     source_tbl_exp = exp.to_table(source_table_str, dialect=self.dialect)
+                # Unqualified synchronous materialized views require the source table's database
+                # to be active on the session before executing `DROP MATERIALIZED VIEW <mv> ON <tbl>`.
                 if not target_table.db and source_tbl_exp.db:
-                    db_sql = exp.to_identifier(source_tbl_exp.db, quoted=True).sql(
-                        dialect=self.dialect, identify=True
-                    )
+                    db_sql = self._to_sql(exp.to_identifier(source_tbl_exp.db, quoted=True))
                     self.execute(f"USE {db_sql}")
-                source_table_sql = source_tbl_exp.sql(dialect=self.dialect, identify=True)
+                source_table_sql = self._to_sql(source_tbl_exp)
                 exists_clause = "IF EXISTS " if ignore_if_not_exists else ""
                 self.execute(
                     f"DROP MATERIALIZED VIEW {exists_clause}{view_table_sql} ON {source_table_sql}"
@@ -696,21 +699,19 @@ class DorisEngineAdapter(
     def _build_create_comment_table_exp(
         self, table: exp.Table, table_comment: str, table_kind: str = "TABLE"
     ) -> exp.Comment | str:
-        table_sql = table.sql(dialect=self.dialect, identify=True)
-        comment_sql = exp.Literal.string(self._truncate_table_comment(table_comment.strip())).sql(
-            dialect=self.dialect
+        table_sql = self._to_sql(table)
+        comment_sql = self._to_sql(
+            exp.Literal.string(self._truncate_table_comment(table_comment.strip()))
         )
         return f"ALTER TABLE {table_sql} MODIFY COMMENT {comment_sql}"
 
     def _build_create_comment_column_exp(
         self, table: exp.Table, column_name: str, column_comment: str, table_kind: str = "TABLE"
     ) -> exp.Comment | str:
-        table_sql = table.sql(dialect=self.dialect, identify=True)
-        col_sql = exp.to_identifier(column_name, quoted=True).sql(
-            dialect=self.dialect, identify=True
-        )
-        comment_sql = exp.Literal.string(self._truncate_column_comment(column_comment.strip())).sql(
-            dialect=self.dialect
+        table_sql = self._to_sql(table)
+        col_sql = self._to_sql(exp.to_identifier(column_name, quoted=True))
+        comment_sql = self._to_sql(
+            exp.Literal.string(self._truncate_column_comment(column_comment.strip()))
         )
         return f"ALTER TABLE {table_sql} MODIFY COLUMN {col_sql} COMMENT {comment_sql}"
 
@@ -727,6 +728,10 @@ class DorisEngineAdapter(
                     raise e
                 caught_err = e
 
+        # When TRUNCATE TABLE is unsupported (e.g., on Iceberg tables), clear all rows via DELETE.
+        # Doris's DeleteHandler rejects DELETE without WHERE, constant WHERE TRUE, OR predicates,
+        # and floating-point/complex column predicates, so we pick a key-compatible column and
+        # execute two complementary `IS NOT NULL` and `IS NULL` deletes.
         cols_to_types = self.columns(table_name)
         if cols_to_types:
             valid_col_name = next(
@@ -997,8 +1002,6 @@ class DorisEngineAdapter(
         rows = self.fetchall(select_query)
         if not rows:
             return
-
-        import pandas as pd
 
         extra_conditions = extra_conditions or []
         cols = [exp.column(k.name, quoted=True) for k in key_exprs]
