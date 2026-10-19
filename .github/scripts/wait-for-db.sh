@@ -105,32 +105,43 @@ db2_ready() {
 }
 
 doris_ready() {
-    probe_port 9030 || return 1
-    HOSTNAME=${DOCKER_HOSTNAME:-127.0.0.1}
-    if [ "$HOSTNAME" = "localhost" ]; then
-        HOSTNAME="127.0.0.1"
-    fi
-    INIT_SQL="ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1');"
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'doris-fe-01'; then
-        docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
-        docker exec -i doris-fe-01 mysql -h127.0.0.1 -P9030 -uroot -e "$INIT_SQL" 2>/dev/null
-    elif command -v mysql > /dev/null 2>&1; then
-        mysql -h "$HOSTNAME" -P 9030 -u root -e "SHOW BACKENDS\G" 2>/dev/null | grep -q "Alive: true" && \
-        mysql -h "$HOSTNAME" -P 9030 -u root -e "$INIT_SQL" 2>/dev/null
-    else
-        python3 -c "
-import pymysql, sys
-conn = pymysql.connect(host='$HOSTNAME', port=9030, user='root', autocommit=True)
-with conn.cursor() as cur:
-    cur.execute('SHOW BACKENDS')
-    rows = cur.fetchall()
-    cols = [d[0] for d in cur.description]
-    alive_idx = cols.index('Alive')
-    if not rows or not any(str(r[alive_idx]).lower() == 'true' for r in rows):
-        sys.exit(1)
-    cur.execute(\"ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1')\")
-" 2>/dev/null
-    fi
+    probe_port 9030
+
+    echo "Waiting for Doris FE to accept SQL connections..."
+    while true; do
+        if docker exec -i doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "SHOW FRONTENDS\G" 2>/dev/null | grep -q "Alive: true"; then
+            echo "Doris FE is alive"
+            break
+        fi
+        sleep 2
+    done
+
+    docker exec -i doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND '172.30.80.3:9050';" 2>/dev/null || true
+
+    echo "Checking for 1 alive Doris backends..."
+    while true; do
+        echo "Checking Doris backends..."
+        ALIVE_BACKENDS=$(docker exec -i doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "show backends \G" 2>/dev/null | grep -c "^ *Alive: true *$")
+
+        # fallback value if failed to get number
+        if ! [[ "$ALIVE_BACKENDS" =~ ^[0-9]+$ ]]; then
+            echo "WARN: Unable to parse number of alive backends, got: '$ALIVE_BACKENDS'"
+            ALIVE_BACKENDS=0
+        fi
+
+        echo "Found $ALIVE_BACKENDS alive backends"
+
+        if [ "$ALIVE_BACKENDS" -ge 1 ]; then
+            echo "Doris has 1 or more alive backends"
+            break
+        fi
+
+        echo "Waiting for more backends to become alive..."
+        sleep 3
+    done
+
+    # set default replication num to 1 (there is only one be in the docker compose file)
+    docker exec -i doris-fe mysql -h127.0.0.1 -P9030 -uroot -e "ADMIN SET FRONTEND CONFIG ('force_olap_table_replication_num' = '1');"
 }
 
 echo "Waiting for $ENGINE to be ready..."

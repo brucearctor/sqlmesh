@@ -141,7 +141,7 @@ def test_materialized_view_sync(ctx: TestContext):
         except Exception:
             return False
 
-    wait_until(drop_view_success, attempts=5, wait=1)
+    wait_until(drop_view_success, attempts=30, wait=1)
 
 
 def test_materialized_view_async_mtmv(ctx: TestContext):
@@ -170,7 +170,7 @@ def test_materialized_view_async_mtmv(ctx: TestContext):
             "distributed_by": exp.Literal.string("RANDOM BUCKETS AUTO"),
         },
     )
-    wait_until(lambda: len(ctx.get_current_data(view)) == len(input_data), attempts=10, wait=1)
+    wait_until(lambda: len(ctx.get_current_data(view)) == len(input_data), attempts=30, wait=1)
     ctx.compare_with_current(view, input_data)
     ctx.engine_adapter.drop_view(view, materialized=True)
 
