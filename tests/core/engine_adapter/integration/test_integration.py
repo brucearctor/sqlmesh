@@ -101,10 +101,13 @@ def test_catalog_operations(ctx: TestContext):
     if (
         ctx.engine_adapter.catalog_support.is_unsupported
         or ctx.engine_adapter.catalog_support.is_single_catalog_only
-        or ctx.dialect == "doris"
     ):
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
+        )
+    if ctx.dialect == "doris":
+        pytest.skip(
+            "Doris external catalogs require connector properties (`CREATE CATALOG ... PROPERTIES (...)`); covered in test_integration_doris.py"
         )
 
     # use a unique name so that integration tests on cloud databases can run in parallel
@@ -155,9 +158,13 @@ def test_drop_schema_catalog(ctx: TestContext, caplog):
         assert len(results.materialized_views) == 0
         assert len(results.non_temp_tables) == 2
 
-    if ctx.engine_adapter.catalog_support.is_unsupported or ctx.dialect == "doris":
+    if ctx.engine_adapter.catalog_support.is_unsupported:
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
+        )
+    if ctx.dialect == "doris":
+        pytest.skip(
+            "Doris external catalogs require connector properties and do not support views; covered in test_integration_doris.py"
         )
     if ctx.dialect == "spark":
         pytest.skip(

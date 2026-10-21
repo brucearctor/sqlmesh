@@ -34,6 +34,7 @@ pip install "sqlmesh[doris]"
 | `connect_timeout` | Connection timeout in seconds (Default: `10`) | int | N |
 | `read_timeout` | Read timeout in seconds | int | N |
 | `write_timeout` | Write timeout in seconds | int | N |
+| `pre_ping` | Whether to ping the connection before executing a statement and reconnect if lost (Default: `False`) | bool | N |
 | `session_variables` | Session variables to set on each new connection via `SET <key> = <value>` (e.g., `workload_group`, `query_timeout`) | dict | N |
 | `ssl` | Explicit SSL configuration dictionary passed to `PyMySQL` | dict | N |
 | `ssl_disabled` | Whether SSL is disabled | bool | N |

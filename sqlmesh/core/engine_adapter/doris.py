@@ -245,13 +245,13 @@ class DorisEngineAdapter(
         return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
 
     _SAFE_RETRY_SQL_PREFIX_RE = re.compile(
-        r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH|SET)\b",
+        r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH)\b",
         re.IGNORECASE | re.DOTALL,
     )
 
     @classmethod
     def _is_safe_to_retry_sql(cls, sql: str) -> bool:
-        """Returns True only for read-only or idempotent session statements that cannot duplicate writes."""
+        """Returns True only for read-only or idempotent catalog/database switch statements that cannot duplicate writes."""
         return bool(cls._SAFE_RETRY_SQL_PREFIX_RE.match(sql))
 
     def ping(self) -> None:
@@ -272,8 +272,13 @@ class DorisEngineAdapter(
             is_disconnect = (err_code in (2006, 2013, 2055) and err_name == "OperationalError") or (
                 err_code == 0 and err_name == "InterfaceError"
             )
+            is_timeout = (
+                isinstance(getattr(e, "__context__", None), TimeoutError)
+                or "timed out" in str(e).lower()
+            )
             if (
                 is_disconnect
+                and not is_timeout
                 and not self._connection_pool.is_transaction_active
                 and self._is_safe_to_retry_sql(sql)
             ):
@@ -287,6 +292,8 @@ class DorisEngineAdapter(
                 conn.ping(reconnect=True)
                 super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
             else:
+                if is_disconnect and not self._connection_pool.is_transaction_active:
+                    self._connection_pool.close()
                 raise
 
     def columns(
@@ -450,9 +457,9 @@ class DorisEngineAdapter(
     ) -> None:
         """
         Doris view creation behavior:
-        - Regular VIEW: supports atomic `CREATE OR REPLACE VIEW` (since Doris 2.0) via `super().create_view`.
+        - Regular VIEW: supports atomic `CREATE OR REPLACE VIEW` via `super().create_view`.
         - MATERIALIZED VIEW: does NOT support `CREATE OR REPLACE MATERIALIZED VIEW`, so `replace=True`
-          drops any existing object/materialized view first before creating the new one.
+          drops any existing object/materialized view first (after validating the new query and properties).
         """
         target_table = exp.to_table(view_name)
         effective_catalog = target_table.catalog or self.default_catalog
@@ -480,21 +487,11 @@ class DorisEngineAdapter(
                 **create_kwargs,
             )
 
-        # Doris does not support `CREATE OR REPLACE MATERIALIZED VIEW`, so drop first when `replace=True`.
-        if replace:
-            self.drop_data_object_on_type_mismatch(
-                self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
-            )
-            self.drop_view(
-                view_name,
-                ignore_if_not_exists=True,
-                materialized=True,
-                view_properties=view_properties,
-            )
         self._create_materialized_view(
             view_name,
             query_or_df,
             target_columns_to_types=target_columns_to_types,
+            replace=replace,
             materialized_properties=materialized_properties,
             table_description=table_description,
             column_descriptions=column_descriptions,
@@ -508,6 +505,7 @@ class DorisEngineAdapter(
         view_name: TableName,
         query_or_df: QueryOrDF,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        replace: bool = True,
         materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
@@ -624,6 +622,19 @@ class DorisEngineAdapter(
                     else:
                         aliased_selects.append(sel_expr)
                 query.set("expressions", aliased_selects)
+
+            # Doris does not support `CREATE OR REPLACE MATERIALIZED VIEW`, so drop first when `replace=True`
+            # after query and table property validation has succeeded.
+            if replace:
+                self.drop_data_object_on_type_mismatch(
+                    self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
+                )
+                self.drop_view(
+                    view_name,
+                    ignore_if_not_exists=True,
+                    materialized=True,
+                    view_properties=view_properties,
+                )
 
             # Doris synchronous materialized views are single-table rollup indexes whose DDL syntax
             # (`CREATE MATERIALIZED VIEW <mv_name> AS SELECT ... FROM <db>.<table>`) forbids a

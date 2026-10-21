@@ -909,6 +909,7 @@ def test_execute_operational_error_reconnect(
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
     conn_mock = mocker.MagicMock()
     mocker.patch.object(adapter._connection_pool, "get", return_value=conn_mock)
+    close_spy = mocker.spy(adapter._connection_pool, "close")
 
     call_count = 0
 
@@ -919,13 +920,34 @@ def test_execute_operational_error_reconnect(
             raise OperationalError(2013, "Lost connection to MySQL server during query")
 
     adapter.cursor.execute.side_effect = side_effect
-    adapter._execute("SELECT 1")
+    adapter._execute("WITH `cte` AS (SELECT 1) SELECT * FROM `cte`")
 
     assert call_count == 2
     conn_mock.ping.assert_called_once_with(reconnect=True)
 
+    # Read timeout (2013 with TimeoutError / "timed out") must NOT be retried even for SELECT
+    conn_mock.reset_mock()
+    close_spy.reset_mock()
+    timeout_calls = 0
+
+    def timeout_side_effect(*args, **kwargs):
+        nonlocal timeout_calls
+        timeout_calls += 1
+        raise OperationalError(
+            2013, "Lost connection to MySQL server during query (timed out)"
+        ) from TimeoutError("timed out")
+
+    adapter.cursor.execute.side_effect = timeout_side_effect
+    with pytest.raises(OperationalError):
+        adapter._execute("SELECT 1")
+
+    assert timeout_calls == 1
+    conn_mock.ping.assert_not_called()
+    close_spy.assert_called_once()
+
     # Write statements (e.g. INSERT) must NOT be retried after OperationalError(2013) to avoid duplicating rows
     conn_mock.reset_mock()
+    close_spy.reset_mock()
     write_calls = 0
 
     def write_side_effect(*args, **kwargs):
@@ -939,6 +961,7 @@ def test_execute_operational_error_reconnect(
 
     assert write_calls == 1
     conn_mock.ping.assert_not_called()
+    close_spy.assert_called_once()
 
 
 def test_external_catalog_view_error_and_drop_noop(
@@ -969,6 +992,17 @@ def test_external_catalog_view_error_and_drop_noop(
             parse_one("SELECT 1 AS id"),
             materialized=True,
         )
+
+    # Materialized view with invalid property raises SQLMeshError BEFORE dropping existing MV
+    with pytest.raises(SQLMeshError, match="Invalid materialized view build mode"):
+        adapter.create_view(
+            "silver.events_mv",
+            parse_one("SELECT 1 AS id"),
+            replace=True,
+            materialized=True,
+            view_properties={"build": exp.Literal.string("INVALID_MODE")},
+        )
+    assert to_sql_calls(adapter) == []
 
 
 def test_duplicate_key_with_buckets_and_random_buckets_fallback(
