@@ -1208,9 +1208,12 @@ class DorisEngineAdapter(
             and "unique_key" not in physical_properties
             and "duplicate_key" not in physical_properties
             and "aggregate_key" not in physical_properties
+            and all(isinstance(k, (exp.Column, exp.Identifier)) for k in unique_key)
         ):
+            cleaned_keys = [exp.column(k.name) for k in unique_key]
+            physical_properties = dict(physical_properties)
             physical_properties["unique_key"] = (
-                unique_key[0] if len(unique_key) == 1 else exp.Tuple(expressions=list(unique_key))
+                cleaned_keys[0] if len(cleaned_keys) == 1 else exp.Tuple(expressions=cleaned_keys)
             )
         return physical_properties
 
@@ -1319,6 +1322,24 @@ class DorisEngineAdapter(
                         expression = self._order_projections_and_filter(
                             expression, target_columns_to_types
                         )
+        elif not is_iceberg and isinstance(expression, exp.Select):
+            proj_by_name = {
+                proj.alias_or_name.lower(): proj
+                for proj in expression.expressions
+                if proj.alias_or_name and not isinstance(proj, exp.Star)
+            }
+            if proj_by_name and len(proj_by_name) == len(expression.expressions):
+                select_cols_to_types = {
+                    proj.alias_or_name: exp.DataType.build("UNKNOWN")
+                    for proj in expression.expressions
+                }
+                reordered_select_cols = self._reorder_olap_columns(select_cols_to_types, kwargs)
+                if list(reordered_select_cols) != list(select_cols_to_types):
+                    expression = expression.copy()
+                    expression.set(
+                        "expressions",
+                        [proj_by_name[c.lower()] for c in reordered_select_cols],
+                    )
 
         return super()._build_create_table_exp(
             table_name_or_schema,
@@ -1786,6 +1807,26 @@ class DorisEngineAdapter(
                 top_level_buckets=top_level_buckets,
             )
             if dist_prop is not None:
+                if not is_materialized_view:
+                    dist_kind = str(dist_prop.args.get("kind") or "").upper()
+                    if unique_key_cols and dist_kind == "RANDOM":
+                        raise SQLMeshError(
+                            "Doris UNIQUE KEY tables do not support DISTRIBUTED BY RANDOM. "
+                            "Use DISTRIBUTED BY HASH (...) instead."
+                        )
+                    if col_by_lower and dist_prop.expressions:
+                        dist_col_names = [c.name for c in dist_prop.expressions]
+                        missing_dist_cols = [
+                            c for c in dist_col_names if c.lower() not in col_by_lower
+                        ]
+                        if missing_dist_cols:
+                            raise SQLMeshError(
+                                f"Doris distributed_by columns {missing_dist_cols} not found in table schema columns {list(target_columns_to_types or ())}."
+                            )
+                        dist_prop.set(
+                            "expressions",
+                            [exp.to_column(col_by_lower[c.lower()]) for c in dist_col_names],
+                        )
                 properties.append(dist_prop)
 
         # Default replication_num = 1 for single-BE dev/CI when not explicitly configured on OLAP tables

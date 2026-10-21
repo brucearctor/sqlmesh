@@ -1445,11 +1445,41 @@ def test_key_model_mutual_exclusion_and_missing_column_validation(
         },
         table_properties={
             "unique_key": exp.to_column("ID"),
+            "distributed_by": "HASH(ID) BUCKETS 8",
         },
     )
     assert to_sql_calls(adapter) == [
-        "CREATE TABLE IF NOT EXISTS `db`.`case_insensitive_uk` (`id` INT, `name` VARCHAR(32)) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10"
+        "CREATE TABLE IF NOT EXISTS `db`.`case_insensitive_uk` (`id` INT, `name` VARCHAR(32)) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 8"
     ]
+
+    with pytest.raises(
+        SQLMeshError, match="Doris UNIQUE KEY tables do not support DISTRIBUTED BY RANDOM"
+    ):
+        adapter.create_table(
+            "db.uk_random_dist",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "unique_key": exp.to_column("id"),
+                "distributed_by": "RANDOM BUCKETS 8",
+            },
+        )
+
+    with pytest.raises(
+        SQLMeshError, match="Doris distributed_by columns .* not found in table schema columns"
+    ):
+        adapter.create_table(
+            "db.missing_dist_col",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "distributed_by": "HASH(missing_col) BUCKETS 8",
+            },
+        )
 
 
 def test_ctas_reorders_projections_in_place_without_double_subquery(
@@ -1467,8 +1497,16 @@ def test_ctas_reorders_projections_in_place_without_double_subquery(
         table_properties={"unique_key": exp.to_column("id")},
     )
 
+    # Unannotated CTAS (target_columns_to_types=None) also reorders Select projections for key prefix
+    adapter.ctas(
+        "db.ctas_unannotated_reordered",
+        parse_one("SELECT name, id FROM db.src", read="doris"),
+        table_properties={"unique_key": exp.to_column("id")},
+    )
+
     assert to_sql_calls(adapter) == [
-        "CREATE TABLE IF NOT EXISTS `db`.`ctas_reordered` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT CAST(`id` AS INT) AS `id`, CAST(`name` AS VARCHAR(50)) AS `name` FROM (SELECT `name`, `id` FROM `db`.`src`) AS `_subquery`"
+        "CREATE TABLE IF NOT EXISTS `db`.`ctas_reordered` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT CAST(`id` AS INT) AS `id`, CAST(`name` AS VARCHAR(50)) AS `name` FROM (SELECT `name`, `id` FROM `db`.`src`) AS `_subquery`",
+        "CREATE TABLE IF NOT EXISTS `db`.`ctas_unannotated_reordered` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT `id`, `name` FROM `db`.`src`",
     ]
 
 
