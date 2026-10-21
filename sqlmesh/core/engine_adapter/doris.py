@@ -61,9 +61,13 @@ class DorisEngineAdapter(
     MAX_IDENTIFIER_LENGTH = 64
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
+    RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False
     SUPPORTS_CREATE_DROP_CATALOG = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
     CURRENT_CATALOG_EXPRESSION = exp.func("current_catalog")
+    RESOLVE_TABLE_REFS_IN_PHYSICAL_PROPERTIES: t.FrozenSet[str] = frozenset(
+        {"excluded_trigger_tables", "source_table"}
+    )
     SCHEMA_DIFFER_KWARGS = {
         "parameterized_type_defaults": {
             exp.DataType.build("DECIMAL", dialect=DIALECT).this: [(9, 0), (0,)],

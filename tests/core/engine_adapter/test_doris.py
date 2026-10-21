@@ -1301,12 +1301,16 @@ def test_adjust_physical_properties_for_incremental(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    assert adapter.RECREATE_MATERIALIZED_VIEW_ON_EVALUATION is False
+    assert adapter.RESOLVE_TABLE_REFS_IN_PHYSICAL_PROPERTIES == frozenset(
+        {"excluded_trigger_tables", "source_table"}
+    )
 
-    # Single unique_key promoted when no explicit key is present
+    # Single unique_key promoted when no explicit key is present (table qualifiers stripped)
     props = adapter.adjust_physical_properties_for_incremental(
         {},
         requires_delete_capable_table=True,
-        unique_key=[exp.to_column("id")],
+        unique_key=[exp.to_column("src.id")],
         model_name="db.incremental_model",
     )
     assert props == {"unique_key": exp.to_column("id")}
