@@ -105,10 +105,6 @@ def test_catalog_operations(ctx: TestContext):
         pytest.skip(
             f"Engine adapter {ctx.engine_adapter.dialect} doesn't support catalog operations"
         )
-    if ctx.dialect == "doris":
-        pytest.skip(
-            "Doris external catalogs require connector properties (`CREATE CATALOG ... PROPERTIES (...)`); covered in test_integration_doris.py"
-        )
 
     # use a unique name so that integration tests on cloud databases can run in parallel
     catalog_name = "testing" if not ctx.is_remote else ctx.add_test_suffix("testing")
@@ -3299,6 +3295,7 @@ def test_value_normalization(
     )
     columns_to_types_normalized = {
         (
+            # "value" is in DorisGenerator.RESERVED_KEYWORDS, so .sql(dialect="doris") returns "`value`"
             normalize_identifiers(k, dialect=ctx.dialect).name
             if ctx.dialect == "doris"
             else normalize_identifiers(k, dialect=ctx.dialect).sql(dialect=ctx.dialect)
@@ -3962,7 +3959,8 @@ def test_materialized_view_evaluation(ctx: TestContext):
         )
     elif dialect == "doris":
         pytest.skip(
-            "Skipping doris as synchronous materialized views do not support specifying schema"
+            "Doris materialized views require DISTRIBUTED BY or physical_properties configuration; "
+            "Doris MVs are covered by test_integration_doris.py"
         )
 
     model_name = ctx.table("test_tbl")

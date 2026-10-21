@@ -172,7 +172,11 @@ def test_materialized_view_async_mtmv(ctx: TestContext):
     )
     wait_until(lambda: len(ctx.get_current_data(view)) == len(input_data), attempts=30, wait=1)
     ctx.compare_with_current(view, input_data)
+    results = ctx.get_metadata_results()
+    assert exp.to_table(view).name in results.materialized_views
+    assert exp.to_table(view).name not in results.tables
     ctx.engine_adapter.drop_view(view, materialized=True)
+    assert len(ctx.get_metadata_results().materialized_views) == 0
 
 
 def test_merge_unique_key(ctx: TestContext):

@@ -36,13 +36,15 @@ pip install "sqlmesh[doris]"
 | `write_timeout` | Write timeout in seconds | int | N |
 | `pre_ping` | Whether to ping the connection before executing a statement and reconnect if lost (Default: `False`) | bool | N |
 | `session_variables` | Session variables to set on each new connection via `SET <key> = <value>` (e.g., `workload_group`, `query_timeout`) | dict | N |
-| `ssl` | Explicit SSL configuration dictionary passed to `PyMySQL` | dict | N |
+| `ssl` | Explicit SSL configuration (`True`/`False` or dictionary) passed to `PyMySQL` | bool \| dict | N |
 | `ssl_disabled` | Whether SSL is disabled | bool | N |
 | `ssl_ca` | Path to the file that contains a PEM-formatted CA certificate | string | N |
 | `ssl_cert` | Path to the file that contains a PEM-formatted client certificate | string | N |
 | `ssl_key` | Path to the file that contains a PEM-formatted private key for the client certificate | string | N |
 | `ssl_verify_cert` | Set to `true` to verify the server's certificate against the CA certificate | bool | N |
 | `ssl_verify_identity` | Set to `true` to verify the server's identity in addition to the certificate | bool | N |
+| `concurrent_tasks` | The maximum number of tasks that can use this connection concurrently (Default: `4`) | int | N |
+| `register_comments` | Whether or not to register model comments with the SQL engine (Default: `True`) | bool | N |
 
 ### Connection configuration example
 
@@ -68,6 +70,11 @@ gateways:
       user: sqlmesh
       password: {{ env_var('POSTGRES_PASSWORD') }}
       database: sqlmesh_state
+
+default_gateway: doris
+
+model_defaults:
+  dialect: doris
 ```
 
 ---
@@ -126,15 +133,15 @@ FROM raw.orders
 WHERE updated_at BETWEEN @start_ds AND @end_ds;
 ```
 
-You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` (creating a `SEQUENCE MAP COL(col1, col2)` sort key on Doris 2.1+ Merge-on-Write tables).
+You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` (emitting `ORDER BY (col1, col2)` on Doris 2.1+ Merge-on-Write tables).
 
 ### AGGREGATE KEY model
 
-For pre-aggregated rollup tables, specify the key columns using `aggregate_key` in `physical_properties`:
+For pre-aggregated rollup tables, specify the key columns using `aggregate_key` in `physical_properties`. Note that Doris requires non-key value columns in an `AGGREGATE KEY` table to specify an aggregation function (`SUM`, `MAX`, `MIN`, `REPLACE`, etc.) in the column definition unless all columns are part of `aggregate_key` (or the table is created via a custom DDL / pre-statement):
 
 ```sql
 MODEL (
-  name analytics.daily_site_metrics,
+  name analytics.daily_site_keys,
   kind FULL,
   clustered_by (site_id),
   physical_properties (
@@ -145,9 +152,7 @@ MODEL (
 
 SELECT
   site_id::INT AS site_id,
-  event_date::DATE AS event_date,
-  SUM(pv)::BIGINT AS total_pv,
-  MAX(dwell_seconds)::INT AS max_dwell
+  event_date::DATE AS event_date
 FROM analytics.user_events
 GROUP BY site_id, event_date;
 ```
@@ -196,6 +201,10 @@ If none of `clustered_by` or `distributed_by` is provided:
 ## Partitioning
 
 Doris OLAP tables support **Multi-Range Batch Partitioning**, **Explicit Partition Definitions**, **Dynamic Partitioning**, and **Auto Partitioning** (Doris 2.1+).
+
+!!! note "OLAP Partitioning Requirements"
+    - On Doris OLAP tables, `PARTITION BY` requires at least one of `partitions`, `auto_partition = 'true'`, or `'dynamic_partition.enable' = 'true'` in `physical_properties`. If none is provided, SQLMesh omits the `PARTITION BY` clause so Doris does not create a zero-partition table that rejects inserts.
+    - On `UNIQUE KEY` tables, Doris requires all `partitioned_by` columns to be a subset of `unique_key`.
 
 ### Multi-range & explicit partitions
 
@@ -257,7 +266,7 @@ WHERE event_ts BETWEEN @start_ts AND @end_ts;
 
 ### Pattern 2: Materializing Apache Iceberg tables via Doris
 
-SQLMesh can also create, partition, and overwrite Apache Iceberg tables directly through Doris (`ENGINE=iceberg` and `INSERT OVERWRITE TABLE ... VALUES (*)`).
+SQLMesh can also create, partition, and overwrite Apache Iceberg tables directly through Doris (`ENGINE=iceberg` and `INSERT OVERWRITE TABLE`).
 
 !!! important "Virtual Environments & Catalog Bootstrap on External Iceberg Catalogs"
     Doris only supports `CREATE VIEW` inside the `internal` catalog; external Iceberg catalogs do not support Doris views, and Doris does not support `environment_suffix_target: catalog`.
@@ -453,6 +462,29 @@ SELECT
   COUNT(*) AS event_count
 FROM analytics.user_events
 GROUP BY user_id, CAST(event_time AS DATE);
+```
+
+### Synchronous Materialized Views (`materialized_type = 'SYNC'`)
+
+Doris also supports single-table synchronous materialized views (rollup indexes maintained atomically on base table writes) by setting `materialized_type = 'SYNC'` and `source_table` in `physical_properties`:
+
+```sql
+MODEL (
+  name analytics.user_events_sync_mv,
+  kind VIEW (
+    materialized true
+  ),
+  physical_properties (
+    materialized_type = 'SYNC',
+    source_table = 'analytics.user_events'
+  )
+);
+
+SELECT
+  user_id,
+  COUNT(event_type) AS event_count
+FROM analytics.user_events
+GROUP BY user_id;
 ```
 
 ### Inverted Indexes (Doris 2.1–5.0)

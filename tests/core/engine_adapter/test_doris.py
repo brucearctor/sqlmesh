@@ -7,6 +7,7 @@ from sqlglot import parse_one
 
 from sqlmesh.core.engine_adapter.doris import DorisEngineAdapter
 from sqlmesh.core.engine_adapter.shared import CatalogSupport, DataObject, DataObjectType
+from sqlmesh.utils.errors import SQLMeshError
 from tests.core.engine_adapter import to_sql_calls
 
 pytestmark = [pytest.mark.doris, pytest.mark.engine]
@@ -1366,3 +1367,116 @@ def test_merge_with_identifier_unique_key(
         )
         for call in sql_calls
     )
+
+
+def test_list_partition_ast_and_random_distributed_by(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "db.list_tbl",
+        target_columns_to_types={
+            "region": exp.DataType.build("VARCHAR(16)", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        partitioned_by=[parse_one("LIST(region)", read="doris")],
+        table_properties={
+            "partitions": exp.Literal.string("PARTITION p_na VALUES IN ('US', 'CA')"),
+            "distributed_by": parse_one("RANDOM()", read="doris"),
+            "buckets": exp.Literal.number(8),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`list_tbl` (`region` VARCHAR(16), `id` INT) PARTITION BY LIST (`region`) (PARTITION p_na VALUES IN ('US', 'CA')) DISTRIBUTED BY RANDOM BUCKETS 8"
+    ]
+
+
+def test_key_model_mutual_exclusion_and_missing_column_validation(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    with pytest.raises(SQLMeshError, match="at most one key model"):
+        adapter.create_table(
+            "db.bad_keys",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "unique_key": exp.to_column("id"),
+                "duplicate_key": exp.to_column("id"),
+            },
+        )
+
+    with pytest.raises(SQLMeshError, match="not found in table schema columns"):
+        adapter.create_table(
+            "db.missing_key",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "unique_key": exp.to_column("nonexistent_col"),
+            },
+        )
+
+
+def test_ctas_reorders_projections_in_place_without_double_subquery(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.ctas(
+        "db.ctas_reordered",
+        parse_one("SELECT name, id FROM db.src", read="doris"),
+        target_columns_to_types={
+            "name": exp.DataType.build("VARCHAR(50)", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        table_properties={"unique_key": exp.to_column("id")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`ctas_reordered` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT CAST(`id` AS INT) AS `id`, CAST(`name` AS VARCHAR(50)) AS `name` FROM (SELECT `name`, `id` FROM `db`.`src`) AS `_subquery`"
+    ]
+
+
+def test_get_data_objects_reclassifies_mtmv_via_mv_infos(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, patch_get_data_objects=False)
+    mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[
+            [("silver", "regular_tbl", "BASE TABLE"), ("silver", "async_mv", "BASE TABLE")],
+            [("async_mv",)],
+        ],
+    )
+
+    objects = adapter._get_data_objects("silver")
+    assert [(o.name, o.type) for o in objects] == [
+        ("regular_tbl", DataObjectType.TABLE),
+        ("async_mv", DataObjectType.MATERIALIZED_VIEW),
+    ]
+
+
+def test_delete_from_boolean_literal_simplification(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # FALSE is a no-op
+    adapter.delete_from("db.tbl", where=exp.false())
+    assert to_sql_calls(adapter) == []
+
+    # Compound AND TRUE is simplified away so Doris DeleteHandler does not reject boolean literal
+    adapter.delete_from("db.tbl", where="id = 1 AND TRUE")
+    assert to_sql_calls(adapter) == ["DELETE FROM `db`.`tbl` WHERE `id` = 1"]
+
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from("db.tbl", where="TRUE")
+    assert to_sql_calls(adapter) == ["TRUNCATE TABLE `db`.`tbl`"]

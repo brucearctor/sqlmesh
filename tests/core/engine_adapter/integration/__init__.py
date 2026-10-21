@@ -758,6 +758,17 @@ class TestContext:
                 self.engine_adapter.execute(f'CREATE DATABASE IF NOT EXISTS "{catalog_name}"')
             except Exception:
                 pass
+        elif self.dialect == "doris":
+            self.engine_adapter.execute(
+                f"""
+                CREATE CATALOG IF NOT EXISTS `{catalog_name}` PROPERTIES (
+                    'type' = 'iceberg',
+                    'iceberg.catalog.type' = 'hadoop',
+                    'warehouse' = 'file:///tmp/doris_iceberg_warehouse/{catalog_name}'
+                )
+                """,
+                quote_identifiers=False,
+            )
 
         self._catalogs.append(catalog_name)
 
@@ -769,6 +780,11 @@ class TestContext:
         elif self.dialect == "fabric":
             # Use the engine adapter's built-in catalog dropping functionality
             self.engine_adapter.drop_catalog(catalog_name)
+        elif self.dialect == "doris":
+            self.engine_adapter.set_current_catalog("internal")
+            self.engine_adapter.execute(
+                f"DROP CATALOG IF EXISTS `{catalog_name}`", quote_identifiers=False
+            )
         else:
             self.engine_adapter.execute(f'DROP DATABASE IF EXISTS "{catalog_name}"')
 

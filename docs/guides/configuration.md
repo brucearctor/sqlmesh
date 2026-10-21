@@ -976,10 +976,10 @@ Other state engines with fast and reliable database transactions (less tested th
 Unsupported state engines, even for development:
 
 * [ClickHouse](../integrations/engines/clickhouse.md)
+* [Doris](../integrations/engines/doris.md)
 * [Spark](../integrations/engines/spark.md)
 * [StarRocks](../integrations/engines/starrocks.md)
 * [Trino](../integrations/engines/trino.md)
-* [Doris](../integrations/engines/doris.md)
 
 This example gateway configuration uses Snowflake for the data warehouse connection and Postgres for the state backend connection:
 

@@ -241,6 +241,12 @@ class DorisEngineAdapter(
     def _fetch_native_df(
         self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> DF:
+        if self._pre_ping:
+            try:
+                self.ping()
+            except Exception:
+                logger.info("Connection to the database was lost. Reconnecting...")
+                self._connection_pool.close()
         self._connection_pool.get_cursor()
         return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
 
@@ -288,9 +294,13 @@ class DorisEngineAdapter(
                     err_code,
                 )
                 self._connection_pool.close_cursor()
-                conn = self._connection_pool.get()
-                conn.ping(reconnect=True)
-                super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
+                try:
+                    conn = self._connection_pool.get()
+                    conn.ping(reconnect=True)
+                    super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
+                except Exception:
+                    self._connection_pool.close()
+                    raise
             else:
                 if is_disconnect and not self._connection_pool.is_transaction_active:
                     self._connection_pool.close()
@@ -439,6 +449,29 @@ class DorisEngineAdapter(
                 )
                 continue
 
+        # In Doris 2.1+, asynchronous materialized views (MTMVs) are stored as OLAP base tables
+        # and report table_type = 'BASE TABLE' in information_schema.tables. Reclassify them via
+        # the mv_infos() table-valued function so drop_data_object_on_type_mismatch and metadata
+        # inspection recognize them as MATERIALIZED_VIEW instead of issuing DROP TABLE.
+        if (not query_catalog or query_catalog.lower() == "internal") and any(
+            obj.type.is_table for obj in result
+        ):
+            try:
+                db_literal = self._to_sql(exp.Literal.string(schema_exp.db), quote=False)
+                mv_rows = self.fetchall(
+                    f"SELECT Name FROM mv_infos('database' = {db_literal})",
+                    quote_identifiers=False,
+                )
+                mv_names = {
+                    _decoded_str(row[0]).lower() for row in mv_rows if len(row) == 1 and row[0]
+                }
+                if mv_names:
+                    for obj in result:
+                        if obj.name.lower() in mv_names:
+                            obj.type = DataObjectType.MATERIALIZED_VIEW
+            except Exception:
+                logger.debug("mv_infos lookup failed on Doris, skipping MTMV reclassification")
+
         return result
 
     def create_view(
@@ -550,8 +583,18 @@ class DorisEngineAdapter(
         with source_queries[0] as query:
             target_table = exp.to_table(view_name)
 
+            is_sync_mv = bool(
+                view_properties
+                and (
+                    (
+                        self._extract_str_value(view_properties.get("materialized_type")) or ""
+                    ).upper()
+                    == "SYNC"
+                )
+            )
+
             schema: t.Union[exp.Table, exp.Schema] = target_table
-            if target_columns_to_types:
+            if target_columns_to_types and not is_sync_mv:
                 schema = self._build_schema_exp(
                     target_table,
                     target_columns_to_types,
@@ -594,15 +637,6 @@ class DorisEngineAdapter(
                 table_kind="MATERIALIZED_VIEW",
             )
 
-            is_sync_mv = bool(
-                view_properties
-                and (
-                    (
-                        self._extract_str_value(view_properties.get("materialized_type")) or ""
-                    ).upper()
-                    == "SYNC"
-                )
-            )
             if is_sync_mv and isinstance(query, exp.Select):
                 query = query.copy()
                 aliased_selects: t.List[exp.Expr] = []
@@ -849,7 +883,7 @@ class DorisEngineAdapter(
         self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expr]] = None
     ) -> None:
         """Delete from a table in Doris."""
-        if not where or where == exp.true():
+        if not where:
             self._truncate_table(table_name)
             return
 
@@ -858,6 +892,13 @@ class DorisEngineAdapter(
         else:
             where = where.copy()
 
+        where = self._simplify_boolean_where(where)
+        if where == exp.true():
+            self._truncate_table(table_name)
+            return
+        if where == exp.false():
+            return
+
         where = self._rewrite_between_in_where(where)
 
         subquery_info = self._extract_subquery_from_where(where)
@@ -865,6 +906,41 @@ class DorisEngineAdapter(
             self._execute_delete_with_subquery(table_name, *subquery_info)
         else:
             super().delete_from(table_name, where)
+
+    @classmethod
+    def _simplify_boolean_where(cls, expr: exp.Expr) -> exp.Expr:
+        if isinstance(expr, (exp.Subquery, exp.Select)):
+            return expr
+        for k, v in list(expr.args.items()):
+            if isinstance(v, exp.Expr):
+                expr.set(k, cls._simplify_boolean_where(v))
+            elif isinstance(v, list):
+                expr.set(
+                    k,
+                    [
+                        cls._simplify_boolean_where(item) if isinstance(item, exp.Expr) else item
+                        for item in v
+                    ],
+                )
+        if isinstance(expr, exp.Paren) and isinstance(expr.this, exp.Boolean):
+            return expr.this
+        if isinstance(expr, exp.Not) and isinstance(expr.this, exp.Boolean):
+            return exp.false() if expr.this == exp.true() else exp.true()
+        if isinstance(expr, exp.And):
+            if expr.this == exp.false() or expr.expression == exp.false():
+                return exp.false()
+            if expr.this == exp.true():
+                return expr.expression
+            if expr.expression == exp.true():
+                return expr.this
+        if isinstance(expr, exp.Or):
+            if expr.this == exp.true() or expr.expression == exp.true():
+                return exp.true()
+            if expr.this == exp.false():
+                return expr.expression
+            if expr.expression == exp.false():
+                return expr.this
+        return expr
 
     @staticmethod
     def _rewrite_between_in_where(where: exp.Expr) -> exp.Expr:
@@ -891,6 +967,7 @@ class DorisEngineAdapter(
         self, where: exp.Expr
     ) -> t.Optional[t.Tuple[t.List[exp.Expr], exp.Subquery, t.List[exp.Expr]]]:
         """Extract positive IN (SELECT ...) subquery and any sibling AND conditions."""
+        where = where.unnest()
         conjuncts: t.List[exp.Expr] = (
             list(where.flatten()) if isinstance(where, exp.And) else [where]
         )
@@ -1149,7 +1226,12 @@ class DorisEngineAdapter(
     ) -> None:
         table_properties = dict(kwargs.get("table_properties") or {})
 
-        if primary_key and "unique_key" not in table_properties:
+        if (
+            primary_key
+            and "unique_key" not in table_properties
+            and "duplicate_key" not in table_properties
+            and "aggregate_key" not in table_properties
+        ):
             table_properties["unique_key"] = exp.Tuple(
                 expressions=[exp.to_column(col) for col in primary_key]
             )
@@ -1217,9 +1299,26 @@ class DorisEngineAdapter(
                             [col_def_map[c] for c in target_columns_to_types] + other_exprs,
                         )
                 if expression is not None and isinstance(expression, exp.Query):
-                    expression = self._order_projections_and_filter(
-                        expression, target_columns_to_types
-                    )
+                    reordered_in_place = False
+                    if isinstance(expression, exp.Select):
+                        proj_by_name = {
+                            proj.alias_or_name: proj
+                            for proj in expression.expressions
+                            if proj.alias_or_name
+                        }
+                        if len(proj_by_name) == len(expression.expressions) == len(
+                            target_columns_to_types
+                        ) and all(c in proj_by_name for c in target_columns_to_types):
+                            expression = expression.copy()
+                            expression.set(
+                                "expressions",
+                                [proj_by_name[c] for c in target_columns_to_types],
+                            )
+                            reordered_in_place = True
+                    if not reordered_in_place:
+                        expression = self._order_projections_and_filter(
+                            expression, target_columns_to_types
+                        )
 
         return super()._build_create_table_exp(
             table_name_or_schema,
@@ -1238,20 +1337,38 @@ class DorisEngineAdapter(
         kwargs: t.Dict[str, t.Any],
     ) -> t.Dict[str, exp.DataType]:
         table_props = kwargs.get("table_properties") or {}
-        explicit_key = (
-            table_props.get("unique_key")
-            or kwargs.get("unique_key")
-            or table_props.get("duplicate_key")
-            or table_props.get("aggregate_key")
-        )
+        unique_key = table_props.get("unique_key") or kwargs.get("unique_key")
+        duplicate_key = table_props.get("duplicate_key")
+        aggregate_key = table_props.get("aggregate_key")
+
+        specified_key_types = [
+            name
+            for name, val in (
+                ("unique_key", unique_key),
+                ("duplicate_key", duplicate_key),
+                ("aggregate_key", aggregate_key),
+            )
+            if self._extract_column_names(val)
+        ]
+        if len(specified_key_types) > 1:
+            raise SQLMeshError(
+                f"Doris tables support at most one key model (unique_key, duplicate_key, or aggregate_key), "
+                f"got multiple: {', '.join(specified_key_types)}."
+            )
+
+        explicit_key = unique_key or duplicate_key or aggregate_key
         col_names = list(target_columns_to_types)
         if not col_names:
             return target_columns_to_types
 
         if explicit_key:
-            key_cols = [
-                k for k in self._extract_column_names(explicit_key) if k in target_columns_to_types
-            ]
+            raw_key_cols = self._extract_column_names(explicit_key)
+            missing_cols = [k for k in raw_key_cols if k not in target_columns_to_types]
+            if missing_cols:
+                raise SQLMeshError(
+                    f"Doris key columns {missing_cols} not found in table schema columns {col_names}."
+                )
+            key_cols = [k for k in raw_key_cols if k in target_columns_to_types]
             if key_cols and col_names[: len(key_cols)] != key_cols:
                 new_order = key_cols + [c for c in col_names if c not in key_cols]
                 return {c: target_columns_to_types[c] for c in new_order}
@@ -1277,18 +1394,18 @@ class DorisEngineAdapter(
         partition_kind: t.Optional[str] = None
 
         for expr in partitioned_by:
-            if isinstance(expr, exp.Anonymous) and expr.this:
-                func_name = str(expr.this).upper()
-                if func_name in ("RANGE", "LIST"):
-                    partition_kind = func_name
-                    for arg in expr.expressions:
-                        if isinstance(arg, exp.Column):
-                            parsed_partitioned_by.append(arg)
-                        elif isinstance(arg, exp.Func) or isinstance(arg, exp.Anonymous):
-                            parsed_partitioned_by.append(arg)
-                        else:
-                            parsed_partitioned_by.append(exp.to_column(str(arg)))
-                    continue
+            if isinstance(expr, exp.List) or (
+                isinstance(expr, exp.Anonymous)
+                and expr.this
+                and str(expr.this).upper() in ("RANGE", "LIST")
+            ):
+                partition_kind = "LIST" if isinstance(expr, exp.List) else str(expr.this).upper()
+                for arg in expr.expressions:
+                    if isinstance(arg, (exp.Column, exp.Func, exp.Anonymous)):
+                        parsed_partitioned_by.append(arg)
+                    else:
+                        parsed_partitioned_by.append(exp.to_column(str(arg)))
+                continue
 
             if isinstance(expr, exp.Literal) and getattr(expr, "is_string", False):
                 text = str(expr.this)
@@ -1521,6 +1638,28 @@ class DorisEngineAdapter(
         order_by_cols = self._extract_column_names(order_by)
 
         if not is_iceberg:
+            specified_key_types = [
+                name
+                for name, cols in (
+                    ("unique_key", unique_key_cols),
+                    ("duplicate_key", duplicate_key_cols),
+                    ("aggregate_key", aggregate_key_cols),
+                )
+                if cols
+            ]
+            if len(specified_key_types) > 1:
+                raise SQLMeshError(
+                    f"Doris tables support at most one key model (unique_key, duplicate_key, or aggregate_key), "
+                    f"got multiple: {', '.join(specified_key_types)}."
+                )
+            active_key_cols = unique_key_cols or duplicate_key_cols or aggregate_key_cols
+            if active_key_cols and target_columns_to_types:
+                missing_cols = [k for k in active_key_cols if k not in target_columns_to_types]
+                if missing_cols:
+                    raise SQLMeshError(
+                        f"Doris key columns {missing_cols} not found in table schema columns {list(target_columns_to_types)}."
+                    )
+
             if unique_key_cols:
                 properties.append(
                     exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in unique_key_cols])
@@ -1789,11 +1928,15 @@ class DorisEngineAdapter(
         if distributed_by is not None:
             distributed_info: t.Dict[str, t.Any] = {}
 
-            # Case 1: Function expression such as HASH(a, b)
+            # Case 1: Function expression such as HASH(a, b) or RANDOM()
             if isinstance(distributed_by, (exp.Anonymous, exp.Func)) and not isinstance(
                 distributed_by, (exp.Tuple, exp.Array, exp.Paren)
             ):
-                kind_upper = distributed_by.name.upper()
+                kind_upper = (
+                    "RANDOM"
+                    if isinstance(distributed_by, exp.Rand)
+                    else distributed_by.name.upper()
+                )
                 if kind_upper not in ("HASH", "RANDOM"):
                     raise SQLMeshError(
                         f"Invalid distributed_by kind: {kind_upper}. Expected HASH or RANDOM."
@@ -1803,20 +1946,24 @@ class DorisEngineAdapter(
                 ]
                 return exp.DistributedByProperty(
                     kind=exp.Var(this=kind_upper),
-                    expressions=cols,
-                    buckets=default_buckets_expr or exp.Literal.number(10),
+                    expressions=cols if cols else None,
+                    buckets=default_buckets_expr or (exp.Literal.number(10) if cols else None),
                     order=None,
                 )
 
-            # Case 2: String shorthand such as "HASH(id) BUCKETS 10", "RANDOM BUCKETS AUTO", or "id"
-            if isinstance(distributed_by, str) or (
+            # Case 2: String shorthand or bare column/identifier such as "HASH(id) BUCKETS 10", "RANDOM BUCKETS AUTO", or id
+            if isinstance(distributed_by, (str, exp.Column, exp.Identifier, exp.Var)) or (
                 isinstance(distributed_by, exp.Literal)
                 and getattr(distributed_by, "is_string", False)
             ):
                 text = (
-                    str(distributed_by.this).strip()
-                    if isinstance(distributed_by, exp.Literal)
-                    else distributed_by.strip()
+                    distributed_by.strip()
+                    if isinstance(distributed_by, str)
+                    else (
+                        str(distributed_by.this).strip()
+                        if isinstance(distributed_by, exp.Literal)
+                        else distributed_by.name.strip()
+                    )
                 )
                 m = re.match(
                     r"^(HASH|RANDOM)\s*(?:\(([^)]*)\))?\s*(?:BUCKETS\s+(AUTO|\d+))?$",
