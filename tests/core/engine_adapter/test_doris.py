@@ -25,8 +25,7 @@ def test_create_view(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdap
     )
 
     assert to_sql_calls(adapter) == [
-        "DROP VIEW IF EXISTS `test_view`",
-        "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
+        "CREATE OR REPLACE VIEW `test_view` AS SELECT `a` FROM `tbl`",
         "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
         "CREATE VIEW `test_view` AS SELECT `a` FROM `tbl`",
     ]
@@ -37,6 +36,14 @@ def test_create_view_with_comment(make_mocked_engine_adapter: t.Callable[..., Do
     adapter.create_view(
         "test_view",
         parse_one("SELECT a FROM tbl"),
+        replace=True,
+        target_columns_to_types={"a": exp.DataType.build("INT")},
+        table_description="test_description",
+        column_descriptions={"a": "test_column_description"},
+    )
+    adapter.create_view(
+        "test_view",
+        parse_one("SELECT a FROM tbl"),
         replace=False,
         target_columns_to_types={"a": exp.DataType.build("INT")},
         table_description="test_description",
@@ -44,6 +51,7 @@ def test_create_view_with_comment(make_mocked_engine_adapter: t.Callable[..., Do
     )
 
     assert to_sql_calls(adapter) == [
+        "CREATE OR REPLACE VIEW `test_view` (`a` COMMENT 'test_column_description') COMMENT 'test_description' AS SELECT `a` FROM `tbl`",
         "CREATE VIEW `test_view` (`a` COMMENT 'test_column_description') COMMENT 'test_description' AS SELECT `a` FROM `tbl`",
     ]
 
@@ -916,22 +924,45 @@ def test_execute_operational_error_reconnect(
     assert call_count == 2
     conn_mock.ping.assert_called_once_with(reconnect=True)
 
+    # Write statements (e.g. INSERT) must NOT be retried after OperationalError(2013) to avoid duplicating rows
+    conn_mock.reset_mock()
+    write_calls = 0
 
-def test_external_catalog_view_skip_and_materialized_error(
+    def write_side_effect(*args, **kwargs):
+        nonlocal write_calls
+        write_calls += 1
+        raise OperationalError(2013, "Lost connection to MySQL server during query")
+
+    adapter.cursor.execute.side_effect = write_side_effect
+    with pytest.raises(OperationalError):
+        adapter._execute("INSERT INTO `tbl` VALUES (1)")
+
+    assert write_calls == 1
+    conn_mock.ping.assert_not_called()
+
+
+def test_external_catalog_view_error_and_drop_noop(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
 ):
     from sqlmesh.utils.errors import SQLMeshError
 
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
-    # Regular view creation and deletion on external catalog is a safe no-op (warns instead of failing dev promotion)
-    adapter.create_view("iceberg_cat.silver__dev.events", parse_one("SELECT 1 AS id"))
+    # Regular view creation on an external catalog raises SQLMeshError pointing to virtual_environment_mode and environment_catalog_mapping
+    with pytest.raises(
+        SQLMeshError,
+        match=r"Doris only supports creating views in the 'internal' catalog, got 'iceberg_cat'.*virtual_environment_mode: dev_only.*environment_catalog_mapping",
+    ):
+        adapter.create_view("iceberg_cat.silver__dev.events", parse_one("SELECT 1 AS id"))
+
+    # Drop view on external catalog remains a safe no-op during cleanup
     adapter.drop_view("iceberg_cat.silver__dev.events")
     assert to_sql_calls(adapter) == []
 
-    # Materialized view on external catalog still raises SQLMeshError
+    # Materialized view on external catalog also raises SQLMeshError
     with pytest.raises(
-        SQLMeshError, match="Doris only supports creating materialized views in the 'internal'"
+        SQLMeshError,
+        match="Doris only supports creating materialized views in the 'internal' catalog",
     ):
         adapter.create_view(
             "iceberg_cat.silver.events_mv",

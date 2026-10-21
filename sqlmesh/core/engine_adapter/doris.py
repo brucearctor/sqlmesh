@@ -244,7 +244,26 @@ class DorisEngineAdapter(
         self._connection_pool.get_cursor()
         return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
 
+    _SAFE_RETRY_SQL_PREFIX_RE = re.compile(
+        r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH|SET)\b",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    @classmethod
+    def _is_safe_to_retry_sql(cls, sql: str) -> bool:
+        """Returns True only for read-only or idempotent session statements that cannot duplicate writes."""
+        return bool(cls._SAFE_RETRY_SQL_PREFIX_RE.match(sql))
+
+    def ping(self) -> None:
+        self._connection_pool.get().ping(reconnect=False)
+
     def _execute(self, sql: str, track_rows_processed: bool = False, **kwargs: t.Any) -> None:
+        if self._pre_ping:
+            try:
+                self.ping()
+            except Exception:
+                logger.info("Connection to the database was lost. Reconnecting...")
+                self._connection_pool.close()
         try:
             super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
         except Exception as e:
@@ -253,9 +272,13 @@ class DorisEngineAdapter(
             is_disconnect = (err_code in (2006, 2013, 2055) and err_name == "OperationalError") or (
                 err_code == 0 and err_name == "InterfaceError"
             )
-            if is_disconnect and not self._connection_pool.is_transaction_active:
+            if (
+                is_disconnect
+                and not self._connection_pool.is_transaction_active
+                and self._is_safe_to_retry_sql(sql)
+            ):
                 logger.warning(
-                    "Doris connection lost (%s: %s), reconnecting and retrying once...",
+                    "Doris connection lost (%s: %s) during read/session statement, reconnecting and retrying once...",
                     err_name,
                     err_code,
                 )
@@ -425,35 +448,29 @@ class DorisEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
         **create_kwargs: t.Any,
     ) -> None:
+        """
+        Doris view creation behavior:
+        - Regular VIEW: supports atomic `CREATE OR REPLACE VIEW` (since Doris 2.0) via `super().create_view`.
+        - MATERIALIZED VIEW: does NOT support `CREATE OR REPLACE MATERIALIZED VIEW`, so `replace=True`
+          drops any existing object/materialized view first before creating the new one.
+        """
         target_table = exp.to_table(view_name)
         effective_catalog = target_table.catalog or self.default_catalog
         if effective_catalog and effective_catalog.lower() != "internal":
-            if materialized:
-                raise SQLMeshError(
-                    f"Doris only supports creating materialized views in the 'internal' catalog, got '{effective_catalog}' "
-                    f"for view '{self._to_sql(target_table)}'."
-                )
-            logger.warning(
-                "Skipping view creation for '%s' because Doris does not support creating views in external catalog '%s'. "
-                "Configure `environment_catalog_mapping` in your SQLMesh configuration to route virtual environment views to the 'internal' catalog.",
-                self._to_sql(target_table),
-                effective_catalog,
+            view_kind = "materialized views" if materialized else "views"
+            raise SQLMeshError(
+                f"Doris only supports creating {view_kind} in the 'internal' catalog, got '{effective_catalog}' "
+                f"for view '{self._to_sql(target_table)}'. Configure `virtual_environment_mode: dev_only` and "
+                f"`environment_catalog_mapping` in your SQLMesh configuration to route virtual environment views "
+                f"to the 'internal' catalog."
             )
-            return
 
-        if replace:
-            self.drop_view(
-                view_name,
-                ignore_if_not_exists=True,
-                materialized=materialized,
-                view_properties=view_properties,
-            )
         if not materialized:
             return super().create_view(
                 view_name,
                 query_or_df,
                 target_columns_to_types,
-                replace=False,
+                replace=replace,
                 materialized=False,
                 materialized_properties=materialized_properties,
                 table_description=table_description,
@@ -461,6 +478,18 @@ class DorisEngineAdapter(
                 view_properties=view_properties,
                 source_columns=source_columns,
                 **create_kwargs,
+            )
+
+        # Doris does not support `CREATE OR REPLACE MATERIALIZED VIEW`, so drop first when `replace=True`.
+        if replace:
+            self.drop_data_object_on_type_mismatch(
+                self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
+            )
+            self.drop_view(
+                view_name,
+                ignore_if_not_exists=True,
+                materialized=True,
+                view_properties=view_properties,
             )
         self._create_materialized_view(
             view_name,

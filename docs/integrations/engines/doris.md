@@ -1,5 +1,8 @@
 # Apache Doris
 
+!!! info
+    The Doris engine adapter is a community contribution. Due to this, only limited community support is available.
+
 This page describes SQLMesh support for the [Apache Doris](https://doris.apache.org/) engine (versions 2.1, 3.x, 4.x, and 5.0), including native Doris OLAP tables and Apache Iceberg multi-catalog lakehouse tables.
 
 !!! note
@@ -260,7 +263,7 @@ SQLMesh can also create, partition, and overwrite Apache Iceberg tables directly
     When materializing models directly inside an external Iceberg catalog:
 
     - Set `virtual_environment_mode: dev_only` (and keep `environment_suffix_target: schema` or `table`) in `config.yaml` so production tables are materialized directly in the Iceberg catalog without virtual views.
-    - Configure `environment_catalog_mapping` in `config.yaml` to route non-`prod` virtual environment views to the `internal` catalog (otherwise `DorisEngineAdapter` will log a warning and skip view creation in external catalogs during `dev` promotion):
+    - Configure `environment_catalog_mapping` in `config.yaml` to route non-`prod` virtual environment views to the `internal` catalog (otherwise `DorisEngineAdapter` will raise an error when attempting to create views in an external catalog):
       ```yaml
       virtual_environment_mode: dev_only
       environment_suffix_target: schema
