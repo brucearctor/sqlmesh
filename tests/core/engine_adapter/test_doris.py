@@ -1423,6 +1423,34 @@ def test_key_model_mutual_exclusion_and_missing_column_validation(
             },
         )
 
+    with pytest.raises(SQLMeshError, match="only supported on UNIQUE KEY tables"):
+        adapter.create_table(
+            "db.order_by_without_uk",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "duplicate_key": exp.to_column("id"),
+                "order_by": exp.to_column("name"),
+            },
+        )
+
+    # Case-insensitive key column matching resolves to the canonical schema column name
+    adapter.create_table(
+        "db.case_insensitive_uk",
+        target_columns_to_types={
+            "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        table_properties={
+            "unique_key": exp.to_column("ID"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`case_insensitive_uk` (`id` INT, `name` VARCHAR(32)) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10"
+    ]
+
 
 def test_ctas_reorders_projections_in_place_without_double_subquery(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],

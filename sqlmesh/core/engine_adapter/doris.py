@@ -1281,7 +1281,7 @@ class DorisEngineAdapter(
                 target_columns_to_types = reordered_cols
                 if isinstance(table_name_or_schema, exp.Schema):
                     col_def_map = {
-                        col_def.name: col_def
+                        col_def.name.lower(): col_def
                         for col_def in table_name_or_schema.expressions
                         if isinstance(col_def, exp.ColumnDef)
                     }
@@ -1291,28 +1291,28 @@ class DorisEngineAdapter(
                         if not isinstance(e, exp.ColumnDef)
                     ]
                     if len(col_def_map) == len(target_columns_to_types) and all(
-                        c in col_def_map for c in target_columns_to_types
+                        c.lower() in col_def_map for c in target_columns_to_types
                     ):
                         table_name_or_schema = table_name_or_schema.copy()
                         table_name_or_schema.set(
                             "expressions",
-                            [col_def_map[c] for c in target_columns_to_types] + other_exprs,
+                            [col_def_map[c.lower()] for c in target_columns_to_types] + other_exprs,
                         )
                 if expression is not None and isinstance(expression, exp.Query):
                     reordered_in_place = False
                     if isinstance(expression, exp.Select):
                         proj_by_name = {
-                            proj.alias_or_name: proj
+                            proj.alias_or_name.lower(): proj
                             for proj in expression.expressions
                             if proj.alias_or_name
                         }
                         if len(proj_by_name) == len(expression.expressions) == len(
                             target_columns_to_types
-                        ) and all(c in proj_by_name for c in target_columns_to_types):
+                        ) and all(c.lower() in proj_by_name for c in target_columns_to_types):
                             expression = expression.copy()
                             expression.set(
                                 "expressions",
-                                [proj_by_name[c] for c in target_columns_to_types],
+                                [proj_by_name[c.lower()] for c in target_columns_to_types],
                             )
                             reordered_in_place = True
                     if not reordered_in_place:
@@ -1362,15 +1362,17 @@ class DorisEngineAdapter(
             return target_columns_to_types
 
         if explicit_key:
+            col_by_lower = {c.lower(): c for c in col_names}
             raw_key_cols = self._extract_column_names(explicit_key)
-            missing_cols = [k for k in raw_key_cols if k not in target_columns_to_types]
+            missing_cols = [k for k in raw_key_cols if k.lower() not in col_by_lower]
             if missing_cols:
                 raise SQLMeshError(
                     f"Doris key columns {missing_cols} not found in table schema columns {col_names}."
                 )
-            key_cols = [k for k in raw_key_cols if k in target_columns_to_types]
+            key_cols = [col_by_lower[k.lower()] for k in raw_key_cols if k.lower() in col_by_lower]
             if key_cols and col_names[: len(key_cols)] != key_cols:
-                new_order = key_cols + [c for c in col_names if c not in key_cols]
+                key_cols_set = set(key_cols)
+                new_order = key_cols + [c for c in col_names if c not in key_cols_set]
                 return {c: target_columns_to_types[c] for c in new_order}
             return target_columns_to_types
 
@@ -1652,13 +1654,22 @@ class DorisEngineAdapter(
                     f"Doris tables support at most one key model (unique_key, duplicate_key, or aggregate_key), "
                     f"got multiple: {', '.join(specified_key_types)}."
                 )
+            col_by_lower = (
+                {c.lower(): c for c in target_columns_to_types} if target_columns_to_types else {}
+            )
             active_key_cols = unique_key_cols or duplicate_key_cols or aggregate_key_cols
-            if active_key_cols and target_columns_to_types:
-                missing_cols = [k for k in active_key_cols if k not in target_columns_to_types]
+            if active_key_cols and col_by_lower and not is_materialized_view:
+                missing_cols = [k for k in active_key_cols if k.lower() not in col_by_lower]
                 if missing_cols:
                     raise SQLMeshError(
-                        f"Doris key columns {missing_cols} not found in table schema columns {list(target_columns_to_types)}."
+                        f"Doris key columns {missing_cols} not found in table schema columns {list(target_columns_to_types or ())}."
                     )
+                if unique_key_cols:
+                    unique_key_cols = [col_by_lower[k.lower()] for k in unique_key_cols]
+                elif duplicate_key_cols:
+                    duplicate_key_cols = [col_by_lower[k.lower()] for k in duplicate_key_cols]
+                elif aggregate_key_cols:
+                    aggregate_key_cols = [col_by_lower[k.lower()] for k in aggregate_key_cols]
 
             if unique_key_cols:
                 properties.append(
@@ -1677,6 +1688,17 @@ class DorisEngineAdapter(
                 )
 
             if order_by_cols and not is_materialized_view:
+                if not unique_key_cols:
+                    raise SQLMeshError(
+                        "Doris table property 'order_by' is only supported on UNIQUE KEY tables."
+                    )
+                if col_by_lower:
+                    missing_order_cols = [k for k in order_by_cols if k.lower() not in col_by_lower]
+                    if missing_order_cols:
+                        raise SQLMeshError(
+                            f"Doris order_by columns {missing_order_cols} not found in table schema columns {list(target_columns_to_types or ())}."
+                        )
+                    order_by_cols = [col_by_lower[k.lower()] for k in order_by_cols]
                 order_cols_sql = ", ".join(self._to_sql(exp.to_column(k)) for k in order_by_cols)
                 properties.append(
                     exp.SetConfigProperty(this=exp.var(f"ORDER BY ({order_cols_sql})"))
@@ -1703,11 +1725,11 @@ class DorisEngineAdapter(
         if partitioned_by:
             parsed_part_exprs, _ = self._parse_partition_expressions(partitioned_by)
             if unique_key_cols and not is_materialized_view and not is_iceberg:
-                key_cols_set = set(unique_key_cols)
+                key_cols_set = {k.lower() for k in unique_key_cols}
                 partition_cols = set()
                 for expr in parsed_part_exprs:
                     for col_node in expr.find_all(exp.Column):
-                        partition_cols.add(col_node.name)
+                        partition_cols.add(col_node.name.lower())
                 not_in_key = partition_cols - key_cols_set
                 if not_in_key:
                     logger.warning(
