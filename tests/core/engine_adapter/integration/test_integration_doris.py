@@ -224,3 +224,142 @@ def test_merge_unique_key(ctx: TestContext):
             ]
         ),
     )
+
+
+def test_auto_partition_and_insert_overwrite_by_partition(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+    from sqlglot import parse_one
+
+    table = ctx.table("test_auto_partition")
+    columns_to_types = {
+        "payload": exp.DataType.build("STRING", dialect="doris"),
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "ds": exp.DataType.build("DATE", dialect="doris"),
+    }
+    partitioned_by = [parse_one("RANGE(DATE_TRUNC(ds, 'day'))", read="doris")]
+    ctx.engine_adapter.create_table(
+        table,
+        columns_to_types,
+        partitioned_by=partitioned_by,
+        table_properties={"auto_partition": exp.Literal.string("true")},
+    )
+    initial_data = pd.DataFrame(
+        [
+            {"payload": "a", "id": 1, "ds": "2022-01-01"},
+            {"payload": "b", "id": 2, "ds": "2022-01-02"},
+        ]
+    )
+    ctx.engine_adapter.insert_append(
+        table,
+        ctx.input_data(initial_data, columns_to_types),
+        target_columns_to_types=columns_to_types,
+    )
+    overwrite_data = pd.DataFrame(
+        [
+            {"payload": "b_updated", "id": 20, "ds": "2022-01-02"},
+            {"payload": "c", "id": 3, "ds": "2022-01-03"},
+        ]
+    )
+    ctx.engine_adapter.insert_overwrite_by_partition(
+        table,
+        ctx.input_data(overwrite_data, columns_to_types),
+        partitioned_by=partitioned_by,
+        target_columns_to_types=columns_to_types,
+    )
+    rows = ctx.engine_adapter.fetchall(
+        exp.select("id", exp.cast(exp.column("ds"), "VARCHAR").as_("ds"), "payload")
+        .from_(table)
+        .order_by("id")
+    )
+    assert list(rows) == [
+        (1, "2022-01-01", "a"),
+        (3, "2022-01-03", "c"),
+        (20, "2022-01-02", "b_updated"),
+    ]
+
+
+def test_unique_key_order_by_and_key_reordering(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+
+    table = ctx.table("test_uk_order_by")
+    columns_to_types = {
+        "payload": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "ds": exp.DataType.build("DATE", dialect="doris"),
+        "seq": exp.DataType.build("INT", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(
+        table,
+        columns_to_types,
+        unique_key=[exp.to_column("id"), exp.to_column("ds")],
+        table_properties={
+            "order_by": exp.Tuple(expressions=[exp.to_column("seq"), exp.to_column("id")]),
+        },
+    )
+    df = pd.DataFrame(
+        [
+            {"payload": "first", "id": 1, "ds": "2022-01-01", "seq": 10},
+            {"payload": "second", "id": 2, "ds": "2022-01-02", "seq": 5},
+        ]
+    )
+    ctx.engine_adapter.insert_append(
+        table,
+        ctx.input_data(df, columns_to_types),
+        target_columns_to_types=columns_to_types,
+    )
+    rows = ctx.engine_adapter.fetchall(
+        exp.select("id", exp.cast(exp.column("ds"), "VARCHAR").as_("ds"), "seq", "payload")
+        .from_(table)
+        .order_by("id")
+    )
+    assert list(rows) == [
+        (1, "2022-01-01", 10, "first"),
+        (2, "2022-01-02", 5, "second"),
+    ]
+
+
+def test_duplicate_key_delete_with_subquery_and_between(ctx: TestContext):
+    import pandas as pd  # noqa: TID253
+
+    target_table = ctx.table("test_dup_delete_target")
+    src_table = ctx.table("test_dup_delete_src")
+    ctx.engine_adapter.create_table(
+        target_table,
+        ctx.columns_to_types,
+        table_properties={
+            "duplicate_key": exp.Tuple(expressions=[exp.to_column("id"), exp.to_column("ds")]),
+        },
+    )
+    input_data = pd.DataFrame(
+        [
+            {"id": 1, "ds": "2022-01-01"},
+            {"id": 2, "ds": "2022-01-02"},
+            {"id": 3, "ds": "2022-01-03"},
+            {"id": 4, "ds": "2022-01-04"},
+        ]
+    )
+    ctx.engine_adapter.insert_append(
+        target_table,
+        ctx.input_data(input_data),
+        target_columns_to_types=ctx.columns_to_types,
+    )
+    # 1. BETWEEN rewrite in DELETE WHERE
+    ctx.engine_adapter.delete_from(target_table, "ds BETWEEN '2022-01-01' AND '2022-01-01'")
+
+    # 2. Subquery DELETE on DUPLICATE KEY table (triggers literal batch fallback since USING requires UNIQUE KEY)
+    src_data = pd.DataFrame([{"id": 2, "ds": "2022-01-02"}])
+    ctx.engine_adapter.ctas(src_table, ctx.input_data(src_data), ctx.columns_to_types)
+    key_exp = exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", exp.column("id"), exp.column("ds"))
+    ctx.engine_adapter.delete_from(
+        target_table,
+        where=key_exp.isin(query=exp.select(key_exp).from_(src_table)),
+    )
+    ctx.compare_with_current(
+        target_table,
+        pd.DataFrame(
+            [
+                {"id": 3, "ds": "2022-01-03"},
+                {"id": 4, "ds": "2022-01-04"},
+            ]
+        ),
+    )

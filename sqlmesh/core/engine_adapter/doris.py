@@ -918,6 +918,14 @@ class DorisEngineAdapter(
         if subquery_info is not None:
             self._execute_delete_with_subquery(table_name, *subquery_info)
         else:
+            target_table = exp.to_table(table_name)
+            for col in where.find_all(exp.Column):
+                if not col.find_ancestor(exp.Subquery, exp.Select) and (
+                    col.table and col.table.lower() == target_table.name.lower()
+                ):
+                    col.set("table", None)
+                    col.set("db", None)
+                    col.set("catalog", None)
             super().delete_from(table_name, where)
 
     @classmethod
@@ -1157,7 +1165,19 @@ class DorisEngineAdapter(
         if not rows:
             return
 
-        extra_conditions = extra_conditions or []
+        target_table = exp.to_table(table_name)
+        cleaned_extra_conditions: t.List[exp.Expr] = []
+        for extra in extra_conditions or []:
+            cleaned_extra = extra.copy()
+            for col in cleaned_extra.find_all(exp.Column):
+                if not col.find_ancestor(exp.Subquery, exp.Select) and (
+                    col.table and col.table.lower() == target_table.name.lower()
+                ):
+                    col.set("table", None)
+                    col.set("db", None)
+                    col.set("catalog", None)
+            cleaned_extra_conditions.append(cleaned_extra)
+        extra_conditions = cleaned_extra_conditions
         cols = [exp.column(k.name, quoted=True) for k in key_exprs]
         batch_size = self.DEFAULT_BATCH_SIZE
 
@@ -1358,6 +1378,51 @@ class DorisEngineAdapter(
                         [proj_by_name[c.lower()] for c in reordered_select_cols],
                     )
 
+        # Doris AUTO PARTITION BY RANGE requires the partition column(s) to be defined as NOT NULL.
+        if not is_iceberg and isinstance(table_name_or_schema, exp.Schema):
+            table_props = kwargs.get("table_properties") or {}
+            auto_partition = table_props.get("auto_partition")
+            is_auto = bool(
+                auto_partition is not None
+                and str(self._extract_str_value(auto_partition) or "").strip().lower()
+                in ("true", "1")
+            )
+            raw_part_by = kwargs.get("partitioned_by") or table_props.get("partitioned_by")
+            if is_auto and raw_part_by:
+                part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
+                parsed_part_exprs, part_kind = self._parse_partition_expressions(part_list)
+                if (part_kind or "RANGE").upper() != "LIST":
+                    auto_range_cols = {
+                        col.name.lower()
+                        for expr in parsed_part_exprs
+                        for col in expr.find_all(exp.Column)
+                    }
+                    if auto_range_cols:
+                        table_name_or_schema = table_name_or_schema.copy()
+                        updated_exprs: t.List[exp.Expr] = []
+                        for expr in table_name_or_schema.expressions:
+                            if (
+                                isinstance(expr, exp.ColumnDef)
+                                and expr.name.lower() in auto_range_cols
+                            ):
+                                existing_constraints = list(expr.args.get("constraints") or [])
+                                has_not_null = any(
+                                    isinstance(c, exp.NotNullColumnConstraint)
+                                    or isinstance(
+                                        getattr(c, "kind", None), exp.NotNullColumnConstraint
+                                    )
+                                    for c in existing_constraints
+                                )
+                                if not has_not_null:
+                                    expr = expr.copy()
+                                    expr.set(
+                                        "constraints",
+                                        [exp.ColumnConstraint(kind=exp.NotNullColumnConstraint())]
+                                        + existing_constraints,
+                                    )
+                            updated_exprs.append(expr)
+                        table_name_or_schema.set("expressions", updated_exprs)
+
         return super()._build_create_table_exp(
             table_name_or_schema,
             expression=expression,
@@ -1421,8 +1486,44 @@ class DorisEngineAdapter(
                 None,
             )
             if valid_col:
-                new_order = [valid_col] + [c for c in col_names if c != valid_col]
-                return {c: target_columns_to_types[c] for c in new_order}
+                col_names = [valid_col] + [c for c in col_names if c != valid_col]
+
+        # Ensure any OLAP partition columns with valid key types precede non-keyable columns
+        raw_part_by = kwargs.get("partitioned_by") or table_props.get("partitioned_by")
+        if raw_part_by:
+            part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
+            parsed_part_exprs, _ = self._parse_partition_expressions(part_list)
+            col_by_lower = {c.lower(): c for c in col_names}
+            part_cols = [
+                col_by_lower[col.name.lower()]
+                for expr in parsed_part_exprs
+                for col in expr.find_all(exp.Column)
+                if col.name.lower() in col_by_lower
+                and self._is_valid_olap_key_type(
+                    target_columns_to_types[col_by_lower[col.name.lower()]]
+                )
+            ]
+            first_non_key_idx = next(
+                (
+                    i
+                    for i, c in enumerate(col_names)
+                    if not self._is_valid_olap_key_type(target_columns_to_types[c])
+                ),
+                None,
+            )
+            if (
+                part_cols
+                and first_non_key_idx is not None
+                and any(col_names.index(p) > first_non_key_idx for p in part_cols)
+            ):
+                moved_parts = [p for p in part_cols if col_names.index(p) > first_non_key_idx]
+                moved_set = set(moved_parts)
+                before_non_key = [c for c in col_names[:first_non_key_idx] if c not in moved_set]
+                after_non_key = [c for c in col_names[first_non_key_idx:] if c not in moved_set]
+                col_names = before_non_key + moved_parts + after_non_key
+
+        if col_names != list(target_columns_to_types):
+            return {c: target_columns_to_types[c] for c in col_names}
 
         return target_columns_to_types
 
@@ -1513,6 +1614,17 @@ class DorisEngineAdapter(
         dynamic_partition_enabled = kwargs.get("dynamic_partition_enabled")
 
         partitioned_by, partition_kind = self._parse_partition_expressions(partitioned_by)
+        if target_columns_to_types:
+            col_by_lower = {c.lower(): c for c in target_columns_to_types}
+            normalized_exprs: t.List[exp.Expr] = []
+            for expr in partitioned_by:
+                expr_copy = expr.copy()
+                for col_node in expr_copy.find_all(exp.Column):
+                    canonical = col_by_lower.get(col_node.name.lower())
+                    if canonical and canonical != col_node.name:
+                        col_node.set("this", exp.to_identifier(canonical))
+                normalized_exprs.append(expr_copy)
+            partitioned_by = normalized_exprs
 
         if is_iceberg:
             return exp.PartitionByListProperty(
@@ -1685,6 +1797,9 @@ class DorisEngineAdapter(
         duplicate_key_cols = self._extract_column_names(duplicate_key)
         aggregate_key_cols = self._extract_column_names(aggregate_key)
         order_by_cols = self._extract_column_names(order_by)
+        col_by_lower = (
+            {c.lower(): c for c in target_columns_to_types} if target_columns_to_types else {}
+        )
 
         if not is_iceberg:
             specified_key_types = [
@@ -1701,9 +1816,6 @@ class DorisEngineAdapter(
                     f"Doris tables support at most one key model (unique_key, duplicate_key, or aggregate_key), "
                     f"got multiple: {', '.join(specified_key_types)}."
                 )
-            col_by_lower = (
-                {c.lower(): c for c in target_columns_to_types} if target_columns_to_types else {}
-            )
             active_key_cols = unique_key_cols or duplicate_key_cols or aggregate_key_cols
             if active_key_cols and col_by_lower and not is_materialized_view:
                 missing_cols = [k for k in active_key_cols if k.lower() not in col_by_lower]
@@ -1771,16 +1883,18 @@ class DorisEngineAdapter(
         add_partition = True
         if partitioned_by:
             parsed_part_exprs, _ = self._parse_partition_expressions(partitioned_by)
-            if unique_key_cols and not is_materialized_view and not is_iceberg:
-                key_cols_set = {k.lower() for k in unique_key_cols}
+            strict_part_key_cols = unique_key_cols or aggregate_key_cols
+            if strict_part_key_cols and not is_materialized_view and not is_iceberg:
+                key_cols_set = {k.lower() for k in strict_part_key_cols}
                 partition_cols = set()
                 for expr in parsed_part_exprs:
                     for col_node in expr.find_all(exp.Column):
                         partition_cols.add(col_node.name.lower())
                 not_in_key = partition_cols - key_cols_set
                 if not_in_key:
+                    key_label = "UNIQUE KEY" if unique_key_cols else "AGGREGATE KEY"
                     logger.warning(
-                        f"[Doris] UNIQUE KEY model: partitioned_by columns {not_in_key} not in key_cols {key_cols_set}, skip PARTITION BY."
+                        f"[Doris] {key_label} model: partitioned_by columns {not_in_key} not in key_cols {key_cols_set}, skip PARTITION BY."
                     )
                     add_partition = False
 
@@ -1810,6 +1924,19 @@ class DorisEngineAdapter(
                         is_iceberg=is_iceberg,
                     )
                     if partition_expr:
+                        if col_by_lower:
+                            part_col_nodes = [
+                                col_node
+                                for expr in parsed_part_exprs
+                                for col_node in expr.find_all(exp.Column)
+                            ]
+                            missing_part_cols = [
+                                c.name for c in part_col_nodes if c.name.lower() not in col_by_lower
+                            ]
+                            if missing_part_cols:
+                                raise SQLMeshError(
+                                    f"Doris partitioned_by columns {missing_part_cols} not found in table schema columns {list(target_columns_to_types or ())}."
+                                )
                         properties.append(partition_expr)
 
         # Pop distribution / bucketing properties so they never leak into PROPERTIES (...)
@@ -1823,21 +1950,23 @@ class DorisEngineAdapter(
         )
 
         if not is_iceberg:
+            strict_key_cols = (
+                (unique_key_cols or aggregate_key_cols) if not is_materialized_view else []
+            )
             dist_prop = self._build_distributed_by_exp(
                 distributed_by=distributed_by,
                 clustered_by=effective_clustered_by,
-                unique_key_cols=unique_key_cols if not is_materialized_view else [],
-                fallback_key_cols=(
-                    (duplicate_key_cols or aggregate_key_cols) if not is_materialized_view else []
-                ),
+                unique_key_cols=strict_key_cols,
+                fallback_key_cols=duplicate_key_cols if not is_materialized_view else [],
                 top_level_buckets=top_level_buckets,
             )
             if dist_prop is not None:
                 if not is_materialized_view:
                     dist_kind = str(dist_prop.args.get("kind") or "").upper()
-                    if unique_key_cols and dist_kind == "RANDOM":
+                    if strict_key_cols and dist_kind == "RANDOM":
+                        key_kind_label = "UNIQUE KEY" if unique_key_cols else "AGGREGATE KEY"
                         raise SQLMeshError(
-                            "Doris UNIQUE KEY tables do not support DISTRIBUTED BY RANDOM. "
+                            f"Doris {key_kind_label} tables do not support DISTRIBUTED BY RANDOM. "
                             "Use DISTRIBUTED BY HASH (...) instead."
                         )
                     if col_by_lower and dist_prop.expressions:
@@ -1853,6 +1982,19 @@ class DorisEngineAdapter(
                             "expressions",
                             [exp.to_column(col_by_lower[c.lower()]) for c in dist_col_names],
                         )
+                    if strict_key_cols and dist_prop.expressions:
+                        strict_key_set = {k.lower() for k in strict_key_cols}
+                        non_key_dist_cols = [
+                            c.name
+                            for c in dist_prop.expressions
+                            if c.name.lower() not in strict_key_set
+                        ]
+                        if non_key_dist_cols:
+                            key_kind_label = "UNIQUE KEY" if unique_key_cols else "AGGREGATE KEY"
+                            raise SQLMeshError(
+                                f"Doris {key_kind_label} tables require distributed_by columns to be key columns, "
+                                f"got {non_key_dist_cols} which are not in {strict_key_cols}."
+                            )
                 properties.append(dist_prop)
 
         # Default replication_num = 1 for single-BE dev/CI when not explicitly configured on OLAP tables
@@ -2159,9 +2301,16 @@ class DorisEngineAdapter(
 
         # Fallback 1: Top-level clustered_by (or physical_properties clustered_by)
         if clustered_by:
-            cols = [
-                exp.to_column(c) for expr in clustered_by for c in self._extract_column_names(expr)
-            ]
+            col_names = [c for expr in clustered_by for c in self._extract_column_names(expr)]
+            if unique_key_cols:
+                strict_key_set = {k.lower() for k in unique_key_cols}
+                not_in_key = [c for c in col_names if c.lower() not in strict_key_set]
+                if not_in_key:
+                    logger.warning(
+                        f"[Doris] clustered_by columns {not_in_key} not in key columns {unique_key_cols}, falling back to key column distribution."
+                    )
+                    col_names = []
+            cols = [exp.to_column(c) for c in col_names]
             if cols:
                 return exp.DistributedByProperty(
                     kind=exp.Var(this="HASH"),

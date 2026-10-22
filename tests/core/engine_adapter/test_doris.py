@@ -724,17 +724,21 @@ def test_create_table_auto_partition_and_unannotated_partitioned_by_guard(
         target_columns_to_types={"id": exp.DataType.build("INT"), "ds": exp.DataType.build("DATE")},
         partitioned_by=[exp.to_column("ds")],
     )
-    # With auto_partition = true, emits AUTO PARTITION BY RANGE (...) ()
+    # With auto_partition = true, emits AUTO PARTITION BY RANGE (...) () and marks range partition column NOT NULL
     adapter.create_table(
         "olap_auto_partition",
-        target_columns_to_types={"id": exp.DataType.build("INT"), "ds": exp.DataType.build("DATE")},
+        target_columns_to_types={
+            "payload": exp.DataType.build("STRING", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
         partitioned_by=[parse_one("RANGE(DATE_TRUNC(ds, 'DAY'))", dialect="doris")],
         table_properties={"auto_partition": exp.Literal.string("true")},
     )
 
     assert to_sql_calls(adapter) == [
         "CREATE TABLE IF NOT EXISTS `olap_no_partitions` (`id` INT, `ds` DATE)",
-        "CREATE TABLE IF NOT EXISTS `olap_auto_partition` (`id` INT, `ds` DATE) AUTO PARTITION BY RANGE (DATE_TRUNC(`ds`, 'DAY')) ()",
+        "CREATE TABLE IF NOT EXISTS `olap_auto_partition` (`id` INT, `ds` DATE NOT NULL, `payload` STRING) AUTO PARTITION BY RANGE (DATE_TRUNC(`ds`, 'DAY')) ()",
     ]
 
 
@@ -1529,6 +1533,54 @@ def test_key_model_mutual_exclusion_and_missing_column_validation(
             },
         )
 
+    # Explicit distributed_by on UNIQUE KEY / AGGREGATE KEY must be a subset of key columns
+    with pytest.raises(
+        SQLMeshError,
+        match="Doris UNIQUE KEY tables require distributed_by columns to be key columns",
+    ):
+        adapter.create_table(
+            "db.uk_non_key_dist",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={
+                "unique_key": exp.to_column("id"),
+                "distributed_by": "HASH(name) BUCKETS 8",
+            },
+        )
+
+    # Cross-engine clustered_by on non-key column for UNIQUE KEY table falls back to key column
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "db.uk_clustered_by_fallback",
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+        },
+        clustered_by=[exp.to_column("name")],
+        table_properties={
+            "unique_key": exp.to_column("id"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`uk_clustered_by_fallback` (`id` INT, `name` VARCHAR(32)) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10"
+    ]
+
+    # Missing partitioned_by column raises SQLMeshError when partitioning is active
+    with pytest.raises(
+        SQLMeshError, match="Doris partitioned_by columns .* not found in table schema columns"
+    ):
+        adapter.create_table(
+            "db.missing_part_col",
+            target_columns_to_types={
+                "id": exp.DataType.build("INT", dialect="doris"),
+                "ds": exp.DataType.build("DATE", dialect="doris"),
+            },
+            partitioned_by=[parse_one("RANGE(missing_ds)", read="doris")],
+            table_properties={"auto_partition": exp.Literal.string("true")},
+        )
+
 
 def test_ctas_reorders_projections_in_place_without_double_subquery(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
@@ -1603,6 +1655,16 @@ def test_delete_from_boolean_literal_simplification(
     )
     assert to_sql_calls(adapter) == [
         "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`src`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`ds` = '2024-01-01'"
+    ]
+
+    # Target-qualified condition in simple DELETE FROM is stripped to unqualified column for Doris DeleteHandler
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from(
+        "db.target",
+        where="target.ds = '2024-01-01' AND target.id = 5",
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`target` WHERE `ds` = '2024-01-01' AND `id` = 5"
     ]
 
 
