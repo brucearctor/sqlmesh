@@ -8,6 +8,7 @@ import typing as t
 
 import pandas as pd  # noqa: TID253
 from sqlglot import exp, parse, parse_one
+from sqlglot.optimizer.qualify_columns import quote_identifiers
 
 from sqlmesh.core.dialect import to_schema
 from sqlmesh.core.engine_adapter.base import (
@@ -30,7 +31,7 @@ from sqlmesh.core.engine_adapter.shared import (
     SourceQuery,
     set_catalog,
 )
-from sqlmesh.utils import get_source_columns_to_types, random_id
+from sqlmesh.utils import columns_to_types_all_known, get_source_columns_to_types, random_id
 from sqlmesh.utils.errors import SQLMeshError
 
 if t.TYPE_CHECKING:
@@ -271,7 +272,34 @@ class DorisEngineAdapter(
                 logger.info("Connection to the database was lost. Reconnecting...")
                 self._connection_pool.close()
         self._connection_pool.get_cursor()
-        return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
+        try:
+            return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
+        except Exception as e:
+            err_code = e.args[0] if getattr(e, "args", None) else None
+            err_name = e.__class__.__name__
+            is_disconnect = (err_code in (2006, 2013, 2055) and err_name == "OperationalError") or (
+                err_code == 0 and err_name == "InterfaceError"
+            )
+            is_timeout = (
+                isinstance(getattr(e, "__context__", None), TimeoutError)
+                or "timed out" in str(e).lower()
+            )
+            if is_disconnect and not is_timeout and not self._connection_pool.is_transaction_active:
+                logger.warning(
+                    "Doris connection lost (%s: %s) during fetchdf, reconnecting and retrying once...",
+                    err_name,
+                    err_code,
+                )
+                self._connection_pool.close()
+                try:
+                    self._connection_pool.get_cursor()
+                    return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
+                except Exception:
+                    self._connection_pool.close()
+                    raise
+            if is_disconnect and not self._connection_pool.is_transaction_active:
+                self._connection_pool.close()
+            raise
 
     _SAFE_RETRY_SQL_PREFIX_RE = re.compile(
         r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH)\b",
@@ -955,16 +983,22 @@ class DorisEngineAdapter(
         subquery_info = self._extract_subquery_from_where(where)
         if subquery_info is not None:
             self._execute_delete_with_subquery(table_name, *subquery_info)
-        else:
-            target_table = exp.to_table(table_name)
-            for col in where.find_all(exp.Column):
-                if not col.find_ancestor(exp.Subquery, exp.Select) and (
-                    col.table and col.table.lower() == target_table.name.lower()
-                ):
-                    col.set("table", None)
-                    col.set("db", None)
-                    col.set("catalog", None)
-            super().delete_from(table_name, where)
+            return
+
+        tuple_in_info = self._extract_literal_tuple_in_from_where(where)
+        if tuple_in_info is not None:
+            self._delete_key_rows(table_name, *tuple_in_info, is_ast_values=True)
+            return
+
+        target_table = exp.to_table(table_name)
+        for col in where.find_all(exp.Column):
+            if not col.find_ancestor(exp.Subquery, exp.Select) and (
+                col.table and col.table.lower() == target_table.name.lower()
+            ):
+                col.set("table", None)
+                col.set("db", None)
+                col.set("catalog", None)
+        super().delete_from(table_name, where)
 
     @classmethod
     def _simplify_boolean_where(cls, expr: exp.Expr) -> exp.Expr:
@@ -1060,15 +1094,17 @@ class DorisEngineAdapter(
 
         lhs_concat = self._unwrap_concat_ws(lhs)
         if lhs_concat is not None:
+            if not (isinstance(select_expr, exp.Select) and len(select_expr.expressions) == 1):
+                return None
+            first_sel = select_expr.expressions[0]
+            raw_sel = first_sel.this if isinstance(first_sel, exp.Alias) else first_sel
+            sel_concat = self._unwrap_concat_ws(raw_sel)
+            if sel_concat is None or len(sel_concat.expressions) != len(lhs_concat.expressions):
+                return None
             key_exprs = [e.copy() for e in lhs_concat.expressions[1:]]
-            if isinstance(select_expr, exp.Select) and len(select_expr.expressions) == 1:
-                first_sel = select_expr.expressions[0]
-                raw_sel = first_sel.this if isinstance(first_sel, exp.Alias) else first_sel
-                sel_concat = self._unwrap_concat_ws(raw_sel)
-                if sel_concat is not None:
-                    select_expr = select_expr.copy()
-                    select_expr.set("expressions", [e.copy() for e in sel_concat.expressions[1:]])
-                    subquery = exp.Subquery(this=select_expr)
+            select_expr = select_expr.copy()
+            select_expr.set("expressions", [e.copy() for e in sel_concat.expressions[1:]])
+            subquery = exp.Subquery(this=select_expr)
         elif isinstance(lhs, exp.Tuple):
             key_exprs = [e.copy() for e in lhs.expressions]
         else:
@@ -1087,6 +1123,58 @@ class DorisEngineAdapter(
             return None
 
         return normalized_keys, subquery, extra_conditions
+
+    def _extract_literal_tuple_in_from_where(
+        self, where: exp.Expr
+    ) -> t.Optional[t.Tuple[t.List[exp.Expr], t.List[t.Tuple[exp.Expr, ...]], t.List[exp.Expr]]]:
+        """Extract positive literal tuple IN predicate `(a, b) IN ((1, 2), (3, 4))` and sibling AND conditions."""
+        where = where.unnest()
+        conjuncts: t.List[exp.Expr] = (
+            list(where.flatten()) if isinstance(where, exp.And) else [where]
+        )
+        target_in: t.Optional[exp.In] = None
+        extra_conditions: t.List[exp.Expr] = []
+
+        for cond in conjuncts:
+            unwrapped_cond = cond.unnest()
+            if (
+                target_in is None
+                and isinstance(unwrapped_cond, exp.In)
+                and self._get_in_subquery(unwrapped_cond) is None
+                and isinstance(unwrapped_cond.this, exp.Tuple)
+                and len(unwrapped_cond.this.expressions) >= 2
+                and unwrapped_cond.expressions
+                and all(
+                    isinstance(item, exp.Tuple)
+                    and len(item.expressions) == len(unwrapped_cond.this.expressions)
+                    for item in unwrapped_cond.expressions
+                )
+            ):
+                target_in = unwrapped_cond
+                continue
+            extra_conditions.append(cond)
+
+        if target_in is None:
+            return None
+
+        normalized_keys: t.List[exp.Expr] = []
+        for k in target_in.this.expressions:
+            if isinstance(k, exp.Column):
+                normalized_keys.append(k.copy())
+            elif isinstance(k, exp.Identifier):
+                normalized_keys.append(exp.Column(this=k.copy()))
+            else:
+                return None
+
+        tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = [
+            tuple(e.copy() for e in item.expressions)
+            for item in target_in.expressions
+            if isinstance(item, exp.Tuple)
+        ]
+        if not tuple_rows:
+            return None
+
+        return normalized_keys, tuple_rows, extra_conditions
 
     @staticmethod
     def _unwrap_concat_ws(expr: exp.Expr) -> t.Optional[exp.Expr]:
@@ -1131,23 +1219,27 @@ class DorisEngineAdapter(
         first_select = subquery.this
         while isinstance(first_select, exp.SetOperation):
             first_select = first_select.this
+        used_t2_aliases: t.Set[str] = set()
         for idx, col in enumerate(key_exprs):
             col_name = col.name
             t1_col = exp.column(col_name, table="_t1")
             t2_col_name = col_name
             if isinstance(first_select, exp.Select) and idx < len(first_select.expressions):
                 sel_item = first_select.expressions[idx]
-                if sel_item.alias_or_name:
-                    t2_col_name = sel_item.alias_or_name
+                candidate_name = sel_item.alias_or_name
+                if candidate_name and candidate_name.lower() not in used_t2_aliases:
+                    t2_col_name = candidate_name
                 elif isinstance(subquery.this, exp.Select):
                     alias_name = f"_col_{idx}"
                     subquery = subquery.copy()
                     sub_select = t.cast(exp.Select, subquery.this)
                     new_exprs = list(sub_select.expressions)
-                    new_exprs[idx] = exp.alias_(sel_item.copy(), alias_name, quoted=True)
+                    inner_expr = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
+                    new_exprs[idx] = exp.alias_(inner_expr.copy(), alias_name, quoted=True)
                     sub_select.set("expressions", new_exprs)
                     first_select = sub_select
                     t2_col_name = alias_name
+            used_t2_aliases.add(t2_col_name.lower())
             t2_col = exp.column(t2_col_name, table="_t2")
             join_conditions.append(t1_col.eq(t2_col))
 
@@ -1221,6 +1313,26 @@ class DorisEngineAdapter(
         rows = self.fetchall(select_query, quote_identifiers=True)
         if not rows:
             return
+        sanitized_rows = [tuple(self._sanitize_key_value(v) for v in row) for row in rows]
+        self._delete_key_rows(
+            table_name,
+            key_exprs,
+            sanitized_rows,
+            extra_conditions=extra_conditions,
+            is_ast_values=False,
+        )
+
+    def _delete_key_rows(
+        self,
+        table_name: TableName,
+        key_exprs: t.List[exp.Expr],
+        rows: t.Sequence[t.Tuple[t.Any, ...]],
+        extra_conditions: t.Optional[t.List[exp.Expr]] = None,
+        *,
+        is_ast_values: bool = False,
+    ) -> None:
+        if not rows:
+            return
 
         target_table = exp.to_table(table_name)
         cleaned_extra_conditions: t.List[exp.Expr] = []
@@ -1238,12 +1350,22 @@ class DorisEngineAdapter(
         cols = [exp.column(k.name, quoted=True) for k in key_exprs]
         batch_size = self.DEFAULT_BATCH_SIZE
 
-        sanitized_rows = [tuple(self._sanitize_key_value(v) for v in row) for row in rows]
+        def _is_null_val(val: t.Any) -> bool:
+            if val is None:
+                return True
+            if is_ast_values and isinstance(val, exp.Null):
+                return True
+            return False
+
+        def _to_expr(val: t.Any) -> exp.Expr:
+            if is_ast_values and isinstance(val, exp.Expr):
+                return val.copy()
+            return exp.convert(val)
 
         if len(cols) == 1:
             col = cols[0]
-            non_null_vals = [exp.convert(r[0]) for r in sanitized_rows if r[0] is not None]
-            has_null = any(r[0] is None for r in sanitized_rows)
+            non_null_vals = [_to_expr(r[0]) for r in rows if not _is_null_val(r[0])]
+            has_null = any(_is_null_val(r[0]) for r in rows)
 
             for i in range(0, len(non_null_vals), batch_size):
                 batch = non_null_vals[i : i + batch_size]
@@ -1259,10 +1381,10 @@ class DorisEngineAdapter(
         # that minimizes the number of distinct prefix groups, breaking ties in favor of the last column.
         batch_idx = min(
             range(len(cols)),
-            key=lambda idx: (len({row[:idx] + row[idx + 1 :] for row in sanitized_rows}), -idx),
+            key=lambda idx: (len({row[:idx] + row[idx + 1 :] for row in rows}), -idx),
         )
         grouped: t.Dict[t.Tuple[t.Any, ...], t.List[t.Any]] = defaultdict(list)
-        for row in sanitized_rows:
+        for row in rows:
             prefix_key = row[:batch_idx] + row[batch_idx + 1 :]
             grouped[prefix_key].append(row[batch_idx])
 
@@ -1271,11 +1393,11 @@ class DorisEngineAdapter(
 
         for prefix_vals, batch_vals in grouped.items():
             prefix_preds: t.List[exp.Expr] = [
-                p_col.eq(exp.convert(p_val)) if p_val is not None else p_col.is_(exp.null())
+                p_col.eq(_to_expr(p_val)) if not _is_null_val(p_val) else p_col.is_(exp.null())
                 for p_col, p_val in zip(prefix_cols, prefix_vals)
             ]
-            non_null_batch = [exp.convert(v) for v in batch_vals if v is not None]
-            has_null_batch = any(v is None for v in batch_vals)
+            non_null_batch = [_to_expr(v) for v in batch_vals if not _is_null_val(v)]
+            has_null_batch = any(_is_null_val(v) for v in batch_vals)
 
             for i in range(0, len(non_null_batch), batch_size):
                 batch = non_null_batch[i : i + batch_size]
@@ -1345,6 +1467,92 @@ class DorisEngineAdapter(
             **kwargs,
         )
 
+    def _create_table_from_source_queries(
+        self,
+        table_name: TableName,
+        source_queries: t.List[SourceQuery],
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        exists: bool = True,
+        replace: bool = False,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        table_kind: t.Optional[str] = None,
+        track_rows_processed: bool = True,
+        **kwargs: t.Any,
+    ) -> None:
+        table = exp.to_table(table_name)
+        effective_catalog = table.catalog or self.default_catalog
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=table.catalog,
+            table_properties=kwargs.get("table_properties"),
+        )
+        is_internal_iceberg = is_iceberg and (
+            not effective_catalog or effective_catalog.lower() == "internal"
+        )
+
+        if not is_iceberg and target_columns_to_types:
+            target_columns_to_types = self._reorder_olap_columns(target_columns_to_types, kwargs)
+
+        target_columns_to_types_known = bool(
+            target_columns_to_types and columns_to_types_all_known(target_columns_to_types)
+        )
+        first_query = source_queries[0].query_factory() if source_queries else None
+        self_referencing = bool(
+            first_query
+            and any(
+                quote_identifiers(t_node.copy()) == quote_identifiers(table.copy())
+                for t_node in first_query.find_all(exp.Table)
+            )
+        )
+
+        # 1. Doris's CTAS grammar forbids `ENGINE=iceberg`, so internal/2-part Iceberg tables with known
+        #    column types must be created via schema DDL (`_create_table_from_columns`) + `INSERT INTO`.
+        # 2. When `replace_query` is called with a self-referencing query on a non-existent table,
+        #    `EngineAdapter.replace_query` creates the empty table via `_create_table_from_columns`
+        #    first and then calls `_create_table_from_source_queries(..., replace=False)`. Executing
+        #    `CREATE TABLE IF NOT EXISTS ... AS SELECT` would be a no-op, so we insert the source queries.
+        if (
+            is_internal_iceberg or (self_referencing and not replace)
+        ) and target_columns_to_types_known:
+            assert target_columns_to_types is not None
+            if not self_referencing:
+                if replace:
+                    self.drop_table(table_name, exists=True)
+                self._create_table_from_columns(
+                    table_name,
+                    target_columns_to_types,
+                    exists=exists,
+                    table_description=table_description,
+                    column_descriptions=column_descriptions,
+                    **kwargs,
+                )
+            for source_query in source_queries:
+                with source_query as query:
+                    query = self._order_projections_and_filter(
+                        query, target_columns_to_types, coerce_types=True
+                    )
+                    self._insert_append_query(
+                        table_name,
+                        query,
+                        target_columns_to_types,
+                        track_rows_processed=track_rows_processed,
+                    )
+            return
+
+        super()._create_table_from_source_queries(
+            table_name,
+            source_queries,
+            target_columns_to_types=target_columns_to_types,
+            exists=exists,
+            replace=replace,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            table_kind=table_kind,
+            track_rows_processed=track_rows_processed,
+            **kwargs,
+        )
+
     def _build_create_table_exp(
         self,
         table_name_or_schema: t.Union[exp.Schema, TableName],
@@ -1405,7 +1613,11 @@ class DorisEngineAdapter(
                             "expressions",
                             new_col_defs + other_exprs,
                         )
-                if order_changed and expression is not None and isinstance(expression, exp.Query):
+                if (
+                    (order_changed or types_changed)
+                    and expression is not None
+                    and isinstance(expression, exp.Query)
+                ):
                     reordered_in_place = False
                     if isinstance(expression, exp.Select):
                         proj_by_name = {
@@ -1417,14 +1629,31 @@ class DorisEngineAdapter(
                             target_columns_to_types
                         ) and all(c.lower() in proj_by_name for c in target_columns_to_types):
                             expression = expression.copy()
-                            expression.set(
-                                "expressions",
-                                [proj_by_name[c.lower()] for c in target_columns_to_types],
-                            )
+                            updated_projs: t.List[exp.Expr] = []
+                            for c, new_dtype in target_columns_to_types.items():
+                                proj = proj_by_name[c.lower()].copy()
+                                if types_changed and original_cols[c] != new_dtype:
+                                    if isinstance(proj, exp.Alias) and isinstance(
+                                        proj.this, exp.Cast
+                                    ):
+                                        proj.this.set("to", new_dtype.copy())
+                                    elif isinstance(proj, exp.Alias):
+                                        proj.set(
+                                            "this",
+                                            exp.cast(proj.this.copy(), to=new_dtype.copy()),
+                                        )
+                                    elif isinstance(proj, exp.Column):
+                                        proj = exp.alias_(
+                                            exp.cast(proj.copy(), to=new_dtype.copy()),
+                                            proj.name,
+                                            quoted=bool(getattr(proj.this, "quoted", True)),
+                                        )
+                                updated_projs.append(proj)
+                            expression.set("expressions", updated_projs)
                             reordered_in_place = True
                     if not reordered_in_place:
                         expression = self._order_projections_and_filter(
-                            expression, target_columns_to_types
+                            expression, target_columns_to_types, coerce_types=types_changed
                         )
         elif not is_iceberg and isinstance(expression, (exp.Select, exp.SetOperation)):
             expression = self._reorder_unannotated_ctas_query(expression, kwargs)
@@ -2292,20 +2521,37 @@ class DorisEngineAdapter(
             expression = expression.copy()
             for dtype in reversed(list(expression.find_all(exp.DataType))):
                 if dtype.is_type("int128"):
-                    dtype.replace(exp.DataType.build("LARGEINT", udt=True))
+                    replacement = exp.DataType.build("LARGEINT", udt=True)
+                    if dtype is expression:
+                        expression = replacement
+                    else:
+                        dtype.replace(replacement)
                 elif dtype.is_type("struct"):
-                    new_fields: t.List[exp.Expr] = []
+                    new_field_sqls: t.List[str] = []
                     for field in dtype.expressions:
                         if isinstance(field, exp.ColumnDef) and field.args.get("kind"):
                             field_id = field.this.copy()
                             if quote and isinstance(field_id, exp.Identifier):
                                 field_id.set("quoted", True)
-                            field_name_sql = super()._to_sql(field_id, quote=False, **kwargs)
-                            field_kind_sql = self._to_sql(field.args["kind"], quote=quote, **kwargs)
-                            new_fields.append(exp.var(f"{field_name_sql}: {field_kind_sql}"))
+                            field_name_sql = super()._to_sql(
+                                field_id, quote=False, pretty=False, **kwargs
+                            )
+                            field_kind_sql = super()._to_sql(
+                                field.args["kind"], quote=quote, pretty=False, **kwargs
+                            )
+                            new_field_sqls.append(f"{field_name_sql}: {field_kind_sql}")
                         else:
-                            new_fields.append(field)
-                    dtype.set("expressions", new_fields)
+                            new_field_sqls.append(
+                                super()._to_sql(field, quote=quote, pretty=False, **kwargs)
+                            )
+                    struct_replacement = exp.DataType(
+                        this=exp.DataType.Type.USERDEFINED,
+                        kind=f"STRUCT<{', '.join(new_field_sqls)}>",
+                    )
+                    if dtype is expression:
+                        expression = struct_replacement
+                    else:
+                        dtype.replace(struct_replacement)
         return super()._to_sql(expression, quote=quote, **kwargs)
 
     def _build_distributed_by_exp(

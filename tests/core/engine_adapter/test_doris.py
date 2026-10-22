@@ -2005,3 +2005,154 @@ def test_sync_mv_inferred_source_table_on_replace_and_unqualified_get_data_objec
     assert "table_schema = DATABASE()" in first_query_sql
     second_query_sql = fetchall_spy.call_args_list[1].args[0]
     assert "mv_infos('database' = DATABASE())" in second_query_sql
+
+
+def test_ctas_string_key_coercion_and_internal_iceberg_ctas(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. CTAS with explicit unique_key on TEXT column coerces CAST(code AS VARCHAR(255)) and reorders key first
+    adapter.ctas(
+        "db.seed_uk_ctas",
+        parse_one("SELECT payload, code FROM db.raw_seed", read="doris"),
+        target_columns_to_types={
+            "payload": exp.DataType.build("text"),
+            "code": exp.DataType.build("text"),
+        },
+        table_properties={"unique_key": exp.to_column("code")},
+    )
+
+    # 2. CTAS with all-TEXT columns (implicit DUPLICATE KEY on first column) coerces first column CAST to VARCHAR(255)
+    adapter.ctas(
+        "db.seed_dup_ctas",
+        parse_one("SELECT country_code, country_name FROM db.raw_countries", read="doris"),
+        target_columns_to_types={
+            "country_code": exp.DataType.build("text"),
+            "country_name": exp.DataType.build("text"),
+        },
+    )
+
+    # 3. 2-part internal Iceberg CTAS (table_format="iceberg") creates table with ENGINE=iceberg and inserts rows
+    adapter.ctas(
+        "silver.iceberg_events",
+        parse_one("SELECT id, ds FROM bronze.events", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("BIGINT"),
+            "ds": exp.DataType.build("DATE"),
+        },
+        table_format="iceberg",
+        partitioned_by=[parse_one("DAY(ds)", dialect="doris")],
+        table_properties={"write-format": exp.Literal.string("parquet")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`seed_uk_ctas` UNIQUE KEY (`code`) DISTRIBUTED BY HASH (`code`) BUCKETS 10 AS SELECT CAST(`code` AS VARCHAR(255)) AS `code`, CAST(`payload` AS STRING) AS `payload` FROM (SELECT `payload`, `code` FROM `db`.`raw_seed`) AS `_subquery`",
+        "CREATE TABLE IF NOT EXISTS `db`.`seed_dup_ctas` AS SELECT CAST(`country_code` AS VARCHAR(255)) AS `country_code`, CAST(`country_name` AS STRING) AS `country_name` FROM (SELECT `country_code`, `country_name` FROM `db`.`raw_countries`) AS `_subquery`",
+        "CREATE TABLE IF NOT EXISTS `silver`.`iceberg_events` (`id` BIGINT, `ds` DATE) ENGINE=iceberg PARTITION BY LIST (DAY(`ds`)) () PROPERTIES ('write-format'='parquet')",
+        "INSERT INTO `silver`.`iceberg_events` (`id`, `ds`) SELECT CAST(`id` AS BIGINT) AS `id`, CAST(`ds` AS DATE) AS `ds` FROM (SELECT `id`, `ds` FROM `bronze`.`events`) AS `_subquery`",
+    ]
+
+
+def test_self_referencing_replace_query_on_new_table(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch.object(adapter, "get_data_object", return_value=None)
+
+    adapter.replace_query(
+        "db.self_ref_tbl",
+        parse_one("SELECT id, name FROM db.self_ref_tbl", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "name": exp.DataType.build("VARCHAR(50)"),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`self_ref_tbl` (`id` INT, `name` VARCHAR(50))",
+        "INSERT INTO `db`.`self_ref_tbl` (`id`, `name`) SELECT CAST(`id` AS INT) AS `id`, CAST(`name` AS VARCHAR(50)) AS `name` FROM (SELECT `id`, `name` FROM `db`.`self_ref_tbl`) AS `_subquery`",
+    ]
+
+
+def test_delete_literal_tuple_in_and_subquery_duplicate_aliases_and_concat_ws_guard(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Literal tuple IN (e.g. from SQLMesh state sync snapshot_id_filter) rewrites to grouped single-column IN
+    adapter.delete_from(
+        "sqlmesh._snapshots",
+        parse_one(
+            "(name, identifier) IN (('model_a', 'id_1'), ('model_a', 'id_2'), ('model_b', 'id_3'))",
+            read="doris",
+        ),
+    )
+
+    # 2. Composite subquery selecting duplicate short column names (`u.id, m.id`) aliases the second column (`_col_1`)
+    adapter.delete_from(
+        "db.pair_links",
+        parse_one(
+            "(a_id, b_id) IN (SELECT u.id, m.id FROM db.users u JOIN db.members m ON u.org_id = m.org_id)",
+            read="doris",
+        ),
+    )
+
+    # 3. CONCAT_WS on LHS with a single non-CONCAT_WS column in RHS subquery does not unwrap into mismatched arity
+    adapter.delete_from(
+        "db.target_tbl",
+        parse_one(
+            "CONCAT_WS('__', a, b) IN (SELECT combined_key FROM db.staging_keys)",
+            read="doris",
+        ),
+    )
+
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `sqlmesh`.`_snapshots` WHERE `name` = 'model_a' AND `identifier` IN ('id_1', 'id_2')",
+        "DELETE FROM `sqlmesh`.`_snapshots` WHERE `name` = 'model_b' AND `identifier` IN ('id_3')",
+        "DELETE FROM `db`.`pair_links` AS `_t1` USING (SELECT `u`.`id`, `m`.`id` AS `_col_1` FROM `db`.`users` AS `u` JOIN `db`.`members` AS `m` ON `u`.`org_id` = `m`.`org_id`) AS `_t2` WHERE `_t1`.`a_id` = `_t2`.`id` AND `_t1`.`b_id` = `_t2`.`_col_1`",
+        "DELETE FROM `db`.`target_tbl` WHERE CONCAT_WS('__', `a`, `b`) IN (SELECT `combined_key` FROM `db`.`staging_keys`)",
+    ]
+
+
+def test_to_sql_root_int128_and_nested_struct_pretty_sql_and_fetchdf_reconnect(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    import pandas as pd
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Root exp.DataType INT128 replacement
+    assert adapter._to_sql(exp.DataType.build("INT128")) == "LARGEINT"
+
+    # 2. Nested STRUCT with INT128 under _pretty_sql = True
+    adapter._pretty_sql = True
+    nested_struct = exp.DataType.build(
+        "STRUCT<outer_id: INT128, nested: STRUCT<inner_id: INT128, label: VARCHAR(20)>>",
+        dialect="doris",
+    )
+    assert (
+        adapter._to_sql(nested_struct)
+        == "STRUCT<`outer_id`: LARGEINT, `nested`: STRUCT<`inner_id`: LARGEINT, `label`: VARCHAR(20)>>"
+    )
+    adapter._pretty_sql = False
+
+    # 3. _fetch_native_df retries once on non-timeout OperationalError(2013) disconnect
+    class OperationalError(Exception):
+        pass
+
+    close_spy = mocker.spy(adapter._connection_pool, "close")
+    fetch_calls = 0
+
+    def fake_read_sql_query(sql, con, *args, **kwargs):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            raise OperationalError(2013, "Lost connection to MySQL server during query")
+        return pd.DataFrame({"id": [1]})
+
+    mocker.patch("pandas.io.sql.read_sql_query", side_effect=fake_read_sql_query)
+    df = adapter.fetchdf("SELECT 1 AS id")
+    assert len(df) == 1
+    assert fetch_calls == 2
+    assert close_spy.call_count == 1
