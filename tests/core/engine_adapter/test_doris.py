@@ -2208,3 +2208,77 @@ def test_strip_for_update_and_multi_col_index_and_partition_by_alias_and_deferre
         "CREATE MATERIALIZED VIEW `db`.`deferred_audited_mv` BUILD DEFERRED REFRESH COMPLETE ON MANUAL PARTITION BY (`ds`) AS SELECT `id`, `ds` FROM `db`.`alias_part_tbl`",
         "REFRESH MATERIALIZED VIEW `db`.`deferred_audited_mv` AUTO",
     ]
+
+
+def test_state_sync_or_key_delete_and_boolean_column_and_alter_key_coercion_guard(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    from sqlmesh.core.snapshot import SnapshotId, SnapshotNameVersion
+    from sqlmesh.core.state_sync.db.utils import snapshot_id_filter, snapshot_name_version_filter
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    assert adapter.SUPPORTS_TUPLE_IN is False
+
+    # 1. snapshot_id_filter with SUPPORTS_TUPLE_IN=False produces OR of AND equalities;
+    #    delete_from decomposes it into zero-OR grouped IN deletes.
+    sids = [
+        SnapshotId(name="db.model_a", identifier="id_1"),
+        SnapshotId(name="db.model_a", identifier="id_2"),
+        SnapshotId(name="db.model_b", identifier="id_3"),
+    ]
+    for where in snapshot_id_filter(adapter, sids, batch_size=100):
+        adapter.delete_from("sqlmesh._snapshots", where=where)
+
+    # 2. IntervalState._delete_intervals_by_dev_version passes `where.and_(exp.column("is_dev"))`
+    snvs = [
+        SnapshotNameVersion(name="db.model_a", version="v1"),
+        SnapshotNameVersion(name="db.model_a", version="v2"),
+    ]
+    for where in snapshot_name_version_filter(
+        adapter, snvs, version_column_name="dev_version", alias=None, batch_size=100
+    ):
+        adapter.delete_from("sqlmesh._intervals", where.and_(exp.column("is_dev")))
+
+    # 3. EnvironmentState.delete_expired_environments passes single-column OR `environment_name = 'dev1' OR environment_name = 'dev2'`
+    adapter.delete_from(
+        "sqlmesh._environment_statements",
+        where=exp.or_(
+            exp.column("environment_name").eq(exp.Literal.string("dev_1")),
+            exp.column("environment_name").eq(exp.Literal.string("dev_2")),
+        ),
+    )
+
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `sqlmesh`.`_snapshots` WHERE `name` = 'db.model_a' AND `identifier` IN ('id_1', 'id_2')",
+        "DELETE FROM `sqlmesh`.`_snapshots` WHERE `name` = 'db.model_b' AND `identifier` IN ('id_3')",
+        "DELETE FROM `sqlmesh`.`_intervals` WHERE `name` = 'db.model_a' AND `dev_version` IN ('v1', 'v2') AND `is_dev` = TRUE",
+        "DELETE FROM `sqlmesh`.`_environment_statements` WHERE `environment_name` IN ('dev_1', 'dev_2')",
+    ]
+
+    # 4. get_alter_operations suppresses invalid VARCHAR(255) -> STRING type change on an OLAP key column
+    #    while preserving ADD COLUMN and non-key column widening.
+    adapter.cursor.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            # DESCRIBE db.current_tbl: `code` is the OLAP key column coerced to VARCHAR(255), `notes` is a non-key VARCHAR(100)
+            [
+                ("code", "VARCHAR(255)", "Yes", "true", None, ""),
+                ("notes", "VARCHAR(100)", "Yes", "false", None, ""),
+            ],
+            # DESCRIBE db.target_tbl: `id` was added, `code` is STRING, `notes` widened to STRING
+            [
+                ("id", "INT", "Yes", "true", None, ""),
+                ("code", "TEXT", "Yes", "false", None, ""),
+                ("notes", "TEXT", "Yes", "false", None, ""),
+            ],
+        ],
+    )
+    ops = adapter.get_alter_operations("db.current_tbl", "db.target_tbl")
+    adapter.cursor.reset_mock()
+    adapter.alter_table(ops)
+    assert to_sql_calls(adapter) == [
+        "ALTER TABLE `db`.`current_tbl` ADD COLUMN `id` INT",
+        "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `notes` STRING",
+    ]

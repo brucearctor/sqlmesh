@@ -38,6 +38,7 @@ if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
     from sqlmesh.core.engine_adapter._typing import DF, QueryOrDF
     from sqlmesh.core.node import IntervalUnit
+    from sqlmesh.core.schema_diff import TableAlterOperation
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class DorisEngineAdapter(
     MAX_TABLE_COMMENT_LENGTH = 2048
     MAX_COLUMN_COMMENT_LENGTH = 255
     SUPPORTS_INDEXES = True
+    SUPPORTS_TUPLE_IN = False
     SUPPORTS_REPLACE_TABLE = False
     MAX_IDENTIFIER_LENGTH = 64
     SUPPORTS_MATERIALIZED_VIEWS = True
@@ -361,17 +363,37 @@ class DorisEngineAdapter(
         self, table_name: TableName, include_pseudo_columns: bool = False
     ) -> t.Dict[str, exp.DataType]:
         """Fetches column names and types for the target table, normalizing Doris type aliases."""
+        cols, key_cols = self._describe_columns_with_keys(table_name)
+        self._last_described_key_cols: t.Set[str] = key_cols
+        return cols
+
+    def _describe_columns_with_keys(
+        self, table_name: TableName
+    ) -> t.Tuple[t.Dict[str, exp.DataType], t.Set[str]]:
         self.execute(exp.Describe(this=exp.to_table(table_name), kind="TABLE"))
         describe_output = self.cursor.fetchall()
         cols: t.Dict[str, exp.DataType] = {}
-        for column_name, column_type, *_ in itertools.takewhile(
-            lambda row: not str(row[0]).startswith("#"),
+        key_cols: t.Set[str] = set()
+        for row in itertools.takewhile(
+            lambda r: not str(r[0]).startswith("#"),
             describe_output,
         ):
+            column_name = row[0] if len(row) > 0 else None
+            column_type = row[1] if len(row) > 1 else None
+            is_key = row[3] if len(row) > 3 else None
             col_name_str = _decoded_str(column_name) if column_name else ""
             raw_type = _decoded_str(column_type) if column_type else ""
             if not col_name_str.strip() or not raw_type.strip():
                 continue
+            if is_key is not None and _decoded_str(is_key).strip().lower() in (
+                "true",
+                "pri",
+                "uni",
+                "dup",
+                "agg",
+                "yes",
+            ):
+                key_cols.add(col_name_str.lower())
             normalized_type = re.sub(
                 r"\bDECIMALV[23]\b(?!\s*`?\s*:)", "DECIMAL", raw_type, flags=re.IGNORECASE
             )
@@ -397,7 +419,59 @@ class DorisEngineAdapter(
                 flags=re.IGNORECASE,
             )
             cols[col_name_str] = exp.DataType.build(normalized_type, dialect=self.dialect, udt=True)
-        return cols
+        if cols and not key_cols:
+            first_col = next(iter(cols))
+            key_cols.add(first_col.lower())
+        return cols, key_cols
+
+    def get_alter_operations(
+        self,
+        current_table_name: TableName,
+        target_table_name: TableName,
+        *,
+        ignore_destructive: bool = False,
+        ignore_additive: bool = False,
+    ) -> t.List[TableAlterOperation]:
+        from sqlmesh.core.schema_diff import (
+            TableAlterChangeColumnTypeOperation,
+            TableAlterOperation,
+        )
+
+        current_table = exp.to_table(current_table_name)
+        is_iceberg = self._is_iceberg_table(catalog_name=current_table.catalog)
+        if is_iceberg:
+            return super().get_alter_operations(
+                current_table_name,
+                target_table_name,
+                ignore_destructive=ignore_destructive,
+                ignore_additive=ignore_additive,
+            )
+
+        self._last_described_key_cols = set()
+        current_cols = self.columns(current_table_name)
+        current_key_cols = set(getattr(self, "_last_described_key_cols", set()))
+        if current_cols and not current_key_cols:
+            current_key_cols = {next(iter(current_cols)).lower()}
+        target_cols = self.columns(target_table_name)
+        operations = t.cast(
+            t.List[TableAlterOperation],
+            self.schema_differ.compare_columns(
+                current_table_name,
+                current_cols,
+                target_cols,
+                ignore_destructive=ignore_destructive,
+                ignore_additive=ignore_additive,
+            ),
+        )
+        return [
+            op
+            for op in operations
+            if not (
+                isinstance(op, TableAlterChangeColumnTypeOperation)
+                and op.column.name.lower() in current_key_cols
+                and not self._is_valid_olap_key_type(op.column_type)
+            )
+        ]
 
     def create_schema(
         self,
@@ -1009,6 +1083,7 @@ class DorisEngineAdapter(
             return
 
         where = self._rewrite_between_in_where(where)
+        where = self._normalize_boolean_column_conjuncts(where)
 
         subquery_info = self._extract_subquery_from_where(where)
         if subquery_info is not None:
@@ -1018,6 +1093,11 @@ class DorisEngineAdapter(
         tuple_in_info = self._extract_literal_tuple_in_from_where(where)
         if tuple_in_info is not None:
             self._delete_key_rows(table_name, *tuple_in_info, is_ast_values=True)
+            return
+
+        or_key_info = self._extract_or_key_rows_from_where(where)
+        if or_key_info is not None:
+            self._delete_key_rows(table_name, *or_key_info, is_ast_values=True)
             return
 
         target_table = exp.to_table(table_name)
@@ -1205,6 +1285,136 @@ class DorisEngineAdapter(
             return None
 
         return normalized_keys, tuple_rows, extra_conditions
+
+    @classmethod
+    def _normalize_boolean_column_conjuncts(cls, where: exp.Expr) -> exp.Expr:
+        """Rewrite top-level bare boolean column conjuncts (`AND is_dev`, `AND NOT is_dev`) to
+        explicit binary comparisons (`is_dev = TRUE`, `is_dev = FALSE`) required by Doris DeleteHandler.
+        """
+        unwrapped = where.unnest()
+        if isinstance(unwrapped, exp.Column):
+            return unwrapped.copy().eq(exp.true())
+        if isinstance(unwrapped, exp.Not) and isinstance(unwrapped.this.unnest(), exp.Column):
+            return unwrapped.this.unnest().copy().eq(exp.false())
+        if isinstance(unwrapped, exp.And):
+            conjuncts = list(unwrapped.flatten())
+            changed = False
+            new_conjuncts: t.List[exp.Expr] = []
+            for cond in conjuncts:
+                inner = cond.unnest()
+                if isinstance(inner, exp.Column):
+                    new_conjuncts.append(inner.copy().eq(exp.true()))
+                    changed = True
+                elif isinstance(inner, exp.Not) and isinstance(inner.this.unnest(), exp.Column):
+                    new_conjuncts.append(inner.this.unnest().copy().eq(exp.false()))
+                    changed = True
+                else:
+                    new_conjuncts.append(cond)
+            if changed:
+                return exp.and_(*new_conjuncts, copy=False)
+        return where
+
+    def _extract_or_key_rows_from_where(
+        self, where: exp.Expr
+    ) -> t.Optional[t.Tuple[t.List[exp.Expr], t.List[t.Tuple[exp.Expr, ...]], t.List[exp.Expr]]]:
+        """Extract a top-level OR of equality/IS NULL key predicates (e.g. from `snapshot_id_filter`
+        when `SUPPORTS_TUPLE_IN = False`, or `delete_expired_environments`) and sibling AND conditions.
+        """
+        where = where.unnest()
+        conjuncts: t.List[exp.Expr] = (
+            list(where.flatten()) if isinstance(where, exp.And) else [where]
+        )
+        target_or: t.Optional[exp.Or] = None
+        extra_conditions: t.List[exp.Expr] = []
+
+        for cond in conjuncts:
+            unwrapped_cond = cond.unnest()
+            if target_or is None and isinstance(unwrapped_cond, exp.Or):
+                target_or = unwrapped_cond
+                continue
+            extra_conditions.append(cond)
+
+        if target_or is None:
+            return None
+
+        disjuncts = list(target_or.flatten())
+        if len(disjuncts) < 2:
+            return None
+
+        canonical_col_order: t.Optional[t.List[str]] = None
+        canonical_cols: t.List[exp.Expr] = []
+        tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = []
+
+        for branch in disjuncts:
+            branch_unwrapped = branch.unnest()
+            branch_conjuncts = (
+                list(branch_unwrapped.flatten())
+                if isinstance(branch_unwrapped, exp.And)
+                else [branch_unwrapped]
+            )
+            col_to_val: t.Dict[str, exp.Expr] = {}
+            col_to_expr: t.Dict[str, exp.Expr] = {}
+            for item in branch_conjuncts:
+                item_unwrapped = item.unnest()
+                if isinstance(item_unwrapped, exp.EQ):
+                    left, right = item_unwrapped.this, item_unwrapped.expression
+                    if isinstance(left, (exp.Column, exp.Identifier)) and isinstance(
+                        right, (exp.Literal, exp.Boolean, exp.Null)
+                    ):
+                        col_expr = (
+                            left.copy()
+                            if isinstance(left, exp.Column)
+                            else exp.Column(this=left.copy())
+                        )
+                        val_expr = right.copy()
+                    elif isinstance(right, (exp.Column, exp.Identifier)) and isinstance(
+                        left, (exp.Literal, exp.Boolean, exp.Null)
+                    ):
+                        col_expr = (
+                            right.copy()
+                            if isinstance(right, exp.Column)
+                            else exp.Column(this=right.copy())
+                        )
+                        val_expr = left.copy()
+                    else:
+                        return None
+                elif isinstance(item_unwrapped, exp.Is) and isinstance(
+                    item_unwrapped.expression, exp.Null
+                ):
+                    left = item_unwrapped.this
+                    if isinstance(left, (exp.Column, exp.Identifier)):
+                        col_expr = (
+                            left.copy()
+                            if isinstance(left, exp.Column)
+                            else exp.Column(this=left.copy())
+                        )
+                        val_expr = exp.null()
+                    else:
+                        return None
+                else:
+                    return None
+
+                col_key = col_expr.name.lower()
+                if not col_key or col_key in col_to_val:
+                    return None
+                col_to_val[col_key] = val_expr
+                col_to_expr[col_key] = col_expr
+
+            if not col_to_val:
+                return None
+
+            if canonical_col_order is None:
+                canonical_col_order = list(col_to_val.keys())
+                canonical_cols = [col_to_expr[k] for k in canonical_col_order]
+            elif set(col_to_val.keys()) != set(canonical_col_order):
+                return None
+
+            tuple_rows.append(tuple(col_to_val[k] for k in canonical_col_order))
+
+        if not canonical_cols or not tuple_rows:
+            return None
+
+        return canonical_cols, tuple_rows, extra_conditions
 
     @staticmethod
     def _unwrap_concat_ws(expr: exp.Expr) -> t.Optional[exp.Expr]:
@@ -2842,6 +3052,7 @@ class DorisEngineAdapter(
             "distributed_by",
             "clustered_by",
             "buckets",
+            "partition_by",
             "partitioned_by",
             "partitions",
             "auto_partition",
