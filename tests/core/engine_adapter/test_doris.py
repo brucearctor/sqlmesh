@@ -1005,6 +1005,17 @@ def test_external_catalog_view_error_and_drop_noop(
         )
     assert to_sql_calls(adapter) == []
 
+    # Invalid refresh_trigger also raises SQLMeshError instead of silently falling back to AUTO
+    with pytest.raises(SQLMeshError, match="Invalid materialized view refresh trigger"):
+        adapter.create_view(
+            "silver.events_mv",
+            parse_one("SELECT 1 AS id"),
+            replace=True,
+            materialized=True,
+            view_properties={"refresh_trigger": exp.Literal.string("ON DEMAND")},
+        )
+    assert to_sql_calls(adapter) == []
+
 
 def test_duplicate_key_with_buckets_and_random_buckets_fallback(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],

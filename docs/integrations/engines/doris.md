@@ -452,7 +452,8 @@ MODEL (
     build = 'IMMEDIATE',
     refresh = 'AUTO',
     refresh_trigger = 'ON SCHEDULE EVERY 1 HOUR',
-    distributed_by = 'HASH(user_id) BUCKETS 10'
+    distributed_by = 'HASH(user_id) BUCKETS 10',
+    excluded_trigger_tables = 'analytics.user_events'
   )
 );
 
@@ -463,6 +464,10 @@ SELECT
 FROM analytics.user_events
 GROUP BY user_id, CAST(event_time AS DATE);
 ```
+
+!!! note "Automatic Physical Table Resolution & Non-Destructive Evaluation"
+    - Doris materialized views are only created on initial deployment or when a rebuild is required (`RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False`), preserving MTMV refresh state across routine `sqlmesh run` invocations.
+    - When `excluded_trigger_tables` (on async MTMVs) or `source_table` (on synchronous MVs) references a SQLMesh-managed model, SQLMesh automatically resolves the model name to its underlying physical snapshot table name.
 
 ### Synchronous Materialized Views (`materialized_type = 'SYNC'`)
 

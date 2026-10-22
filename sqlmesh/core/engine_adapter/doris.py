@@ -1621,10 +1621,19 @@ class DorisEngineAdapter(
                 unit_var: t.Optional[exp.Var] = None
                 starts_lit: t.Optional[exp.Literal] = None
 
+                if isinstance(refresh_val, exp.Paren) and isinstance(refresh_val.this, exp.EQ):
+                    refresh_val = exp.Tuple(expressions=[refresh_val.this])
+                elif isinstance(refresh_val, exp.EQ):
+                    refresh_val = exp.Tuple(expressions=[refresh_val])
+
                 if isinstance(refresh_val, exp.Tuple):
                     method_var, kind_str, every_lit, unit_var, starts_lit = (
                         self._parse_refresh_tuple(refresh_val)
                     )
+                    if refresh_trigger_val is not None:
+                        trigger_text = self._extract_str_value(refresh_trigger_val) or ""
+                        k, e, u, s = self._parse_trigger_string(trigger_text)
+                        kind_str, every_lit, unit_var, starts_lit = k, e, u, s
                 else:
                     raw_refresh = (
                         self._extract_str_value(refresh_val) if refresh_val is not None else "AUTO"
@@ -1936,8 +1945,11 @@ class DorisEngineAdapter(
         starts_lit = None
 
         m_kind = re.match(r"^(MANUAL|COMMIT|SCHEDULE)\b", text, flags=re.IGNORECASE)
-        if m_kind:
-            kind = m_kind.group(1).upper()
+        if not m_kind:
+            raise SQLMeshError(
+                f"Invalid materialized view refresh trigger: {trigger_text}. Expected MANUAL, COMMIT, or SCHEDULE."
+            )
+        kind = m_kind.group(1).upper()
         m_every = re.search(r"\bEVERY\s+(\d+)\s+([A-Za-z]+)", text, flags=re.IGNORECASE)
         if m_every:
             every_lit = exp.Literal.number(int(m_every.group(1)))
@@ -2077,8 +2089,14 @@ class DorisEngineAdapter(
                 has_eq = any(isinstance(e, exp.EQ) for e in distributed_by.expressions)
                 if has_eq:
                     for expr in distributed_by.expressions:
-                        if isinstance(expr, exp.EQ) and hasattr(expr.this, "this"):
-                            key = str(expr.this.this).strip('"').strip("'").lower()
+                        if isinstance(expr, exp.EQ):
+                            key = (
+                                (self._extract_str_value(expr.this) or "")
+                                .strip('"')
+                                .strip("'")
+                                .strip("`")
+                                .lower()
+                            )
                             if isinstance(expr.expression, exp.Literal):
                                 distributed_info[key] = expr.expression.this
                             elif isinstance(expr.expression, (exp.Array, exp.Tuple)):
@@ -2094,14 +2112,23 @@ class DorisEngineAdapter(
                             buckets=default_buckets_expr or exp.Literal.number(10),
                             order=None,
                         )
-            elif isinstance(distributed_by, exp.Paren) and isinstance(distributed_by.this, exp.EQ):
-                expr = distributed_by.this
-                if hasattr(expr.this, "this"):
-                    key = str(expr.this.this).strip('"').strip("'").lower()
-                    if isinstance(expr.expression, exp.Literal):
-                        distributed_info[key] = expr.expression.this
-                    else:
-                        distributed_info[key] = self._extract_str_value(expr.expression)
+            elif isinstance(distributed_by, exp.EQ) or (
+                isinstance(distributed_by, exp.Paren) and isinstance(distributed_by.this, exp.EQ)
+            ):
+                expr = (
+                    distributed_by.this if isinstance(distributed_by, exp.Paren) else distributed_by
+                )
+                key = (
+                    (self._extract_str_value(expr.this) or "")
+                    .strip('"')
+                    .strip("'")
+                    .strip("`")
+                    .lower()
+                )
+                if isinstance(expr.expression, exp.Literal):
+                    distributed_info[key] = expr.expression.this
+                else:
+                    distributed_info[key] = self._extract_str_value(expr.expression)
             elif isinstance(distributed_by, dict):
                 distributed_info = distributed_by
 
