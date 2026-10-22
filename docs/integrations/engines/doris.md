@@ -204,7 +204,7 @@ Doris OLAP tables support **Multi-Range Batch Partitioning**, **Explicit Partiti
 
 !!! note "OLAP Partitioning Requirements"
     - On Doris OLAP tables, `PARTITION BY` requires at least one of `partitions`, `auto_partition = 'true'`, or `'dynamic_partition.enable' = 'true'` in `physical_properties`. If none is provided, SQLMesh omits the `PARTITION BY` clause so Doris does not create a zero-partition table that rejects inserts.
-    - On `UNIQUE KEY` tables, Doris requires all `partitioned_by` columns to be a subset of `unique_key`.
+    - On `UNIQUE KEY` and `AGGREGATE KEY` tables, Doris requires all `partitioned_by` columns to be a subset of the key columns.
 
 ### Multi-range & explicit partitions
 
@@ -509,7 +509,7 @@ FROM raw.logs;
 
 @IF(
   @runtime_stage = 'creating',
-  CREATE INDEX idx_message ON @this_model (message) USING INVERTED PROPERTIES("parser" = "english") COMMENT 'Full-text inverted index'
+  ALTER TABLE @this_model ADD INDEX idx_message (message) USING INVERTED COMMENT 'Full-text inverted index'
 );
 ```
 

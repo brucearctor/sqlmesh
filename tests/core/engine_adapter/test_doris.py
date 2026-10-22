@@ -1774,3 +1774,234 @@ def test_resolve_table_refs_in_physical_properties_for_mv_and_sync_mv(
     assert sync_calls[0] == (
         f"DROP MATERIALIZED VIEW IF EXISTS `doris_db`.`orders_sync_mv` ON `{physical_tbl.db}`.`{physical_tbl.name}`"
     )
+
+
+def test_dataframe_seed_all_string_coercion_and_batch_size(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    import pandas as pd
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    assert adapter.DEFAULT_BATCH_SIZE == 500
+
+    # 1. All-TEXT schema (e.g. from columns_to_types_from_df on a string CSV seed) coerces first column to VARCHAR(255)
+    adapter.create_table(
+        "db.country_seed",
+        target_columns_to_types={
+            "country_code": exp.DataType.build("text"),
+            "country_name": exp.DataType.build("text"),
+        },
+    )
+
+    # 2. Schema with DOUBLE + TEXT moves TEXT column to position 0 and coerces it to VARCHAR(255)
+    adapter.create_table(
+        "db.metric_seed",
+        target_columns_to_types={
+            "score": exp.DataType.build("double"),
+            "metric_name": exp.DataType.build("text"),
+        },
+    )
+
+    # 3. Explicit unique_key on a TEXT column coerces the key column to VARCHAR(255)
+    adapter.create_table(
+        "db.explicit_text_uk",
+        target_columns_to_types={
+            "payload": exp.DataType.build("text"),
+            "code": exp.DataType.build("text"),
+        },
+        table_properties={"unique_key": exp.to_column("code")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`country_seed` (`country_code` VARCHAR(255), `country_name` STRING)",
+        "CREATE TABLE IF NOT EXISTS `db`.`metric_seed` (`metric_name` VARCHAR(255), `score` DOUBLE)",
+        "CREATE TABLE IF NOT EXISTS `db`.`explicit_text_uk` (`code` VARCHAR(255), `payload` STRING) UNIQUE KEY (`code`) DISTRIBUTED BY HASH (`code`) BUCKETS 10",
+    ]
+
+    # 4. Explicit unique_key on a non-coercible invalid key type (DOUBLE) raises SQLMeshError
+    with pytest.raises(SQLMeshError, match="not supported as an OLAP key column"):
+        adapter.create_table(
+            "db.bad_double_uk",
+            target_columns_to_types={
+                "score": exp.DataType.build("DOUBLE", dialect="doris"),
+                "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            },
+            table_properties={"unique_key": exp.to_column("score")},
+        )
+
+    # 5. DataFrame CTAS with pretty_sql=True and 500 rows succeeds without RecursionError
+    pretty_adapter = make_mocked_engine_adapter(DorisEngineAdapter, pretty_sql=True)
+    df = pd.DataFrame({"code": [f"c_{i}" for i in range(500)], "val": list(range(500))})
+    pretty_adapter.ctas("db.df_seed", df)
+    df_sql_calls = to_sql_calls(pretty_adapter)
+    assert len(df_sql_calls) == 1
+    assert "CREATE TABLE IF NOT EXISTS `db`.`df_seed`" in df_sql_calls[0]
+
+
+def test_iceberg_bucket_and_truncate_partition_transforms(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    from sqlmesh.core.dialect import parse
+    from sqlmesh.core.model import SqlModel, load_sql_based_model
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    iceberg_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name iceberg_catalog.silver.curated_events,
+                    kind FULL,
+                    dialect doris,
+                    table_format iceberg,
+                    partitioned_by (day(event_ts), bucket(16, user_id), truncate(10, region))
+                );
+                SELECT
+                    user_id::BIGINT AS user_id,
+                    event_ts::DATETIME AS event_ts,
+                    region::STRING AS region
+                FROM iceberg_catalog.bronze.raw_events;
+                """,
+                default_dialect="doris",
+            )
+        ),
+    )
+
+    adapter.create_table(
+        iceberg_model.name,
+        target_columns_to_types=iceberg_model.columns_to_types or {},
+        table_format=iceberg_model.table_format,
+        partitioned_by=iceberg_model.partitioned_by,
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `iceberg_catalog`.`silver`.`curated_events` (`user_id` BIGINT, `event_ts` DATETIME, `region` STRING) ENGINE=iceberg PARTITION BY LIST (DAY(`event_ts`), BUCKET(16, `user_id`), TRUNCATE(10, `region`)) ()"
+    ]
+
+
+def test_ctas_auto_partition_non_nullable_and_union_key_reordering(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. CTAS with AUTO PARTITION BY RANGE wraps partition column projection in NON_NULLABLE(...)
+    adapter.ctas(
+        "db.ctas_auto_part",
+        parse_one("SELECT payload, id, ds FROM db.src", read="doris"),
+        target_columns_to_types={
+            "payload": exp.DataType.build("STRING", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+        partitioned_by=[parse_one("RANGE(DATE_TRUNC(ds, 'DAY'))", read="doris")],
+        table_properties={"auto_partition": exp.Literal.string("true")},
+    )
+
+    # 2. Unannotated CTAS with UNION ALL reorders projections in all branches for unique_key prefix
+    adapter.ctas(
+        "db.ctas_union_reordered",
+        parse_one(
+            "SELECT name, id FROM db.src1 UNION ALL SELECT name, id FROM db.src2", read="doris"
+        ),
+        table_properties={"unique_key": exp.to_column("id")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`ctas_auto_part` AUTO PARTITION BY RANGE (DATE_TRUNC(`ds`, 'DAY')) () AS SELECT CAST(`id` AS INT) AS `id`, NON_NULLABLE(CAST(`ds` AS DATE)) AS `ds`, CAST(`payload` AS STRING) AS `payload` FROM (SELECT `payload`, `id`, `ds` FROM `db`.`src`) AS `_subquery`",
+        "CREATE TABLE IF NOT EXISTS `db`.`ctas_union_reordered` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT `id`, `name` FROM `db`.`src1` UNION ALL SELECT `id`, `name` FROM `db`.`src2`",
+    ]
+
+
+def test_delete_tautology_and_union_subquery_and_dedup_partition_overwrite(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Literal tautology 1=1 routes to TRUNCATE TABLE; contradiction 1=0 is a no-op
+    adapter.delete_from("db.tbl", where="1 = 1")
+    adapter.delete_from("db.tbl", where="1 = 0")
+
+    # 2. IN subquery with UNION resolves the projected column name from the first SELECT branch
+    adapter.delete_from(
+        "db.tbl",
+        where="id IN (SELECT src_id FROM db.a UNION SELECT src_id FROM db.b)",
+    )
+
+    # 3. IN subquery with unaliased expression aliases the projection for _t2 join
+    adapter.delete_from(
+        "db.tbl",
+        where="id IN (SELECT other_id + 1 FROM db.a)",
+    )
+
+    assert to_sql_calls(adapter) == [
+        "TRUNCATE TABLE `db`.`tbl`",
+        "DELETE FROM `db`.`tbl` AS `_t1` USING (SELECT `src_id` FROM `db`.`a` UNION SELECT `src_id` FROM `db`.`b`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`src_id`",
+        "DELETE FROM `db`.`tbl` AS `_t1` USING (SELECT `other_id` + 1 AS `_col_0` FROM `db`.`a`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`_col_0`",
+    ]
+
+    # 4. insert_overwrite_by_partition deduplicates columns and strips table qualifiers
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "_get_temp_table",
+        return_value=exp.table_("__temp_tbl", db="db"),
+    )
+    adapter.insert_overwrite_by_partition(
+        "db.events",
+        parse_one("SELECT id, ds FROM db.src", read="doris"),
+        partitioned_by=[
+            parse_one("YEAR(src.ds)", read="doris"),
+            parse_one("MONTH(src.ds)", read="doris"),
+        ],
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "ds": exp.DataType.build("DATE"),
+        },
+    )
+    overwrite_calls = to_sql_calls(adapter)
+    assert any(
+        "DELETE FROM `db`.`events` AS `_t1` USING (SELECT DISTINCT `ds` FROM `db`.`__temp_tbl`) AS `_t2` WHERE `_t1`.`ds` = `_t2`.`ds`"
+        == call
+        for call in overwrite_calls
+    )
+
+
+def test_sync_mv_inferred_source_table_on_replace_and_unqualified_get_data_objects(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, patch_get_data_objects=False)
+
+    # 1. Sync MV with replace=True and no explicit source_table in view_properties infers base table from query
+    mocker.patch.object(adapter, "get_data_object", return_value=None)
+    adapter.create_view(
+        "sync_rollup_mv",
+        parse_one("SELECT id, SUM(amount) AS total FROM prod_db.orders GROUP BY id", read="doris"),
+        replace=True,
+        materialized=True,
+        view_properties={"materialized_type": exp.var("SYNC")},
+    )
+    assert to_sql_calls(adapter) == [
+        "USE `prod_db`",
+        "DROP MATERIALIZED VIEW IF EXISTS `sync_rollup_mv` ON `prod_db`.`orders`",
+        "USE `prod_db`",
+        "CREATE MATERIALIZED VIEW `sync_rollup_mv` AS SELECT `id` AS `mv_id`, SUM(`amount`) AS `total` FROM `prod_db`.`orders` GROUP BY `id`",
+    ]
+
+    # 2. _get_data_objects with empty schema uses DATABASE() instead of empty string literal
+    adapter.cursor.execute.reset_mock()
+    fetchall_spy = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[
+            [("active_db", "tbl1", "BASE TABLE")],
+            [],
+        ],
+    )
+    objs = adapter._get_data_objects("")
+    assert len(objs) == 1
+    assert objs[0].schema_name == "active_db"
+    first_query_sql = fetchall_spy.call_args_list[0].args[0].sql("doris")
+    assert "table_schema = DATABASE()" in first_query_sql
+    second_query_sql = fetchall_spy.call_args_list[1].args[0]
+    assert "mv_infos('database' = DATABASE())" in second_query_sql

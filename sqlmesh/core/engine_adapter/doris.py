@@ -50,7 +50,7 @@ class DorisEngineAdapter(
     RowDiffMixin,
 ):
     DIALECT = "doris"
-    DEFAULT_BATCH_SIZE = 5000
+    DEFAULT_BATCH_SIZE = 500
     SUPPORTS_TRANSACTIONS = False
     COMMENT_CREATION_TABLE = CommentCreationTable.IN_SCHEMA_DEF_NO_CTAS
     COMMENT_CREATION_VIEW = CommentCreationView.IN_SCHEMA_DEF_NO_COMMANDS
@@ -133,6 +133,15 @@ class DorisEngineAdapter(
         "DOUBLE",
         "STRING",
         "TEXT",
+        "TINYTEXT",
+        "MEDIUMTEXT",
+        "LONGTEXT",
+        "BLOB",
+        "TINYBLOB",
+        "MEDIUMBLOB",
+        "LONGBLOB",
+        "BINARY",
+        "VARBINARY",
         "JSON",
         "JSONB",
         "VARIANT",
@@ -399,7 +408,7 @@ class DorisEngineAdapter(
         self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
     ) -> t.List[DataObject]:
         """Returns all the data objects that exist in the given schema and optional catalog."""
-        schema_exp = to_schema(schema_name)
+        schema_exp = to_schema(schema_name) if schema_name else exp.Table()
         catalog = schema_exp.catalog or None
         query_catalog = catalog or self.default_catalog
 
@@ -428,7 +437,11 @@ class DorisEngineAdapter(
                 .as_("type"),
             )
             .from_(exp.table_("tables", db="information_schema", catalog=query_catalog))
-            .where(exp.column("table_schema").eq(schema_exp.db))
+            .where(
+                exp.column("table_schema").eq(
+                    schema_exp.db if schema_exp.db else exp.func("DATABASE")
+                )
+            )
         )
         if object_names:
             lowered_names = [name.lower() for name in object_names]
@@ -471,9 +484,13 @@ class DorisEngineAdapter(
             obj.type.is_table for obj in result
         ):
             try:
-                db_literal = self._to_sql(exp.Literal.string(schema_exp.db), quote=False)
+                db_arg = (
+                    self._to_sql(exp.Literal.string(schema_exp.db), quote=False)
+                    if schema_exp.db
+                    else "DATABASE()"
+                )
                 mv_rows = self.fetchall(
-                    f"SELECT Name FROM mv_infos('database' = {db_literal})",
+                    f"SELECT Name FROM mv_infos('database' = {db_arg})",
                     quote_identifiers=False,
                 )
                 mv_names = {
@@ -677,11 +694,20 @@ class DorisEngineAdapter(
                 self.drop_data_object_on_type_mismatch(
                     self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
                 )
+                drop_view_props = dict(view_properties) if view_properties else None
+                if (
+                    is_sync_mv
+                    and drop_view_props is not None
+                    and not drop_view_props.get("source_table")
+                ):
+                    first_tbl = query.find(exp.Table)
+                    if first_tbl:
+                        drop_view_props["source_table"] = first_tbl
                 self.drop_view(
                     view_name,
                     ignore_if_not_exists=True,
                     materialized=True,
-                    view_properties=view_properties,
+                    view_properties=drop_view_props,
                 )
 
             # Doris synchronous materialized views are single-table rollup indexes whose DDL syntax
@@ -874,16 +900,28 @@ class DorisEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
     ) -> None:
         parsed_exprs, _ = self._parse_partition_expressions(partitioned_by)
-        key_exprs: t.List[exp.Expr] = []
+        raw_key_exprs: t.List[exp.Expr] = []
         for expr in parsed_exprs or partitioned_by:
             if isinstance(expr, exp.Column):
-                key_exprs.append(expr)
+                raw_key_exprs.append(expr)
             else:
                 cols = list(expr.find_all(exp.Column))
                 if cols:
-                    key_exprs.extend(cols)
+                    raw_key_exprs.extend(cols)
                 else:
-                    key_exprs.append(expr)
+                    raw_key_exprs.append(expr)
+        key_exprs: t.List[exp.Expr] = []
+        seen_cols: t.Set[str] = set()
+        for expr in raw_key_exprs:
+            if isinstance(expr, exp.Column):
+                col_lower = expr.name.lower()
+                if col_lower not in seen_cols:
+                    seen_cols.add(col_lower)
+                    key_exprs.append(
+                        exp.column(expr.name, quoted=bool(getattr(expr.this, "quoted", False)))
+                    )
+            else:
+                key_exprs.append(expr)
         super().insert_overwrite_by_partition(
             table_name,
             query_or_df,
@@ -945,6 +983,13 @@ class DorisEngineAdapter(
                 )
         if isinstance(expr, exp.Paren) and isinstance(expr.this, exp.Boolean):
             return expr.this
+        if (
+            isinstance(expr, exp.EQ)
+            and isinstance(expr.this, exp.Literal)
+            and isinstance(expr.expression, exp.Literal)
+            and expr.this.is_number == expr.expression.is_number
+        ):
+            return exp.true() if expr.this == expr.expression else exp.false()
         if isinstance(expr, exp.Not) and isinstance(expr.this, exp.Boolean):
             return exp.false() if expr.this == exp.true() else exp.true()
         if isinstance(expr, exp.And):
@@ -1083,14 +1128,26 @@ class DorisEngineAdapter(
             return
 
         join_conditions: t.List[exp.Expr] = []
+        first_select = subquery.this
+        while isinstance(first_select, exp.SetOperation):
+            first_select = first_select.this
         for idx, col in enumerate(key_exprs):
             col_name = col.name
             t1_col = exp.column(col_name, table="_t1")
             t2_col_name = col_name
-            if isinstance(subquery.this, exp.Select) and idx < len(subquery.this.expressions):
-                sel_item = subquery.this.expressions[idx]
+            if isinstance(first_select, exp.Select) and idx < len(first_select.expressions):
+                sel_item = first_select.expressions[idx]
                 if sel_item.alias_or_name:
                     t2_col_name = sel_item.alias_or_name
+                elif isinstance(subquery.this, exp.Select):
+                    alias_name = f"_col_{idx}"
+                    subquery = subquery.copy()
+                    sub_select = t.cast(exp.Select, subquery.this)
+                    new_exprs = list(sub_select.expressions)
+                    new_exprs[idx] = exp.alias_(sel_item.copy(), alias_name, quoted=True)
+                    sub_select.set("expressions", new_exprs)
+                    first_select = sub_select
+                    t2_col_name = alias_name
             t2_col = exp.column(t2_col_name, table="_t2")
             join_conditions.append(t1_col.eq(t2_col))
 
@@ -1161,7 +1218,7 @@ class DorisEngineAdapter(
         )
         if isinstance(select_query, exp.Select):
             select_query = select_query.distinct()
-        rows = self.fetchall(select_query)
+        rows = self.fetchall(select_query, quote_identifiers=True)
         if not rows:
             return
 
@@ -1316,8 +1373,11 @@ class DorisEngineAdapter(
         )
 
         if not is_iceberg and target_columns_to_types:
+            original_cols = dict(target_columns_to_types)
             reordered_cols = self._reorder_olap_columns(target_columns_to_types, kwargs)
-            if list(reordered_cols) != list(target_columns_to_types):
+            order_changed = list(reordered_cols) != list(original_cols)
+            types_changed = any(reordered_cols[c] != original_cols[c] for c in reordered_cols)
+            if order_changed or types_changed:
                 target_columns_to_types = reordered_cols
                 if isinstance(table_name_or_schema, exp.Schema):
                     col_def_map = {
@@ -1333,12 +1393,19 @@ class DorisEngineAdapter(
                     if len(col_def_map) == len(target_columns_to_types) and all(
                         c.lower() in col_def_map for c in target_columns_to_types
                     ):
+                        new_col_defs: t.List[exp.Expr] = []
+                        for c, new_dtype in target_columns_to_types.items():
+                            col_def = col_def_map[c.lower()]
+                            if col_def.args.get("kind") != new_dtype:
+                                col_def = col_def.copy()
+                                col_def.set("kind", new_dtype)
+                            new_col_defs.append(col_def)
                         table_name_or_schema = table_name_or_schema.copy()
                         table_name_or_schema.set(
                             "expressions",
-                            [col_def_map[c.lower()] for c in target_columns_to_types] + other_exprs,
+                            new_col_defs + other_exprs,
                         )
-                if expression is not None and isinstance(expression, exp.Query):
+                if order_changed and expression is not None and isinstance(expression, exp.Query):
                     reordered_in_place = False
                     if isinstance(expression, exp.Select):
                         proj_by_name = {
@@ -1359,27 +1426,11 @@ class DorisEngineAdapter(
                         expression = self._order_projections_and_filter(
                             expression, target_columns_to_types
                         )
-        elif not is_iceberg and isinstance(expression, exp.Select):
-            proj_by_name = {
-                proj.alias_or_name.lower(): proj
-                for proj in expression.expressions
-                if proj.alias_or_name and not isinstance(proj, exp.Star)
-            }
-            if proj_by_name and len(proj_by_name) == len(expression.expressions):
-                select_cols_to_types = {
-                    proj.alias_or_name: exp.DataType.build("UNKNOWN")
-                    for proj in expression.expressions
-                }
-                reordered_select_cols = self._reorder_olap_columns(select_cols_to_types, kwargs)
-                if list(reordered_select_cols) != list(select_cols_to_types):
-                    expression = expression.copy()
-                    expression.set(
-                        "expressions",
-                        [proj_by_name[c.lower()] for c in reordered_select_cols],
-                    )
+        elif not is_iceberg and isinstance(expression, (exp.Select, exp.SetOperation)):
+            expression = self._reorder_unannotated_ctas_query(expression, kwargs)
 
         # Doris AUTO PARTITION BY RANGE requires the partition column(s) to be defined as NOT NULL.
-        if not is_iceberg and isinstance(table_name_or_schema, exp.Schema):
+        if not is_iceberg:
             table_props = kwargs.get("table_properties") or {}
             auto_partition = table_props.get("auto_partition")
             is_auto = bool(
@@ -1397,7 +1448,15 @@ class DorisEngineAdapter(
                         for expr in parsed_part_exprs
                         for col in expr.find_all(exp.Column)
                     }
-                    if auto_range_cols:
+                    strict_key = (
+                        table_props.get("unique_key")
+                        or kwargs.get("unique_key")
+                        or table_props.get("aggregate_key")
+                    )
+                    strict_key_set = {k.lower() for k in self._extract_column_names(strict_key)}
+                    if strict_key_set and not auto_range_cols.issubset(strict_key_set):
+                        auto_range_cols = set()
+                    if auto_range_cols and isinstance(table_name_or_schema, exp.Schema):
                         table_name_or_schema = table_name_or_schema.copy()
                         updated_exprs: t.List[exp.Expr] = []
                         for expr in table_name_or_schema.expressions:
@@ -1422,6 +1481,34 @@ class DorisEngineAdapter(
                                     )
                             updated_exprs.append(expr)
                         table_name_or_schema.set("expressions", updated_exprs)
+                    elif auto_range_cols and isinstance(expression, exp.Select):
+                        expression = expression.copy()
+                        new_select_exprs: t.List[exp.Expr] = []
+                        for proj in expression.expressions:
+                            if proj.alias_or_name.lower() in auto_range_cols:
+                                if isinstance(proj, exp.Alias):
+                                    inner = proj.this
+                                    if not (
+                                        isinstance(inner, exp.Anonymous)
+                                        and inner.name.upper() == "NON_NULLABLE"
+                                    ):
+                                        proj = proj.copy()
+                                        proj.set(
+                                            "this",
+                                            exp.Anonymous(
+                                                this="NON_NULLABLE", expressions=[inner.copy()]
+                                            ),
+                                        )
+                                elif isinstance(proj, exp.Column):
+                                    proj = exp.alias_(
+                                        exp.Anonymous(
+                                            this="NON_NULLABLE", expressions=[proj.copy()]
+                                        ),
+                                        proj.name,
+                                        quoted=bool(getattr(proj.this, "quoted", True)),
+                                    )
+                            new_select_exprs.append(proj)
+                        expression.set("expressions", new_select_exprs)
 
         return super()._build_create_table_exp(
             table_name_or_schema,
@@ -1433,6 +1520,45 @@ class DorisEngineAdapter(
             table_kind=table_kind,
             **kwargs,
         )
+
+    def _reorder_unannotated_ctas_query(
+        self, expression: exp.Expr, kwargs: t.Dict[str, t.Any]
+    ) -> exp.Expr:
+        if isinstance(expression, exp.SetOperation):
+            expression = expression.copy()
+            expression.set("this", self._reorder_unannotated_ctas_query(expression.this, kwargs))
+            expression.set(
+                "expression", self._reorder_unannotated_ctas_query(expression.expression, kwargs)
+            )
+            return expression
+        if isinstance(expression, exp.Select):
+            proj_by_name = {
+                proj.alias_or_name.lower(): proj
+                for proj in expression.expressions
+                if proj.alias_or_name and not isinstance(proj, exp.Star)
+            }
+            if proj_by_name and len(proj_by_name) == len(expression.expressions):
+                select_cols_to_types = {
+                    proj.alias_or_name: exp.DataType.build("UNKNOWN")
+                    for proj in expression.expressions
+                }
+                reordered_select_cols = self._reorder_olap_columns(select_cols_to_types, kwargs)
+                if list(reordered_select_cols) != list(select_cols_to_types):
+                    expression = expression.copy()
+                    expression.set(
+                        "expressions",
+                        [proj_by_name[c.lower()] for c in reordered_select_cols],
+                    )
+        return expression
+
+    @classmethod
+    def _is_coercible_string_key_type(cls, dtype: exp.DataType) -> bool:
+        type_name = (
+            dtype.this.value.upper()
+            if isinstance(dtype.this, exp.DataType.Type)
+            else str(dtype.this).upper()
+        )
+        return type_name in ("TEXT", "STRING", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT")
 
     def _reorder_olap_columns(
         self,
@@ -1473,20 +1599,44 @@ class DorisEngineAdapter(
                     f"Doris key columns {missing_cols} not found in table schema columns {col_names}."
                 )
             key_cols = [col_by_lower[k.lower()] for k in raw_key_cols if k.lower() in col_by_lower]
-            if key_cols and col_names[: len(key_cols)] != key_cols:
-                key_cols_set = set(key_cols)
-                new_order = key_cols + [c for c in col_names if c not in key_cols_set]
-                return {c: target_columns_to_types[c] for c in new_order}
-            return target_columns_to_types
+            updated_types = dict(target_columns_to_types)
+            for k in key_cols:
+                k_dtype = updated_types[k]
+                if not self._is_valid_olap_key_type(k_dtype):
+                    if self._is_coercible_string_key_type(k_dtype):
+                        updated_types[k] = exp.DataType.build("VARCHAR(255)", dialect=self.dialect)
+                    else:
+                        raise SQLMeshError(
+                            f"Doris key column '{k}' has type '{k_dtype.sql(dialect=self.dialect)}' which is not supported as an OLAP key column."
+                        )
+            key_cols_set = set(key_cols)
+            new_order = (
+                key_cols + [c for c in col_names if c not in key_cols_set]
+                if key_cols and col_names[: len(key_cols)] != key_cols
+                else col_names
+            )
+            return {c: updated_types[c] for c in new_order}
 
-        first_dtype = target_columns_to_types[col_names[0]]
+        updated_types = dict(target_columns_to_types)
+        first_dtype = updated_types[col_names[0]]
         if not self._is_valid_olap_key_type(first_dtype):
             valid_col = next(
-                (c for c in col_names if self._is_valid_olap_key_type(target_columns_to_types[c])),
+                (c for c in col_names if self._is_valid_olap_key_type(updated_types[c])),
                 None,
             )
             if valid_col:
                 col_names = [valid_col] + [c for c in col_names if c != valid_col]
+            else:
+                coercible_col = next(
+                    (c for c in col_names if self._is_coercible_string_key_type(updated_types[c])),
+                    None,
+                )
+                if coercible_col:
+                    updated_types[coercible_col] = exp.DataType.build(
+                        "VARCHAR(255)", dialect=self.dialect
+                    )
+                    if col_names[0] != coercible_col:
+                        col_names = [coercible_col] + [c for c in col_names if c != coercible_col]
 
         # Ensure any OLAP partition columns with valid key types precede non-keyable columns
         raw_part_by = kwargs.get("partitioned_by") or table_props.get("partitioned_by")
@@ -1499,15 +1649,13 @@ class DorisEngineAdapter(
                 for expr in parsed_part_exprs
                 for col in expr.find_all(exp.Column)
                 if col.name.lower() in col_by_lower
-                and self._is_valid_olap_key_type(
-                    target_columns_to_types[col_by_lower[col.name.lower()]]
-                )
+                and self._is_valid_olap_key_type(updated_types[col_by_lower[col.name.lower()]])
             ]
             first_non_key_idx = next(
                 (
                     i
                     for i, c in enumerate(col_names)
-                    if not self._is_valid_olap_key_type(target_columns_to_types[c])
+                    if not self._is_valid_olap_key_type(updated_types[c])
                 ),
                 None,
             )
@@ -1522,8 +1670,8 @@ class DorisEngineAdapter(
                 after_non_key = [c for c in col_names[first_non_key_idx:] if c not in moved_set]
                 col_names = before_non_key + moved_parts + after_non_key
 
-        if col_names != list(target_columns_to_types):
-            return {c: target_columns_to_types[c] for c in col_names}
+        if col_names != list(target_columns_to_types) or updated_types != target_columns_to_types:
+            return {c: updated_types[c] for c in col_names}
 
         return target_columns_to_types
 
@@ -1627,8 +1775,26 @@ class DorisEngineAdapter(
             partitioned_by = normalized_exprs
 
         if is_iceberg:
+            iceberg_part_exprs = [
+                expr.copy().transform(
+                    lambda node: (
+                        exp.Anonymous(
+                            this="BUCKET",
+                            expressions=[node.expression.copy(), node.this.copy()],
+                        )
+                        if isinstance(node, exp.PartitionedByBucket)
+                        else exp.Anonymous(
+                            this="TRUNCATE",
+                            expressions=[node.expression.copy(), node.this.copy()],
+                        )
+                        if isinstance(node, exp.PartitionByTruncate)
+                        else node
+                    )
+                )
+                for expr in partitioned_by
+            ]
             return exp.PartitionByListProperty(
-                partition_expressions=partitioned_by,
+                partition_expressions=iceberg_part_exprs,
                 create_expressions=[],
             )
 
