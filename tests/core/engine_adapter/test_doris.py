@@ -2156,3 +2156,55 @@ def test_to_sql_root_int128_and_nested_struct_pretty_sql_and_fetchdf_reconnect(
     assert len(df) == 1
     assert fetch_calls == 2
     assert close_spy.call_count == 1
+
+
+def test_strip_for_update_and_multi_col_index_and_partition_by_alias_and_deferred_mv_audit_refresh(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Strip FOR UPDATE locks from SELECT statements (e.g. EnvironmentState.finalize)
+    locked_select = (
+        exp.select("plan_id")
+        .from_("sqlmesh._environments")
+        .where(exp.column("name").eq("prod"))
+        .lock()
+    )
+    adapter.execute(locked_select)
+
+    # 2. Multi-column composite index creation is skipped gracefully (Doris only supports single-column indexes)
+    adapter.create_index("sqlmesh._snapshots", "idx_snapshots", ("name", "identifier"))
+
+    # 3. partition_by alias in table_properties works for OLAP AUTO PARTITION BY RANGE
+    adapter.create_table(
+        "db.alias_part_tbl",
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "ds": exp.DataType.build("DATE"),
+        },
+        table_properties={
+            "partition_by": parse_one("RANGE(DATE_TRUNC(ds, 'day'))", read="doris"),
+            "auto_partition": exp.Literal.string("true"),
+        },
+    )
+
+    # 4. Async materialized view with build='DEFERRED' and has_audits=True triggers REFRESH MATERIALIZED VIEW ... AUTO
+    adapter.create_view(
+        "db.deferred_audited_mv",
+        parse_one("SELECT id, ds FROM db.alias_part_tbl", read="doris"),
+        replace=False,
+        materialized=True,
+        materialized_properties={"has_audits": True},
+        view_properties={
+            "build": exp.Literal.string("DEFERRED"),
+            "refresh": exp.Literal.string("COMPLETE ON MANUAL"),
+            "partition_by": exp.Tuple(expressions=[exp.column("ds")]),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "SELECT `plan_id` FROM `sqlmesh`.`_environments` WHERE `name` = 'prod'",
+        "CREATE TABLE IF NOT EXISTS `db`.`alias_part_tbl` (`id` INT, `ds` DATE NOT NULL) AUTO PARTITION BY RANGE (DATE_TRUNC(`ds`, 'DAY')) ()",
+        "CREATE MATERIALIZED VIEW `db`.`deferred_audited_mv` BUILD DEFERRED REFRESH COMPLETE ON MANUAL PARTITION BY (`ds`) AS SELECT `id`, `ds` FROM `db`.`alias_part_tbl`",
+        "REFRESH MATERIALIZED VIEW `db`.`deferred_audited_mv` AUTO",
+    ]

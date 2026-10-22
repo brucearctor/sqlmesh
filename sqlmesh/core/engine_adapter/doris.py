@@ -666,8 +666,12 @@ class DorisEngineAdapter(
                 partitioned_by = materialized_properties.get("partitioned_by")
             elif create_kwargs.get("partitioned_by"):
                 partitioned_by = create_kwargs.get("partitioned_by")
-            elif view_properties and view_properties.get("partitioned_by"):
-                raw_vp = view_properties.get("partitioned_by")
+            elif view_properties and (
+                view_properties.get("partitioned_by") or view_properties.get("partition_by")
+            ):
+                raw_vp = view_properties.get("partitioned_by") or view_properties.get(
+                    "partition_by"
+                )
                 if raw_vp is not None:
                     partitioned_by = raw_vp if isinstance(raw_vp, list) else [raw_vp]
 
@@ -763,6 +767,17 @@ class DorisEngineAdapter(
                 ),
                 quote_identifiers=self.QUOTE_IDENTIFIERS_IN_VIEWS,
             )
+            build_mode = (
+                self._to_upper_str(view_properties["build"])
+                if view_properties and view_properties.get("build") is not None
+                else None
+            )
+            if (
+                not is_sync_mv
+                and build_mode == "DEFERRED"
+                and bool((materialized_properties or {}).get("has_audits"))
+            ):
+                self.execute(f"REFRESH MATERIALIZED VIEW {self._to_sql(target_table)} AUTO")
             self._clear_data_object_cache(view_name)
 
     def _to_source_table(self, raw_src: t.Any) -> exp.Table:
@@ -814,6 +829,21 @@ class DorisEngineAdapter(
                 self._clear_data_object_cache(view_name)
                 return
         super().drop_view(view_name, ignore_if_not_exists, materialized, **kwargs)
+
+    def create_index(
+        self,
+        table_name: TableName,
+        index_name: str,
+        columns: t.Tuple[str, ...],
+        exists: bool = True,
+    ) -> None:
+        if len(columns) != 1:
+            logger.warning(
+                f"[Doris] Skipping CREATE INDEX {index_name} on {table_name}: "
+                f"Doris only supports single-column indexes, got columns {columns}."
+            )
+            return
+        super().create_index(table_name, index_name, columns, exists=exists)
 
     def _create_table_like(
         self,
@@ -1667,7 +1697,11 @@ class DorisEngineAdapter(
                 and str(self._extract_str_value(auto_partition) or "").strip().lower()
                 in ("true", "1")
             )
-            raw_part_by = kwargs.get("partitioned_by") or table_props.get("partitioned_by")
+            raw_part_by = (
+                kwargs.get("partitioned_by")
+                or table_props.get("partitioned_by")
+                or table_props.get("partition_by")
+            )
             if is_auto and raw_part_by:
                 part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
                 parsed_part_exprs, part_kind = self._parse_partition_expressions(part_list)
@@ -1868,7 +1902,11 @@ class DorisEngineAdapter(
                         col_names = [coercible_col] + [c for c in col_names if c != coercible_col]
 
         # Ensure any OLAP partition columns with valid key types precede non-keyable columns
-        raw_part_by = kwargs.get("partitioned_by") or table_props.get("partitioned_by")
+        raw_part_by = (
+            kwargs.get("partitioned_by")
+            or table_props.get("partitioned_by")
+            or table_props.get("partition_by")
+        )
         if raw_part_by:
             part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
             parsed_part_exprs, _ = self._parse_partition_expressions(part_list)
@@ -1911,7 +1949,14 @@ class DorisEngineAdapter(
         parsed_partitioned_by: t.List[exp.Expr] = []
         partition_kind: t.Optional[str] = None
 
-        for expr in partitioned_by:
+        flattened_partitioned_by: t.List[exp.Expr] = []
+        for item in partitioned_by:
+            if isinstance(item, (exp.Tuple, exp.Array)):
+                flattened_partitioned_by.extend(item.expressions)
+            else:
+                flattened_partitioned_by.append(item)
+
+        for expr in flattened_partitioned_by:
             if isinstance(expr, exp.List) or (
                 isinstance(expr, exp.Anonymous)
                 and expr.this
@@ -2268,12 +2313,14 @@ class DorisEngineAdapter(
         # Pop partitioning-related properties
         partitions = table_properties_copy.pop("partitions", None)
         auto_partition = table_properties_copy.pop("auto_partition", None)
-        if not partitioned_by and "partitioned_by" in table_properties_copy:
-            raw_part_by = table_properties_copy.pop("partitioned_by")
-            if raw_part_by is not None:
-                partitioned_by = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
-        else:
-            table_properties_copy.pop("partitioned_by", None)
+        raw_part_by = table_properties_copy.pop("partitioned_by", None)
+        raw_part_by_alias = table_properties_copy.pop("partition_by", None)
+        if not partitioned_by:
+            chosen_part_by = raw_part_by if raw_part_by is not None else raw_part_by_alias
+            if chosen_part_by is not None:
+                partitioned_by = (
+                    chosen_part_by if isinstance(chosen_part_by, list) else [chosen_part_by]
+                )
 
         add_partition = True
         if partitioned_by:
@@ -2517,6 +2564,12 @@ class DorisEngineAdapter(
         )
 
     def _to_sql(self, expression: exp.Expr, quote: bool = True, **kwargs: t.Any) -> str:
+        if expression.find(exp.Lock):
+            expression = expression.copy()
+            for select_node in expression.find_all(exp.Select):
+                if select_node.args.get("locks"):
+                    select_node.set("locks", None)
+            logger.debug("[Doris] Removed unsupported FOR UPDATE lock from SELECT statement")
         if expression.find(exp.DataType):
             expression = expression.copy()
             for dtype in reversed(list(expression.find_all(exp.DataType))):
