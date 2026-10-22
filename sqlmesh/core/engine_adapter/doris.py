@@ -188,12 +188,16 @@ class DorisEngineAdapter(
     def _extract_str_value(val: t.Any) -> t.Optional[str]:
         if val is None:
             return None
+        if isinstance(val, exp.Boolean):
+            return "true" if val.this else "false"
+        if isinstance(val, bool):
+            return "true" if val else "false"
         if isinstance(val, exp.Literal):
             return str(val.this)
         if isinstance(val, exp.Identifier):
             return str(val.this)
-        if isinstance(val, exp.Column):
-            return str(val.name)
+        if isinstance(val, (exp.Column, exp.Table)):
+            return ".".join(part.name for part in val.parts)
         if isinstance(val, exp.Var):
             return str(val.this)
         if isinstance(val, str):
@@ -236,8 +240,14 @@ class DorisEngineAdapter(
         )
         if type_name in cls.INVALID_KEY_TYPES:
             return False
-        if dtype.is_type("userdefined"):
-            kind = str(dtype.args.get("kind") or "").upper()
+        if dtype.this == exp.DataType.Type.USERDEFINED:
+            kind = (
+                str(dtype.args.get("kind") or dtype.sql(dialect=cls.DIALECT))
+                .upper()
+                .split("(", 1)[0]
+                .strip()
+                .strip("`")
+            )
             if kind in cls.INVALID_KEY_TYPES:
                 return False
         return True
@@ -680,14 +690,7 @@ class DorisEngineAdapter(
             if is_sync_mv and not target_table.db:
                 source_db: t.Optional[str] = None
                 if view_properties and view_properties.get("source_table"):
-                    raw_src = view_properties["source_table"]
-                    if isinstance(raw_src, exp.Column):
-                        source_db = raw_src.db or None
-                    elif isinstance(raw_src, exp.Table):
-                        source_db = raw_src.db or None
-                    else:
-                        src_str = self._extract_str_value(raw_src) or str(raw_src)
-                        source_db = exp.to_table(src_str, dialect=self.dialect).db or None
+                    source_db = self._to_source_table(view_properties["source_table"]).db or None
                 if not source_db:
                     first_tbl = query.find(exp.Table)
                     if first_tbl and first_tbl.db:
@@ -708,6 +711,22 @@ class DorisEngineAdapter(
             )
             self._clear_data_object_cache(view_name)
 
+    def _to_source_table(self, raw_src: t.Any) -> exp.Table:
+        if isinstance(raw_src, exp.Table):
+            tbl = raw_src.copy()
+        elif isinstance(raw_src, exp.Column):
+            tbl = exp.table_(
+                raw_src.name,
+                db=raw_src.table or None,
+                catalog=raw_src.db or None,
+            )
+        else:
+            src_str = self._extract_str_value(raw_src) or str(raw_src)
+            tbl = exp.to_table(src_str, dialect=self.dialect)
+        if tbl.catalog and tbl.catalog.lower() == "internal":
+            tbl.set("catalog", None)
+        return tbl
+
     def drop_view(
         self,
         view_name: TableName,
@@ -727,17 +746,7 @@ class DorisEngineAdapter(
             source_table = view_properties.get("source_table")
             if mat_type and mat_type.upper() == "SYNC" and source_table:
                 view_table_sql = self._to_sql(target_table)
-                if isinstance(source_table, exp.Column):
-                    source_tbl_exp = exp.table_(
-                        source_table.name,
-                        db=source_table.db or None,
-                        catalog=source_table.catalog or None,
-                    )
-                elif isinstance(source_table, exp.Table):
-                    source_tbl_exp = source_table
-                else:
-                    source_table_str = self._extract_str_value(source_table) or str(source_table)
-                    source_tbl_exp = exp.to_table(source_table_str, dialect=self.dialect)
+                source_tbl_exp = self._to_source_table(source_table)
                 # Unqualified synchronous materialized views require the source table's database
                 # to be active on the session before executing `DROP MATERIALIZED VIEW <mv> ON <tbl>`.
                 if not target_table.db and source_tbl_exp.db:
@@ -1080,8 +1089,12 @@ class DorisEngineAdapter(
         for extra in extra_conditions:
             qualified_extra = extra.copy()
             for col in qualified_extra.find_all(exp.Column):
-                if not col.find_ancestor(exp.Subquery, exp.Select) and not col.table:
+                if not col.find_ancestor(exp.Subquery, exp.Select) and (
+                    not col.table or col.table.lower() == target_table.name.lower()
+                ):
                     col.set("table", exp.to_identifier("_t1"))
+                    col.set("db", None)
+                    col.set("catalog", None)
             join_conditions.append(qualified_extra)
 
         where_expr = exp.and_(*join_conditions)
@@ -1843,15 +1856,10 @@ class DorisEngineAdapter(
         return None
 
     def _to_upper_str(self, val: t.Any) -> str:
-        if isinstance(val, exp.Literal):
-            return str(val.this).upper()
-        if isinstance(val, exp.Identifier):
-            return str(val.this).upper()
-        if isinstance(val, str):
-            return val.upper()
-        if isinstance(val, exp.Expr):
-            return val.sql(dialect=self.dialect).upper()
-        return str(val).upper()
+        extracted = self._extract_str_value(val)
+        if extracted is not None:
+            return extracted.strip().strip("`").upper()
+        return str(val).strip().strip("`").upper()
 
     def _parse_refresh_tuple(
         self,
@@ -1869,12 +1877,10 @@ class DorisEngineAdapter(
         unit_var: t.Optional[exp.Var] = None
         starts_lit: t.Optional[exp.Literal] = None
         for e in tpl.expressions:
-            if (
-                isinstance(e, exp.EQ)
-                and isinstance(e.this, exp.Column)
-                and isinstance(e.this.this, exp.Identifier)
-            ):
-                key = str(e.this.this.this).strip('"').lower()
+            if isinstance(e, exp.EQ):
+                key = (
+                    (self._extract_str_value(e.this) or "").strip('"').strip("'").strip("`").lower()
+                )
                 val = e.expression
                 if key == "method":
                     method_upper = self._to_upper_str(val)
@@ -1906,10 +1912,10 @@ class DorisEngineAdapter(
                         raise SQLMeshError(f"Invalid materialized view refresh unit: {unit_upper}")
                     unit_var = exp.Var(this=unit_upper)
                 elif key == "starts":
-                    if isinstance(val, exp.Literal):
-                        starts_lit = exp.Literal.string(str(val.this))
-                    else:
-                        starts_lit = exp.Literal.string(str(val))
+                    starts_str = self._extract_str_value(val)
+                    starts_lit = exp.Literal.string(
+                        starts_str if starts_str is not None else str(val)
+                    )
         return method_var, kind_str, every_lit, unit_var, starts_lit
 
     @staticmethod

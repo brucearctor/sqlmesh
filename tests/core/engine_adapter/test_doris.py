@@ -1178,6 +1178,27 @@ def test_sync_materialized_view_drop_and_replace(
         "CREATE MATERIALIZED VIEW `sync_mv` AS SELECT `id` AS `mv_id` FROM `db`.`orders`",
     ]
 
+    adapter.cursor.execute.reset_mock()
+
+    # source_table parsed as exp.Column (from MODEL physical_properties) and 3-part internal.db.orders
+    adapter.create_view(
+        "sync_mv",
+        parse_one("SELECT id FROM orders", read="doris"),
+        replace=True,
+        materialized=True,
+        view_properties={
+            "materialized_type": exp.Literal.string("SYNC"),
+            "source_table": parse_one("internal.db.orders", read="doris"),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "USE `db`",
+        "DROP MATERIALIZED VIEW IF EXISTS `sync_mv` ON `db`.`orders`",
+        "USE `db`",
+        "CREATE MATERIALIZED VIEW `sync_mv` AS SELECT `id` AS `mv_id` FROM `orders`",
+    ]
+
 
 def test_delete_with_subquery_fallback_and_cardinality_aware_composite_batching(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
@@ -1274,7 +1295,19 @@ def test_delete_by_literal_keys_doris_delete_handler_invariants(
 
 @pytest.mark.parametrize(
     "non_key_type",
-    ["FLOAT", "DOUBLE", "ARRAY<INT>", "MAP<STRING, INT>", "STRUCT<a: INT>", "JSON", "VARIANT"],
+    [
+        "FLOAT",
+        "DOUBLE",
+        "ARRAY<INT>",
+        "MAP<STRING, INT>",
+        "STRUCT<a: INT>",
+        "JSON",
+        "VARIANT",
+        "BITMAP",
+        "HLL",
+        "QUANTILE_STATE",
+        "AGG_STATE(sum(INT))",
+    ],
 )
 def test_olap_key_type_and_prefix_invariants(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
@@ -1284,7 +1317,7 @@ def test_olap_key_type_and_prefix_invariants(
     adapter.create_table(
         "db.complex_tbl",
         target_columns_to_types={
-            "bad_first_col": exp.DataType.build(non_key_type, dialect="doris"),
+            "bad_first_col": exp.DataType.build(non_key_type, dialect="doris", udt=True),
             "valid_key": exp.DataType.build("BIGINT", dialect="doris"),
         },
     )
@@ -1550,3 +1583,121 @@ def test_delete_from_boolean_literal_simplification(
     adapter.cursor.execute.reset_mock()
     adapter.delete_from("db.tbl", where="TRUE")
     assert to_sql_calls(adapter) == ["TRUNCATE TABLE `db`.`tbl`"]
+
+    # Target-qualified extra condition in DELETE ... USING is rewritten to alias _t1
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from(
+        "db.target",
+        where="target.ds = '2024-01-01' AND id IN (SELECT id FROM db.src)",
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`src`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`ds` = '2024-01-01'"
+    ]
+
+
+def test_resolve_table_refs_in_physical_properties_for_mv_and_sync_mv(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    from sqlmesh.core.dialect import parse
+    from sqlmesh.core.model import SqlModel, load_sql_based_model
+    from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    base_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name doris_db.orders,
+                    kind FULL,
+                    dialect doris,
+                    columns (id INT, amount INT)
+                );
+                SELECT 1 AS id, 10 AS amount;
+                """,
+                default_dialect="doris",
+            )
+        ),
+    )
+    base_snapshot = Snapshot.from_node(base_model, nodes={}, ttl="in 1 week")
+    base_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    physical_tbl = exp.to_table(base_snapshot.table_name())
+    expected_physical = f"{physical_tbl.db}.{physical_tbl.name}"
+    snapshots = {base_snapshot.name: base_snapshot}
+
+    # 1. Async MTMV with excluded_trigger_tables resolves model ref to physical snapshot table
+    async_mv_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name doris_db.orders_mtmv,
+                    kind VIEW (materialized true),
+                    dialect doris,
+                    columns (id INT, amount INT),
+                    physical_properties (
+                        build = IMMEDIATE,
+                        refresh = AUTO,
+                        excluded_trigger_tables = doris_db.orders
+                    )
+                );
+                SELECT id, amount FROM doris_db.orders;
+                """,
+                default_dialect="doris",
+            )
+        ),
+    )
+    rendered_async_props = async_mv_model.render_physical_properties(
+        snapshots=snapshots, engine_adapter=adapter
+    )
+    adapter.create_view(
+        async_mv_model.name,
+        async_mv_model.render_query() or parse_one("SELECT id, amount FROM doris_db.orders"),
+        replace=False,
+        materialized=True,
+        target_columns_to_types=async_mv_model.columns_to_types,
+        view_properties=rendered_async_props,
+    )
+    async_ddl = to_sql_calls(adapter)[-1]
+    assert f"'excluded_trigger_tables'='{expected_physical}'" in async_ddl
+
+    # 2. Sync MV with source_table resolves model ref to physical snapshot table for DROP ... ON
+    adapter.cursor.execute.reset_mock()
+    sync_mv_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name doris_db.orders_sync_mv,
+                    kind VIEW (materialized true),
+                    dialect doris,
+                    physical_properties (
+                        materialized_type = SYNC,
+                        source_table = doris_db.orders
+                    )
+                );
+                SELECT id, SUM(amount) AS total FROM doris_db.orders GROUP BY id;
+                """,
+                default_dialect="doris",
+            )
+        ),
+    )
+    rendered_sync_props = sync_mv_model.render_physical_properties(
+        snapshots=snapshots, engine_adapter=adapter
+    )
+    adapter.create_view(
+        sync_mv_model.name,
+        sync_mv_model.render_query(snapshots=snapshots)
+        or parse_one("SELECT id, SUM(amount) AS total FROM doris_db.orders GROUP BY id"),
+        replace=True,
+        materialized=True,
+        view_properties=rendered_sync_props,
+    )
+    sync_calls = to_sql_calls(adapter)
+    assert sync_calls[0] == (
+        f"DROP MATERIALIZED VIEW IF EXISTS `doris_db`.`orders_sync_mv` ON `{physical_tbl.db}`.`{physical_tbl.name}`"
+    )
