@@ -1322,27 +1322,47 @@ class DorisEngineAdapter(
 
         return normalized_keys, tuple_rows, extra_conditions
 
+    @staticmethod
+    def _is_literal_key_value(expr: exp.Expr) -> bool:
+        return isinstance(expr, (exp.Literal, exp.Boolean, exp.Null)) or (
+            isinstance(expr, exp.Neg) and isinstance(expr.this, exp.Literal)
+        )
+
+    @classmethod
+    def _normalize_single_boolean_conjunct(cls, cond: exp.Expr) -> t.Optional[exp.Expr]:
+        inner = cond.unnest()
+        if isinstance(inner, exp.Column):
+            return inner.copy().eq(exp.true())
+        if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Boolean):
+            return inner.this.copy().eq(inner.expression.copy())
+        if isinstance(inner, exp.Not):
+            neg_inner = inner.this.unnest()
+            if isinstance(neg_inner, exp.Column):
+                return neg_inner.copy().eq(exp.false())
+            if isinstance(neg_inner, exp.Is) and isinstance(neg_inner.expression, exp.Boolean):
+                return neg_inner.this.copy().eq(
+                    exp.Boolean(this=not bool(neg_inner.expression.this))
+                )
+        return None
+
     @classmethod
     def _normalize_boolean_column_conjuncts(cls, where: exp.Expr) -> exp.Expr:
-        """Rewrite top-level bare boolean column conjuncts (`AND is_dev`, `AND NOT is_dev`) to
-        explicit binary comparisons (`is_dev = TRUE`, `is_dev = FALSE`) required by Doris DeleteHandler.
+        """Rewrite top-level bare boolean column conjuncts (`AND is_dev`, `AND NOT is_dev`) and
+        `IS [NOT] TRUE/FALSE` predicates to explicit binary comparisons (`is_dev = TRUE`,
+        `is_dev = FALSE`) required by Doris DeleteHandler.
         """
+        single = cls._normalize_single_boolean_conjunct(where)
+        if single is not None:
+            return single
         unwrapped = where.unnest()
-        if isinstance(unwrapped, exp.Column):
-            return unwrapped.copy().eq(exp.true())
-        if isinstance(unwrapped, exp.Not) and isinstance(unwrapped.this.unnest(), exp.Column):
-            return unwrapped.this.unnest().copy().eq(exp.false())
         if isinstance(unwrapped, exp.And):
             conjuncts = list(unwrapped.flatten())
             changed = False
             new_conjuncts: t.List[exp.Expr] = []
             for cond in conjuncts:
-                inner = cond.unnest()
-                if isinstance(inner, exp.Column):
-                    new_conjuncts.append(inner.copy().eq(exp.true()))
-                    changed = True
-                elif isinstance(inner, exp.Not) and isinstance(inner.this.unnest(), exp.Column):
-                    new_conjuncts.append(inner.this.unnest().copy().eq(exp.false()))
+                normalized = cls._normalize_single_boolean_conjunct(cond)
+                if normalized is not None:
+                    new_conjuncts.append(normalized)
                     changed = True
                 else:
                     new_conjuncts.append(cond)
@@ -1391,21 +1411,22 @@ class DorisEngineAdapter(
             col_to_val: t.Dict[str, exp.Expr] = {}
             col_to_expr: t.Dict[str, exp.Expr] = {}
             for item in branch_conjuncts:
-                item_unwrapped = item.unnest()
+                normalized_bool = self._normalize_single_boolean_conjunct(item)
+                item_unwrapped = normalized_bool if normalized_bool is not None else item.unnest()
                 if isinstance(item_unwrapped, exp.EQ):
                     left, right = item_unwrapped.this, item_unwrapped.expression
-                    if isinstance(left, (exp.Column, exp.Identifier)) and isinstance(
-                        right, (exp.Literal, exp.Boolean, exp.Null)
-                    ):
+                    if isinstance(
+                        left, (exp.Column, exp.Identifier)
+                    ) and self._is_literal_key_value(right):
                         col_expr = (
                             left.copy()
                             if isinstance(left, exp.Column)
                             else exp.Column(this=left.copy())
                         )
                         val_expr = right.copy()
-                    elif isinstance(right, (exp.Column, exp.Identifier)) and isinstance(
-                        left, (exp.Literal, exp.Boolean, exp.Null)
-                    ):
+                    elif isinstance(
+                        right, (exp.Column, exp.Identifier)
+                    ) and self._is_literal_key_value(left):
                         col_expr = (
                             right.copy()
                             if isinstance(right, exp.Column)
@@ -1468,13 +1489,13 @@ class DorisEngineAdapter(
         query = in_expr.args.get("query")
         if isinstance(query, exp.Subquery):
             return query.copy()
-        if isinstance(query, exp.Select):
+        if isinstance(query, (exp.Select, exp.SetOperation)):
             return exp.Subquery(this=query.copy())
         if len(in_expr.expressions) == 1:
             first = in_expr.expressions[0]
             if isinstance(first, exp.Subquery):
                 return first.copy()
-            if isinstance(first, exp.Select):
+            if isinstance(first, (exp.Select, exp.SetOperation)):
                 return exp.Subquery(this=first.copy())
         return None
 
@@ -1492,6 +1513,7 @@ class DorisEngineAdapter(
             return
 
         join_conditions: t.List[exp.Expr] = []
+        subquery = subquery.copy()
         first_select = subquery.this
         while isinstance(first_select, exp.SetOperation):
             first_select = first_select.this
@@ -1505,15 +1527,12 @@ class DorisEngineAdapter(
                 candidate_name = sel_item.alias_or_name
                 if candidate_name and candidate_name.lower() not in used_t2_aliases:
                     t2_col_name = candidate_name
-                elif isinstance(subquery.this, exp.Select):
+                else:
                     alias_name = f"_col_{idx}"
-                    subquery = subquery.copy()
-                    sub_select = t.cast(exp.Select, subquery.this)
-                    new_exprs = list(sub_select.expressions)
+                    new_exprs = list(first_select.expressions)
                     inner_expr = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
                     new_exprs[idx] = exp.alias_(inner_expr.copy(), alias_name, quoted=True)
-                    sub_select.set("expressions", new_exprs)
-                    first_select = sub_select
+                    first_select.set("expressions", new_exprs)
                     t2_col_name = alias_name
             used_t2_aliases.add(t2_col_name.lower())
             t2_col = exp.column(t2_col_name, table="_t2")
@@ -1788,6 +1807,13 @@ class DorisEngineAdapter(
         #    `EngineAdapter.replace_query` creates the empty table via `_create_table_from_columns`
         #    first and then calls `_create_table_from_source_queries(..., replace=False)`. Executing
         #    `CREATE TABLE IF NOT EXISTS ... AS SELECT` would be a no-op, so we insert the source queries.
+        if is_internal_iceberg and not target_columns_to_types_known:
+            raise SQLMeshError(
+                f"Doris does not support `CREATE TABLE ... AS SELECT` with `ENGINE=iceberg` on table '{table_name}' "
+                "without known column types. Either qualify the table with an external Iceberg catalog "
+                "(`<iceberg_catalog>.<db>.<table>`) or specify explicit column types."
+            )
+
         if (
             is_internal_iceberg or (self_referencing and not replace)
         ) and target_columns_to_types_known:
@@ -2030,6 +2056,33 @@ class DorisEngineAdapter(
             **kwargs,
         )
 
+    @staticmethod
+    def _is_integer_indicator_projection(proj: exp.Expr) -> bool:
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if isinstance(inner, exp.Literal) and inner.is_int:
+            return True
+        if isinstance(inner, exp.If):
+            t_val, f_val = inner.args.get("true"), inner.args.get("false")
+            return bool(
+                isinstance(t_val, exp.Literal)
+                and t_val.is_int
+                and isinstance(f_val, exp.Literal)
+                and f_val.is_int
+            )
+        if isinstance(inner, exp.Case):
+            ifs = inner.args.get("ifs") or []
+            default = inner.args.get("default")
+            return bool(
+                ifs
+                and isinstance(default, exp.Literal)
+                and default.is_int
+                and all(
+                    isinstance(i.args.get("true"), exp.Literal) and i.args["true"].is_int
+                    for i in ifs
+                )
+            )
+        return False
+
     def _reorder_unannotated_ctas_query(
         self, expression: exp.Expr, kwargs: t.Dict[str, t.Any]
     ) -> exp.Expr:
@@ -2058,6 +2111,47 @@ class DorisEngineAdapter(
                         "expressions",
                         [proj_by_name[c.lower()] for c in reordered_select_cols],
                     )
+            elif any(isinstance(proj, exp.Star) for proj in expression.expressions):
+                table_props = kwargs.get("table_properties") or {}
+                has_explicit_key = bool(
+                    table_props.get("unique_key")
+                    or kwargs.get("unique_key")
+                    or table_props.get("duplicate_key")
+                    or table_props.get("aggregate_key")
+                )
+                with_clause = expression.args.get("with_")
+                from_clause = expression.args.get("from_")
+                if (
+                    not has_explicit_key
+                    and isinstance(with_clause, exp.With)
+                    and isinstance(from_clause, exp.From)
+                    and isinstance(from_clause.this, exp.Table)
+                ):
+                    target_cte_name = from_clause.this.name.lower()
+                    for cte_idx, cte in enumerate(with_clause.expressions):
+                        if (
+                            isinstance(cte, exp.CTE)
+                            and cte.alias.lower() == target_cte_name
+                            and isinstance(cte.this, exp.Select)
+                            and len(cte.this.expressions) >= 2
+                            and not self._is_integer_indicator_projection(cte.this.expressions[0])
+                        ):
+                            indicator_idx = next(
+                                (
+                                    idx
+                                    for idx, p in enumerate(cte.this.expressions)
+                                    if idx > 0 and self._is_integer_indicator_projection(p)
+                                ),
+                                None,
+                            )
+                            if indicator_idx is not None:
+                                expression = expression.copy()
+                                copied_cte = expression.args["with_"].expressions[cte_idx]
+                                copied_select = copied_cte.this
+                                projs = list(copied_select.expressions)
+                                indicator_proj = projs.pop(indicator_idx)
+                                copied_select.set("expressions", [indicator_proj, *projs])
+                            break
         return expression
 
     @classmethod
@@ -2863,6 +2957,21 @@ class DorisEngineAdapter(
                 if select_node.args.get("locks"):
                     select_node.set("locks", None)
             logger.debug("[Doris] Removed unsupported FOR UPDATE lock from SELECT statement")
+        if any(
+            isinstance(is_node.expression, exp.Boolean) for is_node in expression.find_all(exp.Is)
+        ):
+            expression = expression.copy()
+            for is_node in list(expression.find_all(exp.Is)):
+                if isinstance(is_node.expression, exp.Boolean):
+                    eq_expr: exp.Expr = exp.EQ(
+                        this=is_node.this.copy(), expression=is_node.expression.copy()
+                    )
+                    if isinstance(is_node.parent, exp.Not):
+                        eq_expr = exp.Paren(this=eq_expr)
+                    if is_node is expression:
+                        expression = eq_expr
+                    else:
+                        is_node.replace(eq_expr)
         if expression.find(exp.DataType):
             expression = expression.copy()
             for dtype in reversed(list(expression.find_all(exp.DataType))):

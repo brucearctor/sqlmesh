@@ -2380,3 +2380,83 @@ def test_unannotated_view_column_comments_and_starrocks_property_parity(
             target_columns_to_types=cols,
             table_properties={"distributed_by": exp.Literal.string("HASH BUCKETS 10")},
         )
+
+
+def test_is_bool_rewrites_negative_or_keys_union_delete_and_table_diff_ctas(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. `IS TRUE` / `IS FALSE` / `IS NOT TRUE` in UPDATE (e.g. SnapshotState.unpause_snapshots) and DELETE
+    adapter.update_table(
+        "sqlmesh._snapshots",
+        {"unpaused_ts": 1700000000},
+        where=exp.and_(
+            exp.column("forward_only").is_(exp.true()),
+            exp.column("name").eq(exp.Literal.string("db.m1")),
+        ),
+    )
+    adapter.delete_from(
+        "sqlmesh._intervals",
+        where=exp.and_(
+            exp.column("is_dev").is_(exp.true()).not_(),
+            exp.column("name").eq(exp.Literal.string("db.m1")),
+        ),
+    )
+
+    # 2. Top-level OR of key rows with negative number literals and bare boolean / IS TRUE conjuncts
+    adapter.delete_from(
+        "sqlmesh._intervals",
+        where=parse_one(
+            "(id = -1 AND is_dev) OR (id = -2 AND NOT is_dev)",
+            read="doris",
+        ),
+    )
+
+    # 3. DELETE ... USING with a UNION ALL subquery containing duplicate/unaliased projection names
+    union_where = exp.Tuple(expressions=[exp.column("k1"), exp.column("k2")]).isin(
+        query=parse_one(
+            "SELECT a.id, b.id FROM db.a AS a JOIN db.b AS b ON a.id = b.id "
+            "UNION ALL "
+            "SELECT c.id, d.id FROM db.c AS c JOIN db.d AS d ON c.id = d.id",
+            read="doris",
+        )
+    )
+    adapter.delete_from("db.target_tbl", where=union_where)
+
+    # 4. TableDiff-style unannotated CTAS (`SELECT *, CASE ... AS row_full_match FROM __stats`)
+    #    promotes the integer indicator column (`s_exists`) to index 0 of `__stats` so string/float
+    #    first columns do not fail Doris's implicit DUPLICATE KEY rule.
+    table_diff_query = parse_one(
+        "WITH `__source` AS (SELECT `s`.`name` AS `name`, `s`.`id` AS `__sqlmesh_join_key` FROM `db`.`src` AS `s`), "
+        "`__target` AS (SELECT `t`.`name` AS `name`, `t`.`id` AS `__sqlmesh_join_key` FROM `db`.`tgt` AS `t`), "
+        "`__stats` AS ("
+        "SELECT `s`.`name` AS `s__name`, `t`.`name` AS `t__name`, "
+        "IF(NOT `s`.`__sqlmesh_join_key` IS NULL, 1, 0) AS `s_exists`, "
+        "IF(NOT `t`.`__sqlmesh_join_key` IS NULL, 1, 0) AS `t_exists` "
+        "FROM `__source` AS `s` LEFT JOIN `__target` AS `t` ON `s`.`__sqlmesh_join_key` = `t`.`__sqlmesh_join_key`"
+        ") "
+        "SELECT *, CASE WHEN `s__name` = `t__name` THEN 1 ELSE 0 END AS `row_full_match` FROM `__stats`",
+        read="doris",
+    )
+    adapter.ctas("sqlmesh_temp.diff", table_diff_query)
+
+    assert to_sql_calls(adapter) == [
+        "UPDATE `sqlmesh`.`_snapshots` SET `unpaused_ts` = 1700000000 WHERE `forward_only` = TRUE AND `name` = 'db.m1'",
+        "DELETE FROM `sqlmesh`.`_intervals` WHERE `is_dev` = FALSE AND `name` = 'db.m1'",
+        "DELETE FROM `sqlmesh`.`_intervals` WHERE `id` = -1 AND `is_dev` IN (TRUE)",
+        "DELETE FROM `sqlmesh`.`_intervals` WHERE `id` = -2 AND `is_dev` IN (FALSE)",
+        "DELETE FROM `db`.`target_tbl` AS `_t1` USING (SELECT `a`.`id`, `b`.`id` AS `_col_1` FROM `db`.`a` AS `a` JOIN `db`.`b` AS `b` ON `a`.`id` = `b`.`id` UNION ALL SELECT `c`.`id`, `d`.`id` FROM `db`.`c` AS `c` JOIN `db`.`d` AS `d` ON `c`.`id` = `d`.`id`) AS `_t2` WHERE `_t1`.`k1` = `_t2`.`id` AND `_t1`.`k2` = `_t2`.`_col_1`",
+        "CREATE TABLE IF NOT EXISTS `sqlmesh_temp`.`diff` AS WITH `__source` AS (SELECT `s`.`name` AS `name`, `s`.`id` AS `__sqlmesh_join_key` FROM `db`.`src` AS `s`), `__target` AS (SELECT `t`.`name` AS `name`, `t`.`id` AS `__sqlmesh_join_key` FROM `db`.`tgt` AS `t`), `__stats` AS (SELECT CASE WHEN NOT `s`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `s_exists`, `s`.`name` AS `s__name`, `t`.`name` AS `t__name`, CASE WHEN NOT `t`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `t_exists` FROM `__source` AS `s` LEFT JOIN `__target` AS `t` ON `s`.`__sqlmesh_join_key` = `t`.`__sqlmesh_join_key`) SELECT *, CASE WHEN `s__name` = `t__name` THEN 1 ELSE 0 END AS `row_full_match` FROM `__stats`",
+    ]
+
+    # 5. Unannotated 2-part/internal Iceberg CTAS raises a clear SQLMeshError instead of silently dropping ENGINE=iceberg
+    with pytest.raises(
+        SQLMeshError,
+        match="Doris does not support `CREATE TABLE ... AS SELECT` with `ENGINE=iceberg`",
+    ):
+        adapter.ctas(
+            "silver.unannotated_iceberg",
+            parse_one("SELECT id, ds FROM bronze.events", read="doris"),
+            table_format="iceberg",
+        )
