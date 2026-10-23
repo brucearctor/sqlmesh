@@ -200,6 +200,12 @@ class DorisEngineAdapter(
     def _extract_str_value(val: t.Any) -> t.Optional[str]:
         if val is None:
             return None
+        if isinstance(val, exp.Paren):
+            return DorisEngineAdapter._extract_str_value(val.this)
+        if isinstance(val, (exp.Tuple, exp.Array)):
+            return ",".join(
+                s for e in val.expressions if (s := DorisEngineAdapter._extract_str_value(e))
+            )
         if isinstance(val, exp.Boolean):
             return "true" if val.this else "false"
         if isinstance(val, bool):
@@ -218,6 +224,22 @@ class DorisEngineAdapter(
             return val.name or str(val)
         return str(val)
 
+    @staticmethod
+    def _split_cleaned_column_names(raw: str) -> t.List[str]:
+        s = raw.strip()
+        while len(s) >= 2 and (
+            (s[0] == "(" and s[-1] == ")")
+            or (s[0] == "'" and s[-1] == "'")
+            or (s[0] == '"' and s[-1] == '"')
+        ):
+            s = s[1:-1].strip()
+        result: t.List[str] = []
+        for part in s.split(","):
+            cleaned = part.strip().strip("'\"").strip("()").strip().strip("`'\"").strip()
+            if cleaned:
+                result.append(cleaned)
+        return result
+
     @classmethod
     def _extract_column_names(cls, key_expr: t.Any) -> t.List[str]:
         if key_expr is None:
@@ -235,13 +257,12 @@ class DorisEngineAdapter(
                 names.extend(cls._extract_column_names(e))
             return names
         if isinstance(key_expr, exp.Column):
-            return [key_expr.name]
+            return cls._split_cleaned_column_names(key_expr.name)
         if isinstance(key_expr, (exp.Identifier, exp.Literal, exp.Var)):
-            raw = str(key_expr.this)
-            return [c.strip().strip("`") for c in raw.split(",") if c.strip()]
+            return cls._split_cleaned_column_names(str(key_expr.this))
         if isinstance(key_expr, str):
-            return [c.strip().strip("`") for c in key_expr.split(",") if c.strip()]
-        return [str(key_expr).strip().strip("`")]
+            return cls._split_cleaned_column_names(key_expr)
+        return cls._split_cleaned_column_names(str(key_expr))
 
     @classmethod
     def _is_valid_olap_key_type(cls, dtype: exp.DataType) -> bool:
@@ -639,6 +660,16 @@ class DorisEngineAdapter(
             )
 
         if not materialized:
+            if (
+                not target_columns_to_types
+                and column_descriptions
+                and isinstance(query_or_df, exp.Query)
+                and query_or_df.named_selects
+                and "*" not in query_or_df.named_selects
+            ):
+                target_columns_to_types = {
+                    col: exp.DataType.build("UNKNOWN") for col in query_or_df.named_selects
+                }
             return super().create_view(
                 view_name,
                 query_or_df,
@@ -726,11 +757,24 @@ class DorisEngineAdapter(
                 )
             )
 
+            schema_cols_to_types = target_columns_to_types
+            if (
+                not schema_cols_to_types
+                and column_descriptions
+                and not is_sync_mv
+                and isinstance(query, exp.Query)
+                and query.named_selects
+                and "*" not in query.named_selects
+            ):
+                schema_cols_to_types = {
+                    col: exp.DataType.build("UNKNOWN") for col in query.named_selects
+                }
+
             schema: t.Union[exp.Table, exp.Schema] = target_table
-            if target_columns_to_types and not is_sync_mv:
+            if schema_cols_to_types and not is_sync_mv:
                 schema = self._build_schema_exp(
                     target_table,
-                    target_columns_to_types,
+                    schema_cols_to_types,
                     column_descriptions,
                     is_view=True,
                 )
@@ -740,14 +784,6 @@ class DorisEngineAdapter(
                 partitioned_by = materialized_properties.get("partitioned_by")
             elif create_kwargs.get("partitioned_by"):
                 partitioned_by = create_kwargs.get("partitioned_by")
-            elif view_properties and (
-                view_properties.get("partitioned_by") or view_properties.get("partition_by")
-            ):
-                raw_vp = view_properties.get("partitioned_by") or view_properties.get(
-                    "partition_by"
-                )
-                if raw_vp is not None:
-                    partitioned_by = raw_vp if isinstance(raw_vp, list) else [raw_vp]
 
             clustered_by = None
             if materialized_properties and materialized_properties.get("clustered_by"):
@@ -2039,6 +2075,28 @@ class DorisEngineAdapter(
         kwargs: t.Dict[str, t.Any],
     ) -> t.Dict[str, exp.DataType]:
         table_props = kwargs.get("table_properties") or {}
+        if table_props.get("primary_key") is not None or kwargs.get("primary_key") is not None:
+            raise SQLMeshError(
+                "Doris does not support 'primary_key' in physical_properties; use 'unique_key', 'duplicate_key', or 'aggregate_key' instead."
+            )
+        if table_props.get("partition") is not None:
+            raise SQLMeshError(
+                "Invalid property 'partition' in physical_properties; did you mean 'partition_by', 'partitioned_by', or 'partitions'?"
+            )
+        if (
+            sum(
+                x is not None
+                for x in (
+                    kwargs.get("partitioned_by") or None,
+                    table_props.get("partitioned_by"),
+                    table_props.get("partition_by"),
+                )
+            )
+            > 1
+        ):
+            raise SQLMeshError(
+                "Multiple partition definitions found: specify only one of model 'partitioned_by' or physical_properties 'partitioned_by' / 'partition_by'."
+            )
         unique_key = table_props.get("unique_key") or kwargs.get("unique_key")
         duplicate_key = table_props.get("duplicate_key")
         aggregate_key = table_props.get("aggregate_key")
@@ -2438,6 +2496,17 @@ class DorisEngineAdapter(
                 )
 
         # Pop key models and order_by from table_properties_copy
+        if (
+            table_properties_copy.pop("primary_key", None) is not None
+            or kwargs.get("primary_key") is not None
+        ):
+            raise SQLMeshError(
+                "Doris does not support 'primary_key' in physical_properties; use 'unique_key', 'duplicate_key', or 'aggregate_key' instead."
+            )
+        if table_properties_copy.get("partition") is not None:
+            raise SQLMeshError(
+                "Invalid property 'partition' in physical_properties; did you mean 'partition_by', 'partitioned_by', or 'partitions'?"
+            )
         unique_key = table_properties_copy.pop("unique_key", None) or kwargs.get("unique_key")
         duplicate_key = table_properties_copy.pop("duplicate_key", None)
         aggregate_key = table_properties_copy.pop("aggregate_key", None)
@@ -2525,6 +2594,20 @@ class DorisEngineAdapter(
         auto_partition = table_properties_copy.pop("auto_partition", None)
         raw_part_by = table_properties_copy.pop("partitioned_by", None)
         raw_part_by_alias = table_properties_copy.pop("partition_by", None)
+        if (
+            sum(
+                x is not None
+                for x in (
+                    partitioned_by or None,
+                    raw_part_by,
+                    raw_part_by_alias,
+                )
+            )
+            > 1
+        ):
+            raise SQLMeshError(
+                "Multiple partition definitions found: specify only one of model 'partitioned_by' or physical_properties 'partitioned_by' / 'partition_by'."
+            )
         if not partitioned_by:
             chosen_part_by = raw_part_by if raw_part_by is not None else raw_part_by_alias
             if chosen_part_by is not None:
@@ -2846,6 +2929,14 @@ class DorisEngineAdapter(
                 cols = [
                     exp.to_column(c) for c in self._extract_column_names(distributed_by.expressions)
                 ]
+                if kind_upper == "RANDOM" and cols:
+                    raise SQLMeshError(
+                        "Doris DISTRIBUTED BY RANDOM does not accept column expressions."
+                    )
+                if kind_upper == "HASH" and not cols:
+                    raise SQLMeshError(
+                        "Doris DISTRIBUTED BY HASH requires at least one column expression."
+                    )
                 return exp.DistributedByProperty(
                     kind=exp.Var(this=kind_upper),
                     expressions=cols if cols else None,
@@ -2868,7 +2959,7 @@ class DorisEngineAdapter(
                     )
                 )
                 m = re.match(
-                    r"^(HASH|RANDOM)\s*(?:\(([^)]*)\))?\s*(?:BUCKETS\s+(AUTO|\d+))?$",
+                    r"^(HASH|RANDOM)(?:\s*\(([^)]*)\)|\b)\s*(?:BUCKETS\s+(\S+))?$",
                     text,
                     flags=re.IGNORECASE,
                 )
@@ -2877,14 +2968,18 @@ class DorisEngineAdapter(
                     cols_str = m.group(2)
                     b_str = m.group(3)
                     parsed_cols = (
-                        [
-                            exp.to_column(c.strip().strip("`"))
-                            for c in cols_str.split(",")
-                            if c.strip()
-                        ]
+                        [exp.to_column(c) for c in self._extract_column_names(cols_str)]
                         if cols_str
                         else None
                     )
+                    if kind_upper == "RANDOM" and parsed_cols:
+                        raise SQLMeshError(
+                            "Doris DISTRIBUTED BY RANDOM does not accept column expressions."
+                        )
+                    if kind_upper == "HASH" and not parsed_cols:
+                        raise SQLMeshError(
+                            "Doris DISTRIBUTED BY HASH requires at least one column expression."
+                        )
                     b_expr = self._resolve_buckets(b_str) if b_str else default_buckets_expr
                     return exp.DistributedByProperty(
                         kind=exp.Var(this=kind_upper),
@@ -2951,8 +3046,15 @@ class DorisEngineAdapter(
 
             if distributed_info:
                 raw_kind = distributed_info.get("kind")
-                expressions = distributed_info.get("expressions")
+                expressions = (
+                    distributed_info.get("expressions")
+                    if distributed_info.get("expressions") is not None
+                    else distributed_info.get("columns")
+                )
                 buckets = distributed_info.get("buckets", top_level_buckets)
+
+                if raw_kind is None and expressions is not None:
+                    raw_kind = "HASH"
 
                 if raw_kind:
                     kind_upper = str(raw_kind).strip().upper()
@@ -2966,6 +3068,15 @@ class DorisEngineAdapter(
                     if expressions:
                         col_names = self._extract_column_names(expressions)
                         expressions_list = [exp.to_column(c) for c in col_names]
+
+                    if kind_upper == "RANDOM" and expressions_list:
+                        raise SQLMeshError(
+                            "Doris DISTRIBUTED BY RANDOM does not accept column expressions."
+                        )
+                    if kind_upper == "HASH" and not expressions_list:
+                        raise SQLMeshError(
+                            "Doris DISTRIBUTED BY HASH requires at least one column expression."
+                        )
 
                     return exp.DistributedByProperty(
                         kind=exp.Var(this=kind_upper),

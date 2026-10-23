@@ -2282,3 +2282,101 @@ def test_state_sync_or_key_delete_and_boolean_column_and_alter_key_coercion_guar
         "ALTER TABLE `db`.`current_tbl` ADD COLUMN `id` INT",
         "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `notes` STRING",
     ]
+
+
+def test_unannotated_view_column_comments_and_starrocks_property_parity(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Unannotated VIEW and MATERIALIZED VIEW with column_descriptions (as called by ViewStrategy.create
+    #    where target_columns_to_types=None) infer projection column names to emit column comments.
+    adapter.create_view(
+        "db.unannotated_view",
+        parse_one("SELECT id, name FROM db.users", read="doris"),
+        replace=False,
+        table_description="Users view",
+        column_descriptions={"id": "Primary user ID"},
+    )
+    adapter.create_view(
+        "db.unannotated_mv",
+        parse_one("SELECT id, name FROM db.users", read="doris"),
+        replace=False,
+        materialized=True,
+        table_description="Users MV",
+        column_descriptions={"id": "Primary user ID"},
+    )
+
+    # 2. Parenthesized string forms for unique_key and order_by, structured distributed_by with `columns=...`,
+    #    and tuple generic properties (e.g. excluded_trigger_tables = ('db.t1', 'db.t2')).
+    adapter.create_table(
+        "db.paren_keys_tbl",
+        target_columns_to_types={
+            "name": exp.DataType.build("VARCHAR(50)"),
+            "id": exp.DataType.build("INT"),
+            "dt": exp.DataType.build("DATE"),
+        },
+        table_properties={
+            "unique_key": exp.Literal.string("(id, dt)"),
+            "order_by": exp.Literal.string("'(dt, id)'"),
+            "distributed_by": exp.Tuple(
+                expressions=[
+                    exp.EQ(this=exp.column("columns"), expression=exp.Literal.string("(id, dt)")),
+                    exp.EQ(this=exp.column("buckets"), expression=exp.Literal.number(12)),
+                ]
+            ),
+            "excluded_trigger_tables": exp.Tuple(
+                expressions=[exp.Literal.string("db.t1"), exp.Literal.string("db.t2")]
+            ),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE VIEW `db`.`unannotated_view` (`id` COMMENT 'Primary user ID', `name`) COMMENT 'Users view' AS SELECT `id`, `name` FROM `db`.`users`",
+        "CREATE MATERIALIZED VIEW `db`.`unannotated_mv` (`id` COMMENT 'Primary user ID', `name`) COMMENT 'Users MV' AS SELECT `id`, `name` FROM `db`.`users`",
+        "CREATE TABLE IF NOT EXISTS `db`.`paren_keys_tbl` (`id` INT, `dt` DATE, `name` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) ORDER BY (`dt`, `id`) DISTRIBUTED BY HASH (`id`, `dt`) BUCKETS 12 PROPERTIES ('excluded_trigger_tables'='db.t1,db.t2')",
+    ]
+
+    # 3. Fail-fast validation for unsupported primary_key, typo `partition`, conflicting partition definitions,
+    #    and invalid RANDOM(col) / column-less HASH distribution.
+    cols = {"id": exp.DataType.build("INT"), "dt": exp.DataType.build("DATE")}
+
+    with pytest.raises(SQLMeshError, match="does not support 'primary_key'"):
+        adapter.create_table(
+            "db.bad_pk",
+            target_columns_to_types=cols,
+            table_properties={"primary_key": exp.to_column("id")},
+        )
+
+    with pytest.raises(SQLMeshError, match="Invalid property 'partition'"):
+        adapter.create_table(
+            "db.bad_partition_typo",
+            target_columns_to_types=cols,
+            table_properties={"partition": exp.to_column("dt")},
+        )
+
+    with pytest.raises(SQLMeshError, match="Multiple partition definitions"):
+        adapter.create_table(
+            "db.conflict_part",
+            target_columns_to_types=cols,
+            partitioned_by=[exp.to_column("dt")],
+            table_properties={"partition_by": exp.to_column("dt")},
+        )
+
+    with pytest.raises(
+        SQLMeshError, match="DISTRIBUTED BY RANDOM does not accept column expressions"
+    ):
+        adapter.create_table(
+            "db.bad_random_cols",
+            target_columns_to_types=cols,
+            table_properties={"distributed_by": exp.Literal.string("RANDOM(id)")},
+        )
+
+    with pytest.raises(
+        SQLMeshError, match="DISTRIBUTED BY HASH requires at least one column expression"
+    ):
+        adapter.create_table(
+            "db.bad_hash_no_cols",
+            target_columns_to_types=cols,
+            table_properties={"distributed_by": exp.Literal.string("HASH BUCKETS 10")},
+        )
