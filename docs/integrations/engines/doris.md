@@ -181,7 +181,7 @@ Doris requires a `DISTRIBUTED BY` clause on every OLAP table. SQLMesh supports t
      -- or 'RANDOM BUCKETS AUTO'
    )
    ```
-3. **Structured dictionary `distributed_by`**:
+3. **Structured dictionary or column tuple `distributed_by`**:
    ```sql
    physical_properties (
      distributed_by = (
@@ -189,6 +189,8 @@ Doris requires a `DISTRIBUTED BY` clause on every OLAP table. SQLMesh supports t
        expressions = 'user_id',
        buckets = 'AUTO'
      )
+     -- Also supports `columns = ('user_id', 'event_time')` or `distributed_by = ('user_id', 'event_time')`,
+     -- or `random = 'true'` for `DISTRIBUTED BY RANDOM` on DUPLICATE KEY tables.
    )
    ```
 
@@ -200,7 +202,7 @@ If none of `clustered_by` or `distributed_by` is provided:
 
 ## Partitioning
 
-Doris OLAP tables support **Multi-Range Batch Partitioning**, **Explicit Partition Definitions**, **Dynamic Partitioning**, and **Auto Partitioning** (Doris 2.1+).
+Doris OLAP tables support **Multi-Range Batch Partitioning**, **Explicit Partition Definitions**, **Dynamic Partitioning**, and **Auto Partitioning** (Doris 2.1+). You can specify the partition expression via the top-level `partitioned_by` model property or via `partitioned_by` / `partition_by` inside `physical_properties`.
 
 !!! note "OLAP Partitioning Requirements"
     - On Doris OLAP tables, `PARTITION BY` requires at least one of `partitions`, `auto_partition = 'true'`, or `'dynamic_partition.enable' = 'true'` in `physical_properties`. If none is provided, SQLMesh omits the `PARTITION BY` clause so Doris does not create a zero-partition table that rejects inserts.
@@ -467,7 +469,7 @@ GROUP BY user_id, CAST(event_time AS DATE);
 
 !!! note "Automatic Physical Table Resolution & Non-Destructive Evaluation"
     - Doris materialized views are only created on initial deployment or when a rebuild is required (`RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False`), preserving MTMV refresh state across routine `sqlmesh run` invocations.
-    - When `excluded_trigger_tables` (on async MTMVs) or `source_table` (on synchronous MVs) references a SQLMesh-managed model, SQLMesh automatically resolves the model name to its underlying physical snapshot table name.
+    - When `excluded_trigger_tables` (supports a single string, comma-separated string, or tuple `('db.t1', 'db.t2')` on async MTMVs) or `source_table` (on synchronous MVs) references a SQLMesh-managed model, SQLMesh automatically resolves the model name to its underlying physical snapshot table name.
 
 ### Synchronous Materialized Views (`materialized_type = 'SYNC'`)
 
@@ -515,16 +517,18 @@ FROM raw.logs;
 
 ---
 
-## Migrating from `dbt-doris`
+## Migrating from `dbt-doris` or StarRocks
 
-If you are migrating an existing `dbt-doris` project to native SQLMesh models, map your `dbt-doris` config keys as follows:
+If you are migrating an existing `dbt-doris` project or StarRocks SQLMesh models to Doris, map your configuration keys as follows:
 
-| `dbt-doris` Config | SQLMesh Model Equivalent |
+| `dbt-doris` / StarRocks Config | SQLMesh Doris Equivalent |
 | --- | --- |
 | `materialized='table'` | `kind FULL` |
 | `materialized='incremental'` (with `unique_key`) | `kind INCREMENTAL_BY_UNIQUE_KEY (unique_key ...)` |
 | `materialized='incremental'` (partition overwrite) | `kind INCREMENTAL_BY_TIME_RANGE (time_column ...)` or `kind INCREMENTAL_BY_PARTITION` |
 | `duplicate_key=['c1', 'c2']` | `physical_properties (duplicate_key = ('c1', 'c2'))` |
 | `unique_key=['c1']` | `kind INCREMENTAL_BY_UNIQUE_KEY (unique_key c1)` or `physical_properties (unique_key = ('c1'))` |
-| `distributed_by=['c1']`, `buckets=10` | `clustered_by (c1), physical_properties (buckets = 10)` |
+| `table_type='PRIMARY' \| 'UNIQUE' \| 'DUPLICATE' \| 'AGGREGATE'`, `keys=['c1', 'c2']` | Supported directly in `physical_properties` (`PRIMARY` maps to Doris `UNIQUE KEY`) |
+| `distributed_by=['c1']`, `buckets=10` | `clustered_by (c1), physical_properties (buckets = 10)` or `physical_properties (distributed_by = ('c1'), buckets = 10)` |
+| `partition_by` | Supported in `physical_properties (partition_by = ...)` or top-level `partitioned_by` |
 | `properties={...}` | Key-value entries inside `physical_properties (...)` |
