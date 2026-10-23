@@ -872,6 +872,7 @@ class DorisEngineAdapter(
                     this=schema,
                     kind="VIEW",
                     replace=False,
+                    exists=bool(create_kwargs.get("exists", False)) if not is_sync_mv else False,
                     expression=query,
                     properties=properties_exp,
                 ),
@@ -1703,6 +1704,59 @@ class DorisEngineAdapter(
                 preds = [*prefix_preds, batch_col.is_(exp.null()), *extra_conditions]
                 self.execute(exp.delete(table_name, where=exp.and_(*preds)))
 
+    @classmethod
+    def _resolve_table_type_and_keys(
+        cls, table_props: t.Dict[str, t.Any], pop: bool = False
+    ) -> t.Tuple[t.Any, t.Any, t.Any]:
+        get_fn = table_props.pop if pop else table_props.get
+        unique_key = get_fn("unique_key", None)
+        duplicate_key = get_fn("duplicate_key", None)
+        aggregate_key = get_fn("aggregate_key", None)
+        raw_table_type = get_fn("table_type", None)
+        raw_keys = get_fn("keys", None)
+
+        if raw_table_type is not None and raw_keys is None:
+            raise SQLMeshError(
+                "Doris property 'table_type' requires 'keys' to be specified in physical_properties."
+            )
+        if raw_keys is not None:
+            tt_str = (
+                (cls._extract_str_value(raw_table_type) or "DUPLICATE")
+                .strip()
+                .strip("'\"`")
+                .upper()
+            )
+            if tt_str in (
+                "PRIMARY",
+                "PRIMARY_KEY",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "UNIQUE_KEY",
+                "UNIQUE KEY",
+            ):
+                if unique_key is not None:
+                    raise SQLMeshError(
+                        "Cannot specify both 'unique_key' and 'table_type'/'keys' in physical_properties."
+                    )
+                unique_key = raw_keys
+            elif tt_str in ("DUPLICATE", "DUPLICATE_KEY", "DUPLICATE KEY"):
+                if duplicate_key is not None:
+                    raise SQLMeshError(
+                        "Cannot specify both 'duplicate_key' and 'table_type'/'keys' in physical_properties."
+                    )
+                duplicate_key = raw_keys
+            elif tt_str in ("AGGREGATE", "AGGREGATE_KEY", "AGGREGATE KEY"):
+                if aggregate_key is not None:
+                    raise SQLMeshError(
+                        "Cannot specify both 'aggregate_key' and 'table_type'/'keys' in physical_properties."
+                    )
+                aggregate_key = raw_keys
+            else:
+                raise SQLMeshError(
+                    f"Invalid Doris table_type '{tt_str}'. Expected PRIMARY, UNIQUE, DUPLICATE, or AGGREGATE."
+                )
+        return unique_key, duplicate_key, aggregate_key
+
     def adjust_physical_properties_for_incremental(
         self,
         physical_properties: t.Dict[str, t.Any],
@@ -1714,11 +1768,14 @@ class DorisEngineAdapter(
         """Promote ``unique_key`` from ``INCREMENTAL_BY_UNIQUE_KEY`` models into ``physical_properties``
         when no explicit OLAP key model (``unique_key``, ``duplicate_key``, ``aggregate_key``) is set.
         """
+        unique_key_prop, duplicate_key_prop, aggregate_key_prop = self._resolve_table_type_and_keys(
+            physical_properties
+        )
         if (
             unique_key
-            and "unique_key" not in physical_properties
-            and "duplicate_key" not in physical_properties
-            and "aggregate_key" not in physical_properties
+            and not unique_key_prop
+            and not duplicate_key_prop
+            and not aggregate_key_prop
             and all(isinstance(k, (exp.Column, exp.Identifier)) for k in unique_key)
         ):
             cleaned_keys = [exp.column(k.name) for k in unique_key]
@@ -1739,12 +1796,15 @@ class DorisEngineAdapter(
         **kwargs: t.Any,
     ) -> None:
         table_properties = dict(kwargs.get("table_properties") or {})
+        unique_key_prop, duplicate_key_prop, aggregate_key_prop = self._resolve_table_type_and_keys(
+            table_properties
+        )
 
         if (
             primary_key
-            and "unique_key" not in table_properties
-            and "duplicate_key" not in table_properties
-            and "aggregate_key" not in table_properties
+            and not unique_key_prop
+            and not duplicate_key_prop
+            and not aggregate_key_prop
         ):
             table_properties["unique_key"] = exp.Tuple(
                 expressions=[exp.to_column(col) for col in primary_key]
@@ -1983,11 +2043,8 @@ class DorisEngineAdapter(
                         for expr in parsed_part_exprs
                         for col in expr.find_all(exp.Column)
                     }
-                    strict_key = (
-                        table_props.get("unique_key")
-                        or kwargs.get("unique_key")
-                        or table_props.get("aggregate_key")
-                    )
+                    resolved_uk, _, resolved_ak = self._resolve_table_type_and_keys(table_props)
+                    strict_key = resolved_uk or kwargs.get("unique_key") or resolved_ak
                     strict_key_set = {k.lower() for k in self._extract_column_names(strict_key)}
                     if strict_key_set and not auto_range_cols.issubset(strict_key_set):
                         auto_range_cols = set()
@@ -2113,11 +2170,11 @@ class DorisEngineAdapter(
                     )
             elif any(isinstance(proj, exp.Star) for proj in expression.expressions):
                 table_props = kwargs.get("table_properties") or {}
+                resolved_uk, resolved_dk, resolved_ak = self._resolve_table_type_and_keys(
+                    table_props
+                )
                 has_explicit_key = bool(
-                    table_props.get("unique_key")
-                    or kwargs.get("unique_key")
-                    or table_props.get("duplicate_key")
-                    or table_props.get("aggregate_key")
+                    resolved_uk or kwargs.get("unique_key") or resolved_dk or resolved_ak
                 )
                 with_clause = expression.args.get("with_")
                 from_clause = expression.args.get("from_")
@@ -2191,9 +2248,8 @@ class DorisEngineAdapter(
             raise SQLMeshError(
                 "Multiple partition definitions found: specify only one of model 'partitioned_by' or physical_properties 'partitioned_by' / 'partition_by'."
             )
-        unique_key = table_props.get("unique_key") or kwargs.get("unique_key")
-        duplicate_key = table_props.get("duplicate_key")
-        aggregate_key = table_props.get("aggregate_key")
+        resolved_uk, duplicate_key, aggregate_key = self._resolve_table_type_and_keys(table_props)
+        unique_key = resolved_uk or kwargs.get("unique_key")
 
         specified_key_types = [
             name
@@ -2601,9 +2657,10 @@ class DorisEngineAdapter(
             raise SQLMeshError(
                 "Invalid property 'partition' in physical_properties; did you mean 'partition_by', 'partitioned_by', or 'partitions'?"
             )
-        unique_key = table_properties_copy.pop("unique_key", None) or kwargs.get("unique_key")
-        duplicate_key = table_properties_copy.pop("duplicate_key", None)
-        aggregate_key = table_properties_copy.pop("aggregate_key", None)
+        resolved_uk, duplicate_key, aggregate_key = self._resolve_table_type_and_keys(
+            table_properties_copy, pop=True
+        )
+        unique_key = resolved_uk or kwargs.get("unique_key")
         order_by = table_properties_copy.pop("order_by", None)
 
         unique_key_cols = self._extract_column_names(unique_key)
@@ -3155,6 +3212,7 @@ class DorisEngineAdapter(
 
             if distributed_info:
                 raw_kind = distributed_info.get("kind")
+                raw_random = distributed_info.get("random")
                 expressions = (
                     distributed_info.get("expressions")
                     if distributed_info.get("expressions") is not None
@@ -3162,6 +3220,16 @@ class DorisEngineAdapter(
                 )
                 buckets = distributed_info.get("buckets", top_level_buckets)
 
+                if raw_random is not None:
+                    rand_str = (
+                        str(self._extract_str_value(raw_random) or raw_random).strip().lower()
+                    )
+                    if rand_str in ("true", "1"):
+                        if raw_kind is not None and str(raw_kind).strip().upper() != "RANDOM":
+                            raise SQLMeshError(
+                                f"Conflicting distributed_by configuration: kind='{raw_kind}' with random=true."
+                            )
+                        raw_kind = "RANDOM"
                 if raw_kind is None and expressions is not None:
                     raw_kind = "HASH"
 
@@ -3279,6 +3347,8 @@ class DorisEngineAdapter(
             "unique_key",
             "duplicate_key",
             "aggregate_key",
+            "table_type",
+            "keys",
             "order_by",
             "engine",
             "properties",
@@ -3289,6 +3359,13 @@ class DorisEngineAdapter(
             if key in skip_keys or value is None:
                 continue
             raw_str = self._extract_str_value(value)
-            str_literal = exp.Literal.string(raw_str if raw_str is not None else str(value))
+            val_str = raw_str if raw_str is not None else str(value)
+            if key == "excluded_trigger_tables" and val_str:
+                val_str = ",".join(
+                    re.sub(r"(?i)^`?internal`?\.", "", part.strip())
+                    for part in val_str.split(",")
+                    if part.strip()
+                )
+            str_literal = exp.Literal.string(val_str)
             expressions.append(exp.Property(this=exp.Literal.string(str(key)), value=str_literal))
         return expressions

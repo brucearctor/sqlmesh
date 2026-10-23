@@ -2460,3 +2460,167 @@ def test_is_bool_rewrites_negative_or_keys_union_delete_and_table_diff_ctas(
             parse_one("SELECT id, ds FROM bronze.events", read="doris"),
             table_format="iceberg",
         )
+
+
+def test_table_type_keys_random_distribution_mv_exists_and_tuple_ref_resolution(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    from sqlmesh.core.dialect import parse
+    from sqlmesh.core.model import SqlModel, load_sql_based_model
+    from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    cols = {
+        "payload": exp.DataType.build("VARCHAR(50)"),
+        "id": exp.DataType.build("INT"),
+        "dt": exp.DataType.build("DATE"),
+    }
+
+    # 1. StarRocks-style `table_type` ('PRIMARY' | 'UNIQUE' | 'DUPLICATE' | 'AGGREGATE') + `keys`
+    adapter.create_table(
+        "db.sr_primary",
+        target_columns_to_types=cols,
+        table_properties={
+            "table_type": exp.Literal.string("PRIMARY"),
+            "keys": exp.Tuple(expressions=[exp.to_column("id"), exp.to_column("dt")]),
+            "buckets": exp.Literal.number(8),
+        },
+    )
+    adapter.create_table(
+        "db.sr_duplicate_random",
+        target_columns_to_types=cols,
+        table_properties={
+            "table_type": exp.Literal.string("DUPLICATE"),
+            "keys": exp.Tuple(expressions=[exp.to_column("id")]),
+            "distributed_by": exp.Tuple(
+                expressions=[
+                    exp.EQ(this=exp.column("random"), expression=exp.Literal.string("true")),
+                    exp.EQ(this=exp.column("buckets"), expression=exp.Literal.number(6)),
+                ]
+            ),
+        },
+    )
+    adapter.create_table(
+        "db.sr_aggregate",
+        target_columns_to_types={"id": exp.DataType.build("INT"), "dt": exp.DataType.build("DATE")},
+        table_properties={
+            "table_type": exp.Literal.string("AGGREGATE"),
+            "keys": exp.Literal.string("(id, dt)"),
+            "buckets": exp.Literal.number(4),
+        },
+    )
+
+    # 2. `create_view(..., materialized=True, replace=False, exists=True)` emits IF NOT EXISTS
+    adapter.create_view(
+        "db.mv_if_not_exists",
+        parse_one("SELECT id FROM db.sr_primary", read="doris"),
+        replace=False,
+        materialized=True,
+        exists=True,
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`sr_primary` (`id` INT, `dt` DATE, `payload` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) DISTRIBUTED BY HASH (`id`) BUCKETS 8",
+        "CREATE TABLE IF NOT EXISTS `db`.`sr_duplicate_random` (`id` INT, `payload` VARCHAR(50), `dt` DATE) DUPLICATE KEY (`id`) DISTRIBUTED BY RANDOM BUCKETS 6",
+        "CREATE TABLE IF NOT EXISTS `db`.`sr_aggregate` (`id` INT, `dt` DATE) AGGREGATE KEY (`id`, `dt`) DISTRIBUTED BY HASH (`id`) BUCKETS 4",
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv_if_not_exists` AS SELECT `id` FROM `db`.`sr_primary`",
+    ]
+
+    # 3. Validation errors for invalid `table_type` / missing `keys` / conflicting `random=true`
+    with pytest.raises(SQLMeshError, match="requires 'keys' to be specified"):
+        adapter.create_table(
+            "db.bad_tt_no_keys",
+            target_columns_to_types=cols,
+            table_properties={"table_type": exp.Literal.string("UNIQUE")},
+        )
+
+    with pytest.raises(SQLMeshError, match="Invalid Doris table_type"):
+        adapter.create_table(
+            "db.bad_tt_val",
+            target_columns_to_types=cols,
+            table_properties={
+                "table_type": exp.Literal.string("UNKNOWN_MODEL"),
+                "keys": exp.to_column("id"),
+            },
+        )
+
+    with pytest.raises(SQLMeshError, match="Conflicting distributed_by configuration"):
+        adapter.create_table(
+            "db.bad_dist_conflict",
+            target_columns_to_types=cols,
+            table_properties={
+                "distributed_by": exp.Tuple(
+                    expressions=[
+                        exp.EQ(this=exp.column("kind"), expression=exp.Literal.string("HASH")),
+                        exp.EQ(this=exp.column("random"), expression=exp.Literal.string("true")),
+                    ]
+                )
+            },
+        )
+
+    # 4. Tuple `excluded_trigger_tables` + `default_catalog="internal"` resolves 2-part model refs
+    #    and strips the leading `internal.` catalog prefix from the physical table name in Doris MTMV DDL.
+    adapter.cursor.execute.reset_mock()
+    base_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name doris_db.orders,
+                    kind FULL,
+                    dialect doris,
+                    columns (id INT, amount INT)
+                );
+                SELECT 1 AS id, 10 AS amount;
+                """,
+                default_dialect="doris",
+            ),
+            default_catalog="internal",
+        ),
+    )
+    base_snapshot = Snapshot.from_node(base_model, nodes={}, ttl="in 1 week")
+    base_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    physical_tbl = exp.to_table(base_snapshot.table_name())
+    expected_physical = f"{physical_tbl.db}.{physical_tbl.name}"
+    snapshots = {base_snapshot.name: base_snapshot}
+
+    tuple_mv_model = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            parse(
+                """
+                MODEL (
+                    name doris_db.orders_tuple_mtmv,
+                    kind VIEW (materialized true),
+                    dialect doris,
+                    columns (id INT, amount INT),
+                    physical_properties (
+                        build = IMMEDIATE,
+                        refresh = AUTO,
+                        excluded_trigger_tables = ('doris_db.orders', 'ext_cat.ext_db.raw_events')
+                    )
+                );
+                SELECT id, amount FROM doris_db.orders;
+                """,
+                default_dialect="doris",
+            ),
+            default_catalog="internal",
+        ),
+    )
+    rendered_tuple_props = tuple_mv_model.render_physical_properties(
+        snapshots=snapshots, engine_adapter=adapter
+    )
+    adapter.create_view(
+        tuple_mv_model.name,
+        tuple_mv_model.render_query() or parse_one("SELECT id, amount FROM doris_db.orders"),
+        replace=False,
+        materialized=True,
+        target_columns_to_types=tuple_mv_model.columns_to_types,
+        view_properties=rendered_tuple_props,
+    )
+    tuple_mv_ddl = to_sql_calls(adapter)[-1]
+    assert (
+        f"'excluded_trigger_tables'='{expected_physical},ext_cat.ext_db.raw_events'" in tuple_mv_ddl
+    )
