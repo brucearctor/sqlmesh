@@ -363,3 +363,125 @@ def test_duplicate_key_delete_with_subquery_and_between(ctx: TestContext):
             ]
         ),
     )
+
+
+def test_insert_overwrite_by_time_partition_and_scd_type_2(ctx: TestContext):
+    from datetime import datetime
+    import pandas as pd  # noqa: TID253
+    from sqlmesh.utils.date import to_time_column
+
+    # 1. insert_overwrite_by_time_partition with CAST(... AS DATE) bounds and partition column after VARCHAR
+    time_table = ctx.table("test_time_range_overwrite")
+    time_cols = {
+        "code": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+        "ds": exp.DataType.build("DATE", dialect="doris"),
+        "amount": exp.DataType.build("DOUBLE", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(
+        time_table,
+        time_cols,
+        partitioned_by=[exp.to_column("ds")],
+    )
+    initial_df = pd.DataFrame(
+        [
+            {"code": "a", "ds": "2022-01-01", "amount": 10.0},
+            {"code": "b", "ds": "2022-01-02", "amount": 20.0},
+            {"code": "c", "ds": "2022-01-03", "amount": 30.0},
+        ]
+    )
+    ctx.engine_adapter.insert_append(
+        time_table,
+        ctx.input_data(initial_df, time_cols),
+        target_columns_to_types=time_cols,
+    )
+    replacement_df = pd.DataFrame(
+        [
+            {"code": "b_new", "ds": "2022-01-02", "amount": 25.0},
+        ]
+    )
+    ctx.engine_adapter.insert_overwrite_by_time_partition(
+        time_table,
+        ctx.input_data(replacement_df, time_cols),
+        start="2022-01-02",
+        end="2022-01-02",
+        time_column="ds",
+        time_formatter=lambda v, _: to_time_column(
+            v, exp.DataType.build("DATE", dialect="doris"), "doris"
+        ),
+        target_columns_to_types=time_cols,
+    )
+    rows = ctx.engine_adapter.fetchall(
+        exp.select("code", exp.cast(exp.column("ds"), "VARCHAR").as_("ds"), "amount")
+        .from_(time_table)
+        .order_by("ds")
+    )
+    assert list(rows) == [
+        ("a", "2022-01-01", 10.0),
+        ("b_new", "2022-01-02", 25.0),
+        ("c", "2022-01-03", 30.0),
+    ]
+
+    # 2. scd_type_2_by_time across initial load and incremental update
+    scd_table = ctx.table("test_scd_type_2")
+    scd_src_table = ctx.table("test_scd_type_2_src")
+    scd_src_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "name": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+        "updated_at": exp.DataType.build("DATETIME", dialect="doris"),
+    }
+    scd_target_cols = {
+        **scd_src_cols,
+        "valid_from": exp.DataType.build("DATETIME", dialect="doris"),
+        "valid_to": exp.DataType.build("DATETIME", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(scd_table, scd_target_cols)
+    batch1_df = pd.DataFrame(
+        [
+            {"id": 1, "name": "alice_v1", "updated_at": "2022-01-01 00:00:00"},
+            {"id": 2, "name": "bob_v1", "updated_at": "2022-01-01 00:00:00"},
+        ]
+    )
+    ctx.engine_adapter.ctas(scd_src_table, ctx.input_data(batch1_df, scd_src_cols), scd_src_cols)
+    ctx.engine_adapter.scd_type_2_by_time(
+        target_table=scd_table,
+        source_table=exp.select("id", "name", "updated_at").from_(scd_src_table),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        updated_at_col=exp.column("updated_at", quoted=True),
+        target_columns_to_types=scd_target_cols,
+        execution_time=datetime(2022, 1, 2, 0, 0, 0),
+        truncate=True,
+    )
+    batch2_df = pd.DataFrame(
+        [
+            {"id": 1, "name": "alice_v2", "updated_at": "2022-01-05 00:00:00"},
+            {"id": 2, "name": "bob_v1", "updated_at": "2022-01-01 00:00:00"},
+        ]
+    )
+    ctx.engine_adapter.replace_query(
+        scd_src_table,
+        ctx.input_data(batch2_df, scd_src_cols),
+        target_columns_to_types=scd_src_cols,
+    )
+    ctx.engine_adapter.scd_type_2_by_time(
+        target_table=scd_table,
+        source_table=exp.select("id", "name", "updated_at").from_(scd_src_table),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        updated_at_col=exp.column("updated_at", quoted=True),
+        target_columns_to_types=scd_target_cols,
+        execution_time=datetime(2022, 1, 6, 0, 0, 0),
+        truncate=False,
+    )
+    scd_rows = ctx.engine_adapter.fetchall(
+        exp.select("id", "name", exp.column("valid_to").is_(exp.null()).as_("is_current"))
+        .from_(scd_table)
+        .order_by("id", "valid_from")
+    )
+    assert list(scd_rows) == [
+        (1, "alice_v1", 0),
+        (1, "alice_v2", 1),
+        (2, "bob_v1", 1),
+    ]

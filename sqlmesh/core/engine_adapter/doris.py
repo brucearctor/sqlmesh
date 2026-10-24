@@ -178,6 +178,22 @@ class DorisEngineAdapter(
     def set_current_catalog(self, catalog: str) -> None:
         catalog_sql = self._to_sql(exp.to_identifier(catalog, quoted=True))
         self.execute(exp.Command(this="SWITCH", expression=catalog_sql))
+        self._active_catalog: t.Optional[str] = catalog
+        self._needs_catalog_restore: bool = False
+
+    def _restore_active_catalog_on_reconnect(self, sql: t.Optional[str] = None) -> None:
+        active_cat = getattr(self, "_active_catalog", None)
+        self._needs_catalog_restore = False
+        if not active_cat:
+            return
+        if sql and re.match(
+            r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*SWITCH\b",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            return
+        catalog_sql = self._to_sql(exp.to_identifier(active_cat, quoted=True))
+        self.cursor.execute(f"SWITCH {catalog_sql}")
 
     def _is_iceberg_table(
         self,
@@ -294,7 +310,10 @@ class DorisEngineAdapter(
             except Exception:
                 logger.info("Connection to the database was lost. Reconnecting...")
                 self._connection_pool.close()
+                self._needs_catalog_restore = True
         self._connection_pool.get_cursor()
+        if getattr(self, "_needs_catalog_restore", False):
+            self._restore_active_catalog_on_reconnect()
         try:
             return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
         except Exception as e:
@@ -316,12 +335,15 @@ class DorisEngineAdapter(
                 self._connection_pool.close()
                 try:
                     self._connection_pool.get_cursor()
+                    self._restore_active_catalog_on_reconnect()
                     return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
                 except Exception:
                     self._connection_pool.close()
+                    self._needs_catalog_restore = True
                     raise
             if is_disconnect and not self._connection_pool.is_transaction_active:
                 self._connection_pool.close()
+                self._needs_catalog_restore = True
             raise
 
     _SAFE_RETRY_SQL_PREFIX_RE = re.compile(
@@ -344,6 +366,9 @@ class DorisEngineAdapter(
             except Exception:
                 logger.info("Connection to the database was lost. Reconnecting...")
                 self._connection_pool.close()
+                self._needs_catalog_restore = True
+        if getattr(self, "_needs_catalog_restore", False):
+            self._restore_active_catalog_on_reconnect(sql)
         try:
             super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
         except Exception as e:
@@ -370,14 +395,20 @@ class DorisEngineAdapter(
                 self._connection_pool.close_cursor()
                 try:
                     conn = self._connection_pool.get()
-                    conn.ping(reconnect=True)
+                    try:
+                        conn.ping(reconnect=True)
+                    except Exception:
+                        self._connection_pool.close()
+                    self._restore_active_catalog_on_reconnect(sql)
                     super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
                 except Exception:
                     self._connection_pool.close()
+                    self._needs_catalog_restore = True
                     raise
             else:
                 if is_disconnect and not self._connection_pool.is_transaction_active:
                     self._connection_pool.close()
+                    self._needs_catalog_restore = True
                 raise
 
     def columns(
@@ -1119,6 +1150,7 @@ class DorisEngineAdapter(
         if where == exp.false():
             return
 
+        where = self._unwrap_literal_casts_in_where(where)
         where = self._rewrite_between_in_where(where)
         where = self._normalize_boolean_column_conjuncts(where)
 
@@ -1188,6 +1220,22 @@ class DorisEngineAdapter(
             if expr.expression == exp.false():
                 return expr.this
         return expr
+
+    @classmethod
+    def _unwrap_literal_casts_in_where(cls, where: exp.Expr) -> exp.Expr:
+        """Unwrap top-level `CAST(<literal> AS ...)` expressions in `DELETE WHERE` predicates
+        (e.g. from `to_time_column` in `insert_overwrite_by_time_partition`) because Doris's OLAP
+        `DeleteHandler` only accepts plain literals on the RHS of comparison and `IN` predicates.
+        """
+        for cast_node in list(where.find_all(exp.Cast, exp.TryCast)):
+            if cast_node.find_ancestor(exp.Subquery, exp.Select):
+                continue
+            inner = cast_node.this
+            while isinstance(inner, (exp.Cast, exp.TryCast)):
+                inner = inner.this
+            if inner is not None and cls._is_literal_key_value(inner):
+                cast_node.replace(inner.copy())
+        return where
 
     @staticmethod
     def _rewrite_between_in_where(where: exp.Expr) -> exp.Expr:
@@ -1853,12 +1901,23 @@ class DorisEngineAdapter(
             target_columns_to_types and columns_to_types_all_known(target_columns_to_types)
         )
         first_query = source_queries[0].query_factory() if source_queries else None
+
+        def _matches_target_table(t_node: exp.Table) -> bool:
+            if quote_identifiers(t_node.copy()) == quote_identifiers(table.copy()):
+                return True
+            if self.default_catalog:
+                norm_node = t_node.copy()
+                if not norm_node.catalog and norm_node.db:
+                    norm_node.set("catalog", exp.parse_identifier(self.default_catalog))
+                norm_target = table.copy()
+                if not norm_target.catalog and norm_target.db:
+                    norm_target.set("catalog", exp.parse_identifier(self.default_catalog))
+                return quote_identifiers(norm_node) == quote_identifiers(norm_target)
+            return False
+
         self_referencing = bool(
             first_query
-            and any(
-                quote_identifiers(t_node.copy()) == quote_identifiers(table.copy())
-                for t_node in first_query.find_all(exp.Table)
-            )
+            and any(_matches_target_table(t_node) for t_node in first_query.find_all(exp.Table))
         )
 
         # 1. Doris's CTAS grammar forbids `ENGINE=iceberg`, so internal/2-part Iceberg tables with known
@@ -2299,6 +2358,28 @@ class DorisEngineAdapter(
             return {c: updated_types[c] for c in new_order}
 
         updated_types = dict(target_columns_to_types)
+        raw_part_by = (
+            kwargs.get("partitioned_by")
+            or table_props.get("partitioned_by")
+            or table_props.get("partition_by")
+        )
+        part_col_names: t.List[str] = []
+        if raw_part_by:
+            part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
+            parsed_part_exprs, _ = self._parse_partition_expressions(part_list)
+            col_by_lower = {c.lower(): c for c in col_names}
+            for expr in parsed_part_exprs:
+                for col in expr.find_all(exp.Column):
+                    canonical = col_by_lower.get(col.name.lower())
+                    if canonical and canonical not in part_col_names:
+                        part_col_names.append(canonical)
+                        if not self._is_valid_olap_key_type(
+                            updated_types[canonical]
+                        ) and self._is_coercible_string_key_type(updated_types[canonical]):
+                            updated_types[canonical] = exp.DataType.build(
+                                "VARCHAR(255)", dialect=self.dialect
+                            )
+
         first_dtype = updated_types[col_names[0]]
         if not self._is_valid_olap_key_type(first_dtype):
             valid_col = next(
@@ -2319,23 +2400,15 @@ class DorisEngineAdapter(
                     if col_names[0] != coercible_col:
                         col_names = [coercible_col] + [c for c in col_names if c != coercible_col]
 
-        # Ensure any OLAP partition columns with valid key types precede non-keyable columns
-        raw_part_by = (
-            kwargs.get("partitioned_by")
-            or table_props.get("partitioned_by")
-            or table_props.get("partition_by")
-        )
-        if raw_part_by:
-            part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
-            parsed_part_exprs, _ = self._parse_partition_expressions(part_list)
-            col_by_lower = {c.lower(): c for c in col_names}
+        # Ensure OLAP partition/time columns are included in Doris's implicit DUPLICATE KEY prefix:
+        # Doris stops implicit key inference at the first non-keyable column, immediately after the
+        # first VARCHAR column, or after 3 columns (`shortkey_max_column_count`) when no physical
+        # OLAP PARTITION BY clause is emitted.
+        if part_col_names:
             part_cols = [
-                col_by_lower[col.name.lower()]
-                for expr in parsed_part_exprs
-                for col in expr.find_all(exp.Column)
-                if col.name.lower() in col_by_lower
-                and self._is_valid_olap_key_type(updated_types[col_by_lower[col.name.lower()]])
+                c for c in part_col_names if self._is_valid_olap_key_type(updated_types[c])
             ]
+            part_cols_set = set(part_cols)
             first_non_key_idx = next(
                 (
                     i
@@ -2344,16 +2417,40 @@ class DorisEngineAdapter(
                 ),
                 None,
             )
+            first_varchar_idx = next(
+                (
+                    i
+                    for i, c in enumerate(col_names)
+                    if c not in part_cols_set and updated_types[c].is_type("varchar")
+                ),
+                None,
+            )
+            auto_str = self._extract_str_value(table_props.get("auto_partition"))
+            dyn_str = self._extract_str_value(table_props.get("dynamic_partition.enable"))
+            has_physical_olap_partition = bool(
+                table_props.get("partitions")
+                or (auto_str and str(auto_str).strip().lower() in ("true", "1"))
+                or (dyn_str and str(dyn_str).strip().lower() in ("true", "1"))
+            )
+            shortkey_limit_idx = (
+                max(1, 3 - len(part_cols)) if not has_physical_olap_partition else None
+            )
+            cutoff_candidates = [
+                idx
+                for idx in (first_non_key_idx, first_varchar_idx, shortkey_limit_idx)
+                if idx is not None
+            ]
+            cutoff_idx = min(cutoff_candidates) if cutoff_candidates else None
             if (
                 part_cols
-                and first_non_key_idx is not None
-                and any(col_names.index(p) > first_non_key_idx for p in part_cols)
+                and cutoff_idx is not None
+                and any(col_names.index(p) >= cutoff_idx for p in part_cols)
             ):
-                moved_parts = [p for p in part_cols if col_names.index(p) > first_non_key_idx]
+                moved_parts = [p for p in part_cols if col_names.index(p) >= cutoff_idx]
                 moved_set = set(moved_parts)
-                before_non_key = [c for c in col_names[:first_non_key_idx] if c not in moved_set]
-                after_non_key = [c for c in col_names[first_non_key_idx:] if c not in moved_set]
-                col_names = before_non_key + moved_parts + after_non_key
+                before_cutoff = [c for c in col_names[:cutoff_idx] if c not in moved_set]
+                after_cutoff = [c for c in col_names[cutoff_idx:] if c not in moved_set]
+                col_names = before_cutoff + moved_parts + after_cutoff
 
         if col_names != list(target_columns_to_types) or updated_types != target_columns_to_types:
             return {c: updated_types[c] for c in col_names}

@@ -2624,3 +2624,141 @@ def test_table_type_keys_random_distribution_mv_exists_and_tuple_ref_resolution(
     assert (
         f"'excluded_trigger_tables'='{expected_physical},ext_cat.ext_db.raw_events'" in tuple_mv_ddl
     )
+
+
+def test_time_range_delete_cast_unwrap_partition_key_prefix_scd_type_2_and_reconnect_catalog(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    from datetime import datetime
+    from sqlmesh.utils.date import to_time_column
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, default_catalog="internal")
+
+    # 1. insert_overwrite_by_time_partition with `to_time_column` (`CAST('...' AS DATE)`) unwraps
+    #    CAST literals in top-level DELETE WHERE while preserving CAST in INSERT SELECT WHERE.
+    adapter.insert_overwrite_by_time_partition(
+        "db.events",
+        parse_one("SELECT id, ds FROM db.src_events", read="doris"),
+        start="2024-01-01",
+        end="2024-01-31",
+        time_column="ds",
+        time_formatter=lambda v, _: to_time_column(
+            v, exp.DataType.build("DATE", dialect="doris"), "doris"
+        ),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+    )
+
+    time_overwrite_calls = to_sql_calls(adapter)
+    assert time_overwrite_calls == [
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-31'",
+        "INSERT INTO `db`.`events` (`id`, `ds`) SELECT `id`, `ds` FROM (SELECT `id`, `ds` FROM `db`.`src_events`) AS `_subquery` WHERE `ds` BETWEEN CAST('2024-01-01' AS DATE) AND CAST('2024-01-31' AS DATE)",
+    ]
+
+    # 2. Implicit DUPLICATE KEY prefix ordering for partitioned_by / time_column:
+    #    (a) TEXT partition column coerced to VARCHAR(255) and moved before DOUBLE;
+    #    (b) DATE partition column moved before VARCHAR column (which cuts off Doris implicit key);
+    #    (c) DATE partition column moved within the first 3 columns (`shortkey_max_column_count = 3`).
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "db.part_text_col",
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "amount": exp.DataType.build("DOUBLE", dialect="doris"),
+            "ds": exp.DataType.build("TEXT", dialect="doris"),
+        },
+        partitioned_by=[exp.to_column("ds")],
+    )
+    adapter.create_table(
+        "db.part_after_varchar",
+        target_columns_to_types={
+            "code": exp.DataType.build("VARCHAR(100)", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+            "amount": exp.DataType.build("DOUBLE", dialect="doris"),
+        },
+        partitioned_by=[exp.to_column("ds")],
+    )
+    adapter.create_table(
+        "db.part_fourth_col",
+        target_columns_to_types={
+            "c1": exp.DataType.build("INT", dialect="doris"),
+            "c2": exp.DataType.build("INT", dialect="doris"),
+            "c3": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+        partitioned_by=[exp.to_column("ds")],
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`part_text_col` (`id` INT, `ds` VARCHAR(255), `amount` DOUBLE)",
+        "CREATE TABLE IF NOT EXISTS `db`.`part_after_varchar` (`ds` DATE, `code` VARCHAR(100), `amount` DOUBLE)",
+        "CREATE TABLE IF NOT EXISTS `db`.`part_fourth_col` (`c1` INT, `c2` INT, `ds` DATE, `c3` INT)",
+    ]
+
+    # 3. SCD Type 2 on an existing table when `default_catalog="internal"` does not mutate `target_table`
+    #    in `temp_table` and properly rewrites `db.scd_tbl` references to `__temp_scd_tbl_...`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+    mocker.patch.object(
+        adapter,
+        "get_data_object",
+        return_value=DataObject(
+            catalog="internal", schema="db", name="scd_tbl", type=DataObjectType.TABLE
+        ),
+    )
+    adapter.scd_type_2_by_time(
+        target_table="db.scd_tbl",
+        source_table=t.cast(
+            exp.Select,
+            parse_one("SELECT id, name, updated_at FROM db.src_tbl", read="doris"),
+        ),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        updated_at_col=exp.column("updated_at", quoted=True),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "name": exp.DataType.build("VARCHAR(50)", dialect="doris"),
+            "updated_at": exp.DataType.build("DATETIME", dialect="doris"),
+            "valid_from": exp.DataType.build("DATETIME", dialect="doris"),
+            "valid_to": exp.DataType.build("DATETIME", dialect="doris"),
+        },
+        execution_time=datetime(2024, 1, 2, 0, 0, 0),
+    )
+    scd_calls = to_sql_calls(adapter)
+    insert_scd_sql = next(c for c in scd_calls if c.startswith("INSERT INTO `db`.`scd_tbl`"))
+    assert "FROM `internal`.`db`.`__temp_scd_tbl_abcd1234`" in insert_scd_sql
+    assert "FROM `db`.`scd_tbl`" not in insert_scd_sql
+
+    # 4. Reconnect in `_execute` restores active catalog set via `set_current_catalog` and falls back
+    #    to `self._connection_pool.close()` when `conn.ping(reconnect=True)` raises on a closed socket.
+    class InterfaceError(Exception):
+        pass
+
+    adapter.cursor.execute.reset_mock()
+    adapter.set_current_catalog("iceberg_cat")
+    adapter.cursor.execute.reset_mock()
+
+    conn_mock = mocker.MagicMock()
+    conn_mock.ping.side_effect = InterfaceError(0, "Already closed")
+    mocker.patch.object(adapter._connection_pool, "get", return_value=conn_mock)
+    close_spy = mocker.spy(adapter._connection_pool, "close")
+
+    exec_attempt = 0
+
+    def reconnect_side_effect(sql, *args, **kwargs):
+        nonlocal exec_attempt
+        exec_attempt += 1
+        if exec_attempt == 1:
+            raise InterfaceError(0, "Already closed")
+
+    adapter.cursor.execute.side_effect = reconnect_side_effect
+    adapter._execute("SELECT 1")
+
+    assert close_spy.call_count == 1
+    assert exec_attempt == 1
+    assert to_sql_calls(adapter) == [
+        "SWITCH `iceberg_cat`",
+        "SELECT 1",
+    ]
