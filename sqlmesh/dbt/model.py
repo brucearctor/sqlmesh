@@ -151,15 +151,6 @@ class ModelConfig(BaseModelConfig):
     inserts_only: t.Optional[bool] = None
     incremental_predicates: t.Optional[t.List[str]] = None
 
-    # doris
-    distributed_by: t.Optional[t.Union[t.List[str], str, t.Dict[str, t.Any]]] = None
-    buckets: t.Optional[t.Union[int, str]] = None
-    duplicate_key: t.Optional[t.Union[t.List[str], str]] = None
-    aggregate_key: t.Optional[t.Union[t.List[str], str]] = None
-    keys: t.Optional[t.Union[t.List[str], str]] = None
-    table_type: t.Optional[str] = None
-    properties: t.Optional[t.Dict[str, t.Any]] = None
-
     _sql_validator = sql_str_validator
     _on_destructive_change_validator = on_destructive_change_validator
     _on_additive_change_validator = on_additive_change_validator
@@ -720,71 +711,6 @@ class ModelConfig(BaseModelConfig):
 
             if self.settings:
                 physical_properties.update({k: exp.var(v) for k, v in self.settings.items()})
-
-            if physical_properties:
-                model_kwargs["physical_properties"] = physical_properties
-
-        if context.target.dialect == "doris":
-            for prop_name, raw_cols in (
-                ("unique_key", self.unique_key),
-                ("duplicate_key", self.duplicate_key),
-                ("aggregate_key", self.aggregate_key),
-                ("keys", self.keys),
-                ("order_by", self.order_by),
-            ):
-                if raw_cols:
-                    if prop_name == "unique_key" and (
-                        self.duplicate_key or self.aggregate_key or self.keys
-                    ):
-                        continue
-                    col_list = raw_cols if isinstance(raw_cols, list) else [raw_cols]
-                    parsed_cols = [d.parse_one(c, dialect=model_dialect) for c in col_list]
-                    physical_properties[prop_name] = (
-                        parsed_cols[0]
-                        if len(parsed_cols) == 1
-                        else exp.Tuple(expressions=parsed_cols)
-                    )
-
-            if self.table_type:
-                physical_properties["table_type"] = exp.Literal.string(self.table_type)
-
-            if self.distributed_by is not None:
-                if isinstance(self.distributed_by, list):
-                    dist_cols = [d.parse_one(c, dialect=model_dialect) for c in self.distributed_by]
-                    physical_properties["distributed_by"] = (
-                        dist_cols[0] if len(dist_cols) == 1 else exp.Tuple(expressions=dist_cols)
-                    )
-                elif isinstance(self.distributed_by, dict):
-                    physical_properties["distributed_by"] = exp.Tuple(
-                        expressions=[
-                            exp.EQ(
-                                this=exp.column(str(k)),
-                                expression=exp.Literal.number(v)
-                                if isinstance(v, int) and not isinstance(v, bool)
-                                else exp.Literal.string(str(v)),
-                            )
-                            for k, v in self.distributed_by.items()
-                        ]
-                    )
-                else:
-                    physical_properties["distributed_by"] = exp.Literal.string(
-                        str(self.distributed_by)
-                    )
-
-            if self.buckets is not None:
-                physical_properties["buckets"] = (
-                    exp.Literal.number(self.buckets)
-                    if isinstance(self.buckets, int) and not isinstance(self.buckets, bool)
-                    else exp.Literal.string(str(self.buckets))
-                )
-
-            if self.properties:
-                for k, v in self.properties.items():
-                    physical_properties[str(k)] = (
-                        exp.Literal.number(v)
-                        if isinstance(v, int) and not isinstance(v, bool)
-                        else exp.Literal.string(str(v))
-                    )
 
             if physical_properties:
                 model_kwargs["physical_properties"] = physical_properties

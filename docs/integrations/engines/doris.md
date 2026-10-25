@@ -586,6 +586,31 @@ FROM raw.logs;
 
 ---
 
+## Audits & Data Diff (`sqlmesh audit` & `sqlmesh table_diff`)
+
+All built-in and custom SQLMesh [audits](../../concepts/audits.md) (`not_null`, `unique_values`, `number_of_rows`, `accepted_values`, `forall`, etc.) and [`sqlmesh table_diff`](../../guides/tablediff.md) work out of the box on Doris:
+
+```sql
+MODEL (
+  name analytics.daily_orders,
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column order_date,
+    partition_by_time_column false
+  ),
+  audits (
+    not_null(columns := (order_id, customer_id)),
+    unique_values(columns := (order_id)),
+    number_of_rows(threshold := 1)
+  )
+);
+```
+
+- **Constant folding in `LIMIT` clauses**: Doris requires `LIMIT` arguments to be integer literals rather than arithmetic expressions (such as `LIMIT 10 + 1` emitted by `number_of_rows`). `DorisEngineAdapter` automatically folds constant arithmetic in `LIMIT` clauses before execution.
+- **Deferred Materialized Views (`build = 'DEFERRED'`)**: When a materialized view is created with `build = 'DEFERRED'` and has `audits (...)` attached, SQLMesh automatically triggers `REFRESH MATERIALIZED VIEW ... AUTO` before running audits so they evaluate against populated data.
+- **`sqlmesh table_diff` on floating-point and string columns**: Temporary diff tables created by `sqlmesh table_diff` automatically promote integer indicator columns into the Doris OLAP short-key prefix, so comparing tables whose leading user columns are `DOUBLE`, `FLOAT`, `STRING`, or `JSON` succeeds without manual key configuration.
+
+---
+
 ## Supported Model Kinds & Catalog Matrix
 
 | SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal`) | External Apache Iceberg Catalog (`table_format iceberg`) |
@@ -602,21 +627,18 @@ FROM raw.logs;
 
 ---
 
-## Migrating from `dbt-doris` or StarRocks
+## Property Aliases & StarRocks Compatibility
 
-SQLMesh supports loading existing `dbt-doris` projects directly (`type: doris` in `profiles.yml`) as well as native SQLMesh Doris models. If you are migrating a `dbt-doris` project or StarRocks SQLMesh models to native SQLMesh Doris models, map your configuration keys as follows:
+If you are migrating StarRocks SQLMesh models or existing Doris DDL conventions, `DorisEngineAdapter` supports these property shorthands in `physical_properties`:
 
-| `dbt-doris` / StarRocks Config | SQLMesh Doris Equivalent |
+| Property / Shorthand | SQLMesh Doris Behavior |
 | --- | --- |
-| `materialized='table'` | `kind FULL` |
-| `materialized='incremental'` (with `unique_key`) | `kind INCREMENTAL_BY_UNIQUE_KEY (unique_key ...)` |
-| `materialized='incremental'` (partition overwrite) | `kind INCREMENTAL_BY_TIME_RANGE (time_column ...)` or `kind INCREMENTAL_BY_PARTITION` |
-| `duplicate_key=['c1', 'c2']` | `physical_properties (duplicate_key = ('c1', 'c2'))` |
-| `unique_key=['c1']` | `kind INCREMENTAL_BY_UNIQUE_KEY (unique_key c1)` or `physical_properties (unique_key = ('c1'))` |
-| `table_type='PRIMARY' \| 'UNIQUE' \| 'DUPLICATE' \| 'AGGREGATE'`, `keys=['c1', 'c2']` | Supported directly in `physical_properties` (`PRIMARY` maps to Doris `UNIQUE KEY`) |
-| `distributed_by=['c1']`, `buckets=10` | `clustered_by (c1), physical_properties (buckets = 10)` or `physical_properties (distributed_by = ('c1'), buckets = 10)` |
-| `partition_by` | Supported in `physical_properties (partition_by = ...)` or top-level `partitioned_by` |
-| `properties={...}` | Key-value entries inside `physical_properties (...)` |
+| `duplicate_key = ('c1', 'c2')` | Emits `DUPLICATE KEY (c1, c2)` (and automatically appends active OLAP `partitioned_by` columns if omitted from `duplicate_key`) |
+| `unique_key = ('c1')` | Emits `UNIQUE KEY (c1)` (automatic for `INCREMENTAL_BY_UNIQUE_KEY`) |
+| `aggregate_key = ('c1', 'c2')` | Emits `AGGREGATE KEY (c1, c2)` |
+| `table_type = 'PRIMARY' \| 'UNIQUE' \| 'DUPLICATE' \| 'AGGREGATE'`, `keys = ('c1', 'c2')` | Maps directly to the corresponding Doris key model (`PRIMARY` maps to Doris `UNIQUE KEY`) |
+| `clustered_by (c1)` + `physical_properties (buckets = 10)` | Emits `DISTRIBUTED BY HASH(c1) BUCKETS 10` |
+| `physical_properties (partition_by = ...)` | Supported alias for top-level `partitioned_by` |
 
 ---
 
@@ -625,6 +647,6 @@ SQLMesh supports loading existing `dbt-doris` projects directly (`type: doris` i
 | Symptom / Doris Error | Cause | Resolution |
 | --- | --- | --- |
 | `errCode = 2, replication num 3 is larger than available backends 1` | Doris defaults to `replication_num = 3`, which fails on single-BE local/CI clusters. | Set `replication_num: 1` under `model_defaults.physical_properties` in `config.yaml` for local dev. |
-| `PARTITION BY` omitted on OLAP table (logged as a warning) | Doris OLAP tables with `PARTITION BY (...) ()` and no partition creation strategy have zero partitions and reject all `INSERT`s. | Add `auto_partition = 'true'`, `'dynamic_partition.enable' = 'true'`, or explicit `partitions = '...'` to `physical_properties`. |
+| `PARTITION BY` omitted on OLAP table (logged as a warning) | Doris OLAP tables with `PARTITION BY (...) ()` and no partition creation strategy have zero partitions and reject all `INSERT`s. | Add `auto_partition = 'true'`, `'dynamic_partition.enable' = 'true'`, or explicit `partitions = '...'` to `physical_properties`, or set `partition_by_time_column false` in `INCREMENTAL_BY_TIME_RANGE` if you do not want OLAP partitioning. |
 | `Doris only supports creating views in the 'internal' catalog` | External Iceberg catalogs do not support Doris `VIEW` or `MATERIALIZED VIEW` objects. | Set `virtual_environment_mode: dev_only` and `environment_catalog_mapping: {"^(?!prod$).*": "internal"}` in `config.yaml`. |
 | `Key column cannot be of type STRING / DOUBLE / ARRAY` | Doris forbids `STRING`/`TEXT`, floating-point (`FLOAT`/`DOUBLE`), and complex types as OLAP key columns. | SQLMesh automatically reorders valid key columns first and coerces `STRING`/`TEXT` key columns to `VARCHAR(255)`. For explicit keys on `DOUBLE`/`FLOAT`, use `DECIMAL` or an integer/date key column. |

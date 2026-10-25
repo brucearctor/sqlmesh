@@ -105,6 +105,7 @@ class DorisEngineAdapter(
                 exp.DataType.build("INT", dialect=DIALECT),
                 exp.DataType.build("BIGINT", dialect=DIALECT),
                 exp.DataType.build("INT128", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("TINYINT", dialect=DIALECT): {
                 exp.DataType.build("SMALLINT", dialect=DIALECT),
@@ -112,26 +113,46 @@ class DorisEngineAdapter(
                 exp.DataType.build("BIGINT", dialect=DIALECT),
                 exp.DataType.build("INT128", dialect=DIALECT),
                 exp.DataType.build("DOUBLE", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("SMALLINT", dialect=DIALECT): {
                 exp.DataType.build("INT", dialect=DIALECT),
                 exp.DataType.build("BIGINT", dialect=DIALECT),
                 exp.DataType.build("INT128", dialect=DIALECT),
                 exp.DataType.build("DOUBLE", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("INT", dialect=DIALECT): {
                 exp.DataType.build("BIGINT", dialect=DIALECT),
                 exp.DataType.build("INT128", dialect=DIALECT),
                 exp.DataType.build("DOUBLE", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("BIGINT", dialect=DIALECT): {
                 exp.DataType.build("INT128", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("INT128", dialect=DIALECT): {
+                exp.DataType.build("LARGEINT", dialect=DIALECT, udt=True),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("LARGEINT", dialect=DIALECT, udt=True): {
+                exp.DataType.build("INT128", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("FLOAT", dialect=DIALECT): {
                 exp.DataType.build("DOUBLE", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("DOUBLE", dialect=DIALECT): {
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("DATE", dialect=DIALECT): {
                 exp.DataType.build("DATETIME", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("DATETIME", dialect=DIALECT): {
+                exp.DataType.build("TEXT", dialect=DIALECT),
             },
         },
     }
@@ -573,6 +594,13 @@ class DorisEngineAdapter(
                 ignore_additive=ignore_additive,
             ),
         )
+        dropped_key_cols = {
+            op.column.name.lower()
+            for op in operations
+            if isinstance(op, TableAlterDropColumnOperation)
+            and op.column.name.lower() in current_key_cols
+        }
+        protected_key_cols = invalid_target_key_cols | dropped_key_cols
         return [
             op
             for op in operations
@@ -584,7 +612,7 @@ class DorisEngineAdapter(
                 )
                 or (
                     isinstance(op, (TableAlterDropColumnOperation, TableAlterAddColumnOperation))
-                    and op.column.name.lower() in invalid_target_key_cols
+                    and op.column.name.lower() in protected_key_cols
                 )
             )
         ]
@@ -1262,6 +1290,14 @@ class DorisEngineAdapter(
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         source_columns: t.Optional[t.List[str]] = None,
     ) -> None:
+        if not partitioned_by:
+            self.replace_query(
+                table_name,
+                query_or_df,
+                target_columns_to_types=target_columns_to_types,
+                source_columns=source_columns,
+            )
+            return
         parsed_exprs, _ = self._parse_partition_expressions(partitioned_by)
         col_order: t.List[str] = []
         col_to_expr: t.Dict[str, exp.Column] = {}
@@ -1514,14 +1550,8 @@ class DorisEngineAdapter(
                 normalized_keys.append(k)
             elif isinstance(k, exp.Identifier):
                 normalized_keys.append(exp.Column(this=k.copy()))
-            elif (transform := self._extract_time_partition_transform(k)) is not None:
-                col_expr, unit = transform
-                normalized_keys.append(
-                    exp.Anonymous(
-                        this="DATE_TRUNC",
-                        expressions=[col_expr, exp.Literal.string(unit)],
-                    )
-                )
+            elif self._extract_time_partition_transform(k) is not None:
+                normalized_keys.append(k.copy())
             else:
                 return None
 
@@ -1915,6 +1945,7 @@ class DorisEngineAdapter(
             return
 
         projections: t.List[exp.Expr] = []
+        raw_year_indices: t.Set[int] = set()
         if (
             isinstance(select_query, exp.Select)
             and len(select_query.expressions) == len(key_exprs)
@@ -1928,9 +1959,22 @@ class DorisEngineAdapter(
                 transform = self._extract_time_partition_transform(k)
                 if transform is not None:
                     _, unit = transform
+                    k_unnested = k.unnest()
+                    is_year_fn = (
+                        unit == "year"
+                        and not isinstance(k_unnested, (exp.TimestampTrunc, exp.DateTrunc))
+                        and not (
+                            isinstance(k_unnested, exp.Anonymous)
+                            and k_unnested.name.upper() == "DATE_TRUNC"
+                        )
+                    )
                     src_transform = self._extract_time_partition_transform(raw_sel)
                     if src_transform is not None:
                         src_arg: exp.Expr = src_transform[0].copy()
+                    elif is_year_fn:
+                        raw_year_indices.add(idx)
+                        projections.append(exp.alias_(raw_sel.copy(), f"_val_{idx}", quoted=True))
+                        continue
                     else:
                         src_arg = raw_sel.copy()
                     trunc_expr = exp.Anonymous(
@@ -1959,16 +2003,24 @@ class DorisEngineAdapter(
                     all_branches.append(node)
 
             _collect_select_branches(select_query)
+            unwrapped_indices: t.Set[int] = set(range(len(key_exprs)))
             for branch in all_branches:
-                if len(branch.expressions) == len(key_exprs) and not branch.args.get("group"):
+                if len(branch.expressions) == len(key_exprs):
+                    can_unwrap_group = not branch.args.get("having") and not branch.args.get(
+                        "limit"
+                    )
                     branch_exprs = list(branch.expressions)
                     for idx, k in enumerate(key_exprs):
                         if self._extract_time_partition_transform(k) is not None:
                             sel_item = branch_exprs[idx]
                             raw_sel = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
                             src_transform = self._extract_time_partition_transform(raw_sel)
-                            if src_transform is not None:
+                            if src_transform is not None and can_unwrap_group:
                                 branch_exprs[idx] = src_transform[0].copy()
+                                if branch.args.get("group"):
+                                    branch.set("group", None)
+                            else:
+                                unwrapped_indices.discard(idx)
                     branch.set("expressions", branch_exprs)
 
             new_first_exprs = list(first_select.expressions)
@@ -1982,6 +2034,19 @@ class DorisEngineAdapter(
                 transform = self._extract_time_partition_transform(k)
                 if transform is not None:
                     _, unit = transform
+                    k_unnested = k.unnest()
+                    is_year_fn = (
+                        unit == "year"
+                        and not isinstance(k_unnested, (exp.TimestampTrunc, exp.DateTrunc))
+                        and not (
+                            isinstance(k_unnested, exp.Anonymous)
+                            and k_unnested.name.upper() == "DATE_TRUNC"
+                        )
+                    )
+                    if idx not in unwrapped_indices and is_year_fn:
+                        raw_year_indices.add(idx)
+                        projections.append(exp.alias_(sq_col, f"_val_{idx}", quoted=True))
+                        continue
                     trunc_expr = exp.Anonymous(
                         this="DATE_TRUNC",
                         expressions=[sq_col, exp.Literal.string(unit)],
@@ -2023,11 +2088,33 @@ class DorisEngineAdapter(
         for row in rows:
             predicates: t.List[exp.Expr] = []
             pos = 0
-            for k in key_exprs:
+            for idx, k in enumerate(key_exprs):
                 transform = self._extract_time_partition_transform(k)
                 if transform is not None:
                     col_expr, _ = transform
                     target_col = exp.column(col_expr.name, quoted=True)
+                    if idx in raw_year_indices:
+                        yr_val = self._sanitize_key_value(row[pos])
+                        pos += 1
+                        if yr_val is None:
+                            predicates.append(target_col.is_(exp.null()))
+                        else:
+                            yr_int = int(yr_val)
+                            low_val: t.Any = f"{yr_int:04d}-01-01"
+                            high_val: t.Any = f"{yr_int + 1:04d}-01-01"
+                            predicates.append(
+                                exp.GTE(
+                                    this=target_col.copy(),
+                                    expression=self._to_delete_literal_expr(low_val),
+                                )
+                            )
+                            predicates.append(
+                                exp.LT(
+                                    this=target_col.copy(),
+                                    expression=self._to_delete_literal_expr(high_val),
+                                )
+                            )
+                        continue
                     low_val = self._sanitize_key_value(row[pos])
                     high_val = self._sanitize_key_value(row[pos + 1])
                     pos += 2
@@ -2652,34 +2739,67 @@ class DorisEngineAdapter(
                                     )
                             updated_exprs.append(expr)
                         table_name_or_schema.set("expressions", updated_exprs)
-                    elif auto_range_cols and isinstance(expression, exp.Select):
+                    elif auto_range_cols and isinstance(expression, (exp.Select, exp.SetOperation)):
                         expression = expression.copy()
-                        new_select_exprs: t.List[exp.Expr] = []
-                        for proj in expression.expressions:
-                            if proj.alias_or_name.lower() in auto_range_cols:
-                                if isinstance(proj, exp.Alias):
-                                    inner = proj.this
-                                    if not (
-                                        isinstance(inner, exp.Anonymous)
-                                        and inner.name.upper() == "NON_NULLABLE"
+                        auto_select_branches: t.List[exp.Select] = []
+
+                        def _collect_auto_branches(node: exp.Expr) -> None:
+                            if isinstance(node, exp.SetOperation):
+                                _collect_auto_branches(node.this)
+                                _collect_auto_branches(node.expression)
+                            elif isinstance(node, exp.Select):
+                                auto_select_branches.append(node)
+
+                        _collect_auto_branches(expression)
+                        if auto_select_branches:
+                            target_indices = {
+                                idx
+                                for idx, proj in enumerate(auto_select_branches[0].expressions)
+                                if proj.alias_or_name.lower() in auto_range_cols
+                            }
+                            for branch_idx, branch in enumerate(auto_select_branches):
+                                new_select_exprs: t.List[exp.Expr] = []
+                                for idx, proj in enumerate(branch.expressions):
+                                    if (
+                                        proj.alias_or_name.lower() in auto_range_cols
+                                        or idx in target_indices
                                     ):
-                                        proj = proj.copy()
-                                        proj.set(
-                                            "this",
-                                            exp.Anonymous(
-                                                this="NON_NULLABLE", expressions=[inner.copy()]
-                                            ),
-                                        )
-                                elif isinstance(proj, exp.Column):
-                                    proj = exp.alias_(
-                                        exp.Anonymous(
-                                            this="NON_NULLABLE", expressions=[proj.copy()]
-                                        ),
-                                        proj.name,
-                                        quoted=bool(getattr(proj.this, "quoted", True)),
-                                    )
-                            new_select_exprs.append(proj)
-                        expression.set("expressions", new_select_exprs)
+                                        if isinstance(proj, exp.Alias):
+                                            inner = proj.this
+                                            if not (
+                                                isinstance(inner, exp.Anonymous)
+                                                and inner.name.upper() == "NON_NULLABLE"
+                                            ):
+                                                proj = proj.copy()
+                                                proj.set(
+                                                    "this",
+                                                    exp.Anonymous(
+                                                        this="NON_NULLABLE",
+                                                        expressions=[inner.copy()],
+                                                    ),
+                                                )
+                                        elif isinstance(proj, exp.Column):
+                                            wrapped = exp.Anonymous(
+                                                this="NON_NULLABLE", expressions=[proj.copy()]
+                                            )
+                                            proj = (
+                                                exp.alias_(
+                                                    wrapped,
+                                                    proj.name,
+                                                    quoted=bool(getattr(proj.this, "quoted", True)),
+                                                )
+                                                if branch_idx == 0
+                                                else wrapped
+                                            )
+                                        elif not (
+                                            isinstance(proj, exp.Anonymous)
+                                            and proj.name.upper() == "NON_NULLABLE"
+                                        ):
+                                            proj = exp.Anonymous(
+                                                this="NON_NULLABLE", expressions=[proj.copy()]
+                                            )
+                                    new_select_exprs.append(proj)
+                                branch.set("expressions", new_select_exprs)
 
         return super()._build_create_table_exp(
             table_name_or_schema,
@@ -2811,6 +2931,91 @@ class DorisEngineAdapter(
     ) -> exp.Expr:
         if isinstance(expression, exp.SetOperation):
             expression = expression.copy()
+            branches: t.List[exp.Select] = []
+
+            def _collect_branches(node: exp.Expr) -> None:
+                if isinstance(node, exp.SetOperation):
+                    _collect_branches(node.this)
+                    _collect_branches(node.expression)
+                elif isinstance(node, exp.Select):
+                    branches.append(node)
+
+            _collect_branches(expression)
+            if not branches:
+                return expression
+            first_exprs = branches[0].expressions
+            num_cols = len(first_exprs)
+            if (
+                num_cols > 0
+                and all(
+                    len(b.expressions) == num_cols
+                    and not any(isinstance(p, exp.Star) for p in b.expressions)
+                    for b in branches
+                )
+                and len(
+                    {
+                        p.alias_or_name.lower()
+                        for p in first_exprs
+                        if p.alias_or_name and not isinstance(p, exp.Star)
+                    }
+                )
+                == num_cols
+            ):
+                orig_names = [p.alias_or_name for p in first_exprs]
+                merged_cols_to_types: t.Dict[str, exp.DataType] = {}
+                for col_idx, col_name in enumerate(orig_names):
+                    inferred = exp.DataType.build("UNKNOWN")
+                    for b in branches:
+                        cand = self._infer_projection_type(b.expressions[col_idx])
+                        if cand.this != exp.DataType.Type.UNKNOWN:
+                            inferred = cand
+                            break
+                    merged_cols_to_types[col_name] = inferred
+                reordered_select_cols = self._reorder_olap_columns(merged_cols_to_types, kwargs)
+                perm = [orig_names.index(c) for c in reordered_select_cols]
+                coercions = {
+                    orig_names.index(c): reordered_select_cols[c]
+                    for c in reordered_select_cols
+                    if reordered_select_cols[c] != merged_cols_to_types[c]
+                }
+                if perm != list(range(num_cols)) or coercions:
+                    for b_idx, branch in enumerate(branches):
+                        old_projs = list(branch.expressions)
+                        updated_branch_projs: t.List[exp.Expr] = []
+                        for orig_idx in perm:
+                            proj = old_projs[orig_idx].copy()
+                            new_dtype = coercions.get(orig_idx)
+                            if new_dtype is not None:
+                                col_name = orig_names[orig_idx]
+                                if isinstance(proj, exp.Alias) and isinstance(
+                                    proj.this, (exp.Cast, exp.TryCast)
+                                ):
+                                    proj.this.set("to", new_dtype.copy())
+                                elif isinstance(proj, (exp.Cast, exp.TryCast)):
+                                    cast_expr = exp.cast(proj.this.copy(), to=new_dtype.copy())
+                                    proj = (
+                                        exp.alias_(cast_expr, col_name, quoted=True)
+                                        if b_idx == 0
+                                        else cast_expr
+                                    )
+                                elif isinstance(proj, exp.Alias):
+                                    proj.set(
+                                        "this", exp.cast(proj.this.copy(), to=new_dtype.copy())
+                                    )
+                                elif isinstance(proj, exp.Column):
+                                    cast_expr = exp.cast(proj.copy(), to=new_dtype.copy())
+                                    proj = (
+                                        exp.alias_(
+                                            cast_expr,
+                                            proj.name,
+                                            quoted=bool(getattr(proj.this, "quoted", True)),
+                                        )
+                                        if b_idx == 0
+                                        else cast_expr
+                                    )
+                            updated_branch_projs.append(proj)
+                        branch.set("expressions", updated_branch_projs)
+                return expression
             expression.set("this", self._reorder_unannotated_ctas_query(expression.this, kwargs))
             expression.set(
                 "expression", self._reorder_unannotated_ctas_query(expression.expression, kwargs)
@@ -2974,6 +3179,42 @@ class DorisEngineAdapter(
                     f"Doris key columns {missing_cols} not found in table schema columns {col_names}."
                 )
             key_cols = [col_by_lower[k.lower()] for k in raw_key_cols if k.lower() in col_by_lower]
+            if duplicate_key and not unique_key and not aggregate_key:
+                raw_part_by_dup = (
+                    kwargs.get("partitioned_by")
+                    or table_props.get("partitioned_by")
+                    or table_props.get("partition_by")
+                )
+                has_active_olap_part = bool(
+                    raw_part_by_dup
+                    and (
+                        table_props.get("partitions")
+                        or kwargs.get("partitions")
+                        or str(self._extract_str_value(table_props.get("auto_partition")) or "")
+                        .strip()
+                        .lower()
+                        in ("true", "1")
+                        or str(
+                            self._extract_str_value(table_props.get("dynamic_partition.enable"))
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                        in ("true", "1")
+                    )
+                )
+                if has_active_olap_part:
+                    part_list_dup = (
+                        raw_part_by_dup if isinstance(raw_part_by_dup, list) else [raw_part_by_dup]
+                    )
+                    parsed_part_dup, _ = self._parse_partition_expressions(part_list_dup)
+                    key_cols_lower = {k.lower() for k in key_cols}
+                    for expr in parsed_part_dup:
+                        for col_node in expr.find_all(exp.Column):
+                            canonical = col_by_lower.get(col_node.name.lower())
+                            if canonical and canonical.lower() not in key_cols_lower:
+                                key_cols.append(canonical)
+                                key_cols_lower.add(canonical.lower())
             updated_types = dict(target_columns_to_types)
             for k in key_cols:
                 k_dtype = updated_types[k]
@@ -3241,7 +3482,9 @@ class DorisEngineAdapter(
         if not partitions and not is_auto and not dynamic_partition_enabled:
             logger.warning(
                 "[Doris] Omitting PARTITION BY on OLAP table because none of 'auto_partition = true', "
-                "'dynamic_partition.enable = true', or explicit 'partitions' were configured in physical_properties."
+                "'dynamic_partition.enable = true', or explicit 'partitions' were configured in physical_properties. "
+                "Add one of those properties to physical_properties, or set 'partition_by_time_column false' in your "
+                "INCREMENTAL_BY_TIME_RANGE model kind to silence this warning."
             )
             return None
 
@@ -3416,6 +3659,33 @@ class DorisEngineAdapter(
             {c.lower(): c for c in target_columns_to_types} if target_columns_to_types else {}
         )
 
+        # Pop partitioning-related properties before building key properties so explicit duplicate_key
+        # can automatically include active OLAP partition columns (required by Doris FE validation).
+        partitions = table_properties_copy.pop("partitions", None)
+        auto_partition = table_properties_copy.pop("auto_partition", None)
+        raw_part_by = table_properties_copy.pop("partitioned_by", None)
+        raw_part_by_alias = table_properties_copy.pop("partition_by", None)
+        if (
+            sum(
+                x is not None
+                for x in (
+                    partitioned_by or None,
+                    raw_part_by,
+                    raw_part_by_alias,
+                )
+            )
+            > 1
+        ):
+            raise SQLMeshError(
+                "Multiple partition definitions found: specify only one of model 'partitioned_by' or physical_properties 'partitioned_by' / 'partition_by'."
+            )
+        if not partitioned_by:
+            chosen_part_by = raw_part_by if raw_part_by is not None else raw_part_by_alias
+            if chosen_part_by is not None:
+                partitioned_by = (
+                    chosen_part_by if isinstance(chosen_part_by, list) else [chosen_part_by]
+                )
+
         if not is_iceberg:
             specified_key_types = [
                 name
@@ -3444,6 +3714,34 @@ class DorisEngineAdapter(
                     duplicate_key_cols = [col_by_lower[k.lower()] for k in duplicate_key_cols]
                 elif aggregate_key_cols:
                     aggregate_key_cols = [col_by_lower[k.lower()] for k in aggregate_key_cols]
+
+            if (
+                duplicate_key_cols
+                and partitioned_by
+                and not is_materialized_view
+                and (
+                    partitions
+                    or str(self._extract_str_value(auto_partition) or "").strip().lower()
+                    in ("true", "1")
+                    or str(
+                        self._extract_str_value(
+                            table_properties_copy.get("dynamic_partition.enable")
+                        )
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                    in ("true", "1")
+                )
+            ):
+                parsed_dup_part_exprs, _ = self._parse_partition_expressions(partitioned_by)
+                dup_lower_set = {k.lower() for k in duplicate_key_cols}
+                for expr in parsed_dup_part_exprs:
+                    for col_node in expr.find_all(exp.Column):
+                        part_col_name = col_by_lower.get(col_node.name.lower(), col_node.name)
+                        if part_col_name.lower() not in dup_lower_set:
+                            duplicate_key_cols.append(part_col_name)
+                            dup_lower_set.add(part_col_name.lower())
 
             if unique_key_cols:
                 properties.append(
@@ -3485,32 +3783,6 @@ class DorisEngineAdapter(
                     this=exp.Literal.string(self._truncate_table_comment(table_description))
                 )
             )
-
-        # Pop partitioning-related properties
-        partitions = table_properties_copy.pop("partitions", None)
-        auto_partition = table_properties_copy.pop("auto_partition", None)
-        raw_part_by = table_properties_copy.pop("partitioned_by", None)
-        raw_part_by_alias = table_properties_copy.pop("partition_by", None)
-        if (
-            sum(
-                x is not None
-                for x in (
-                    partitioned_by or None,
-                    raw_part_by,
-                    raw_part_by_alias,
-                )
-            )
-            > 1
-        ):
-            raise SQLMeshError(
-                "Multiple partition definitions found: specify only one of model 'partitioned_by' or physical_properties 'partitioned_by' / 'partition_by'."
-            )
-        if not partitioned_by:
-            chosen_part_by = raw_part_by if raw_part_by is not None else raw_part_by_alias
-            if chosen_part_by is not None:
-                partitioned_by = (
-                    chosen_part_by if isinstance(chosen_part_by, list) else [chosen_part_by]
-                )
 
         add_partition = True
         if partitioned_by:

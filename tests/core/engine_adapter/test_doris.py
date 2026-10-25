@@ -2982,14 +2982,11 @@ def test_thread_local_state_isolation_time_transform_partition_delete_table_diff
     assert "dialect: doris" in doris_init_cfg
 
 
-def test_union_time_transform_delete_agg_ctas_mv_df_order_limit_fold_and_dbt_target(
+def test_union_time_transform_delete_agg_ctas_mv_df_order_and_limit_fold(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
 ):
     import pandas as pd
     from sqlmesh.core.config.connection import DorisConnectionConfig
-    from sqlmesh.dbt.context import DbtContext
-    from sqlmesh.dbt.model import ModelConfig
-    from sqlmesh.dbt.target import DorisConfig, TargetConfig
 
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
@@ -3116,48 +3113,103 @@ def test_union_time_transform_delete_agg_ctas_mv_df_order_limit_fold_and_dbt_tar
         == "SELECT COUNT(*) FROM (SELECT 1 FROM `db`.`events` WHERE TRUE LIMIT 11) AS `_q` HAVING COUNT(*) <= 10"
     )
 
-    # 7. `dbt-doris` TargetConfig (`DorisConfig`) and `ModelConfig` integration.
-    target = TargetConfig.load(
-        {
-            "type": "doris",
-            "name": "dev",
-            "host": "fe.internal",
-            "port": 9030,
-            "username": "doris_admin",
-            "pass": "secret",
-            "schema": "analytics",
-            "catalog": "iceberg_cat",
-            "threads": 8,
-        }
+    # 7. Lockstep `UNION ALL` CTAS reordering when only one branch has explicit types (`AVG(score)`, `CAST(id AS INT)`)
+    #    plus `NON_NULLABLE(...)` wrapping across all `UNION ALL` branches when `auto_partition = true`.
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        "db.union_lockstep_ctas",
+        parse_one(
+            "SELECT AVG(score) AS score, CAST(id AS INT) AS id FROM db.s1 GROUP BY id "
+            "UNION ALL SELECT score, id FROM db.s2",
+            read="doris",
+        ),
     )
-    assert isinstance(target, DorisConfig)
-    conn_cfg = target.to_sqlmesh()
-    assert isinstance(conn_cfg, DorisConnectionConfig)
-    assert conn_cfg.host == "fe.internal"
-    assert conn_cfg.user == "doris_admin"
-    assert conn_cfg.password == "secret"
-    assert conn_cfg.database == "analytics"
-    assert conn_cfg.catalog == "iceberg_cat"
-    assert conn_cfg.concurrent_tasks == 8
+    adapter.ctas(
+        "db.union_auto_part_ctas",
+        parse_one(
+            "SELECT id, ds FROM db.s1 UNION ALL SELECT id, ds FROM db.s2",
+            read="doris",
+        ),
+        partitioned_by=[parse_one("RANGE(ds)", read="doris")],
+        table_properties={"auto_partition": exp.Literal.string("true")},
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`union_lockstep_ctas` AS SELECT CAST(`id` AS INT) AS `id`, AVG(`score`) AS `score` FROM `db`.`s1` GROUP BY `id` UNION ALL SELECT `id`, `score` FROM `db`.`s2`",
+        "CREATE TABLE IF NOT EXISTS `db`.`union_auto_part_ctas` AUTO PARTITION BY RANGE (`ds`) () AS SELECT `id`, NON_NULLABLE(`ds`) AS `ds` FROM `db`.`s1` UNION ALL SELECT `id`, NON_NULLABLE(`ds`) FROM `db`.`s2`",
+    ]
 
-    dbt_ctx = DbtContext()
-    dbt_ctx.project_name = "test"
-    dbt_ctx.target = target
-    dbt_model = ModelConfig(
-        name="orders_doris",
-        alias="orders_doris",
-        package_name="pkg",
-        schema="analytics",
-        materialized="incremental",
-        unique_key=["order_id"],
-        distributed_by=["order_id"],
-        buckets=16,
-        properties={"replication_num": "1"},
-        sql="SELECT 1 AS order_id",
+    # 8. Explicit `duplicate_key` with active OLAP `partitioned_by` automatically includes the
+    #    partition column in `DUPLICATE KEY` and the leading schema prefix (required by Doris FE).
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "db.dup_part_tbl",
+        {
+            "score": exp.DataType.build("DOUBLE", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        partitioned_by=[parse_one("RANGE(ds)", read="doris")],
+        table_properties={
+            "duplicate_key": exp.Tuple(expressions=[exp.Literal.string("id")]),
+            "auto_partition": exp.Literal.string("true"),
+            "buckets": exp.Literal.number(8),
+        },
     )
-    sqlmesh_model = dbt_model.to_sqlmesh(dbt_ctx)
-    rendered_props = sqlmesh_model.render_physical_properties()
-    assert rendered_props["unique_key"] == exp.column("order_id", quoted=True)
-    assert rendered_props["distributed_by"] == exp.column("order_id", quoted=True)
-    assert rendered_props["buckets"] == exp.Literal.number(16)
-    assert rendered_props["replication_num"] == exp.Literal.string("1")
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`dup_part_tbl` (`id` INT, `ds` DATE NOT NULL, `score` DOUBLE) DUPLICATE KEY (`id`, `ds`) AUTO PARTITION BY RANGE (`ds`) () DISTRIBUTED BY HASH (`id`) BUCKETS 8"
+    ]
+
+    # 9. `_delete_by_time_transform_keys` handles pre-extracted integer `YEAR` columns (`SELECT yr`),
+    #    `GROUP BY` inside `UNION ALL` branches, and `NULL` partition values (`IS NULL`).
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [(2024,), (None,)],
+            [("2024-01-01", "2025-01-01")],
+        ],
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one("YEAR(ds) IN (SELECT yr FROM db.staging)", read="doris"),
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "YEAR(ds) IN (SELECT YEAR(ds) FROM db.s1 GROUP BY YEAR(ds) UNION ALL SELECT YEAR(ds) FROM db.s2)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT `yr` AS `_val_0` FROM `db`.`staging`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+        "DELETE FROM `db`.`events` WHERE `ds` IS NULL",
+        "SELECT DISTINCT DATE_TRUNC(`_col_0`, 'year') AS `_low_0`, DATE_ADD(DATE_TRUNC(`_col_0`, 'year'), INTERVAL 1 YEAR) AS `_high_0` FROM (SELECT `ds` AS `_col_0` FROM `db`.`s1` UNION ALL SELECT `ds` FROM `db`.`s2`) AS `_sq`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+    ]
+
+    # 10. `insert_overwrite_by_partition` with empty `partitioned_by=[]` delegates cleanly to `replace_query`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "get_data_object",
+        return_value=DataObject(
+            catalog="internal", schema="db", name="unpart_tbl", type=DataObjectType.TABLE
+        ),
+    )
+    adapter.insert_overwrite_by_partition(
+        "db.unpart_tbl",
+        parse_one("SELECT 1 AS id", read="doris"),
+        partitioned_by=[],
+        target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
+    )
+    assert to_sql_calls(adapter) == [
+        "TRUNCATE TABLE `db`.`unpart_tbl`",
+        "INSERT INTO `db`.`unpart_tbl` (`id`) SELECT 1 AS `id`",
+    ]
+
+    # 11. `DorisConnectionConfig` with `ssl=True` populates a non-empty `ssl` dict so PyMySQL enables TLS.
+    ssl_conn_cfg = DorisConnectionConfig(host="fe.internal", user="root", ssl=True)
+    assert ssl_conn_cfg._static_connection_kwargs["ssl"] == {"check_hostname": False}
+    assert bool(ssl_conn_cfg._static_connection_kwargs["ssl"]) is True
