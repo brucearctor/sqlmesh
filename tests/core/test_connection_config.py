@@ -2545,8 +2545,14 @@ def test_doris(make_config):
     assert advanced_config.get_catalog() == "iceberg_cat"
     assert advanced_config.concurrent_tasks == 10
     assert "database" not in advanced_config._static_connection_kwargs
-    assert advanced_config._static_connection_kwargs["ssl"] == {"ca": "/path/to/ca.pem"}
-    assert advanced_config._static_connection_kwargs["ssl_verify_cert"] is True
+    assert advanced_config._static_connection_kwargs["ssl"] == {
+        "ca": "/path/to/ca.pem",
+        "verify_mode": True,
+    }
+    assert advanced_config._extra_engine_config == {
+        "database": "analytics",
+        "catalog": "iceberg_cat",
+    }
 
     mock_cursor = MagicMock()
     assert advanced_config._cursor_init is not None
@@ -2565,7 +2571,7 @@ def test_doris(make_config):
         ssl=True,
         check_import=False,
     )
-    assert ssl_bool_config._static_connection_kwargs["ssl"] == {}
+    assert ssl_bool_config._static_connection_kwargs["ssl"] == {"check_hostname": False}
 
     ssl_false_config = make_config(
         type="doris",

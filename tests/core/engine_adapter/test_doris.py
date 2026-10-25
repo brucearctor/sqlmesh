@@ -3578,3 +3578,183 @@ def test_doris_snapshot_evaluator_end_to_end_model_kinds(
         for s in part_sql
     )
     assert any("INSERT INTO `internal`.`sqlmesh__db`.`db__inc_part__" in s for s in part_sql)
+
+
+def test_unannotated_unknown_columns_ctas_and_sync_mv_and_schema_tmp_truncation(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Unannotated SqlModel passes `target_columns_to_types` with `UNKNOWN` types to `ctas`:
+    #    must reorder the `SELECT` projections so `id` (the `unique_key`) is column 0.
+    adapter.ctas(
+        "db.unannotated_uk_model",
+        parse_one("SELECT name, id FROM db.src", read="doris"),
+        target_columns_to_types={
+            "name": exp.DataType.build("UNKNOWN"),
+            "id": exp.DataType.build("UNKNOWN"),
+        },
+        table_properties={"unique_key": exp.to_column("id")},
+    )
+
+    # 2. Unannotated SqlModel with `UNKNOWN` column types and `AVG(score)` at column 0:
+    #    falls through to `_reorder_unannotated_ctas_query` and moves `CAST(id AS INT)` to column 0.
+    adapter.ctas(
+        "db.unannotated_agg_model",
+        parse_one(
+            "SELECT AVG(score) AS score, CAST(id AS INT) AS id FROM db.src GROUP BY id",
+            read="doris",
+        ),
+        target_columns_to_types={
+            "score": exp.DataType.build("UNKNOWN"),
+            "id": exp.DataType.build("UNKNOWN"),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`unannotated_uk_model` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT `id`, `name` FROM `db`.`src`",
+        "CREATE TABLE IF NOT EXISTS `db`.`unannotated_agg_model` AS SELECT CAST(`id` AS INT) AS `id`, AVG(`score`) AS `score` FROM `db`.`src` GROUP BY `id`",
+    ]
+
+    # 3. Sync MV (`materialized_type='SYNC'`) with `target_columns_to_types` and `table_description`:
+    #    must NOT wrap the query in `SELECT CAST(...) FROM (...) AS _subquery`, must NOT emit `COMMENT`,
+    #    and `drop_view(view_name, materialized=True)` without `view_properties` still emits `ON <source_table>`.
+    adapter.cursor.execute.reset_mock()
+    adapter.create_view(
+        "db.sync_mv_typed",
+        parse_one("SELECT id, SUM(amount) AS total FROM db.orders GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "total": exp.DataType.build("BIGINT", dialect="doris"),
+        },
+        table_description="Sync rollup MV",
+        view_properties={
+            "materialized_type": exp.Literal.string("SYNC"),
+            "source_table": exp.Literal.string("db.orders"),
+        },
+    )
+    adapter.drop_view("db.sync_mv_typed", materialized=True)
+
+    assert to_sql_calls(adapter) == [
+        "CREATE MATERIALIZED VIEW `db`.`sync_mv_typed` AS SELECT `id` AS `mv_id`, SUM(`amount`) AS `total` FROM `db`.`orders` GROUP BY `id`",
+        "DROP MATERIALIZED VIEW IF EXISTS `db`.`sync_mv_typed` ON `db`.`orders`",
+    ]
+
+    # 4. Overlong `_schema_tmp` table identifier (> 64 chars) is deterministically shortened to <= 64 chars
+    #    across `CREATE TABLE`, `DESCRIBE`, and `DROP TABLE`.
+    adapter.cursor.execute.reset_mock()
+    long_schema_tmp = f"db.{'very_long_model_name_' * 3}_schema_tmp"
+    assert len(exp.to_table(long_schema_tmp).name) > 64
+    adapter.cursor.fetchall.return_value = [("id", "INT", "Yes", "true", None, "")]
+    adapter.ctas(long_schema_tmp, parse_one("SELECT 1 AS id", read="doris"))
+    adapter.columns(long_schema_tmp)
+    adapter.drop_table(long_schema_tmp)
+
+    schema_tmp_calls = to_sql_calls(adapter)
+    assert len(schema_tmp_calls) == 3
+    created_tbl = parse_one(schema_tmp_calls[0], read="doris").this
+    assert len(created_tbl.name) <= 64
+    assert created_tbl.name.endswith("_schema_tmp")
+    assert f"`{created_tbl.name}`" in schema_tmp_calls[1]
+    assert f"`{created_tbl.name}`" in schema_tmp_calls[2]
+
+
+def test_nested_delete_and_mixed_union_time_transform_and_merge_text_preservation(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    from sqlmesh.core.config.connection import DorisConnectionConfig
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Nested parenthesized `AND`s with `IN (SELECT ...)` and extra `OR` condition:
+    #    extracts the subquery and normalizes `(status = 'x' OR status = 'y')` into `status IN ('x', 'y')`.
+    adapter.delete_from(
+        "db.target",
+        where=parse_one(
+            "(tenant_id = 1 AND id IN (SELECT id FROM db.staging)) AND (status = 'x' OR status = 'y')",
+            read="doris",
+        ),
+    )
+
+    # 2. Single-column `id IN (SELECT * FROM db.staging_ids)` falls back to literal key batching
+    #    instead of emitting invalid `SELECT * AS _col_0`.
+    mocker.patch.object(adapter, "fetchall", return_value=[(10,), (20,)])
+    adapter.delete_from(
+        "db.target",
+        where=parse_one("id IN (SELECT * FROM db.staging_ids)", read="doris"),
+    )
+
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`staging`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`tenant_id` = 1 AND `_t1`.`status` IN ('x', 'y')",
+        "DELETE FROM `db`.`target` WHERE `id` IN (10, 20)",
+    ]
+
+    # 3. `_delete_by_time_transform_keys`:
+    #    (a) Mixed `UNION ALL` branches (`SELECT YEAR(ds) FROM db.s1 UNION ALL SELECT yr FROM db.s2`)
+    #        use `branch_is_raw_col` instead of wrapping integer `yr` in `DATE_TRUNC(yr, 'year')`.
+    #    (b) `GROUP BY` with aggregate `MAX(region)` in `WHERE`/`HAVING` is preserved instead of stripping `GROUP BY`.
+    adapter.cursor.execute.reset_mock()
+    mocker.stopall()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [(2024,)],
+            [("2024-01-01", "2024-01-02")],
+        ],
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "YEAR(ds) IN (SELECT YEAR(ds) FROM db.s1 UNION ALL SELECT yr FROM db.s2)",
+            read="doris",
+        ),
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "DATE_TRUNC(ds, 'day') IN (SELECT DATE_TRUNC(ds, 'day') FROM db.s1 GROUP BY DATE_TRUNC(ds, 'day') HAVING COUNT(*) > 1)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT `_col_0` AS `_val_0` FROM (SELECT YEAR(`ds`) AS `_col_0` FROM `db`.`s1` UNION ALL SELECT `yr` FROM `db`.`s2`) AS `_sq`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+        "SELECT DISTINCT DATE_TRUNC(`_col_0`, 'day') AS `_low_0`, DATE_ADD(DATE_TRUNC(`_col_0`, 'day'), INTERVAL 1 DAY) AS `_high_0` FROM (SELECT DATE_TRUNC(`ds`, 'DAY') AS `_col_0` FROM `db`.`s1` GROUP BY DATE_TRUNC(`ds`, 'DAY') HAVING COUNT(*) > 1) AS `_sq`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2024-01-02'",
+    ]
+
+    # 4. `merge` with `{"notes": TEXT, "code": TEXT}` and `unique_key=[code]`:
+    #    `temp_table` uses `UNIQUE KEY (code)` so `code` is coerced to `VARCHAR(255)` while non-key `notes` stays `STRING` (`TEXT`).
+    adapter.cursor.execute.reset_mock()
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+    adapter.merge(
+        target_table="db.notes_tbl",
+        source_table=parse_one("SELECT notes, code FROM db.staging_notes", read="doris"),
+        target_columns_to_types={
+            "notes": exp.DataType.build("TEXT", dialect="doris"),
+            "code": exp.DataType.build("TEXT", dialect="doris"),
+        },
+        unique_key=[exp.to_column("code")],
+    )
+    merge_calls = to_sql_calls(adapter)
+    assert (
+        merge_calls[0]
+        == "CREATE TABLE `db`.`__temp_notes_tbl_abcd1234` UNIQUE KEY (`code`) DISTRIBUTED BY HASH (`code`) BUCKETS 10 AS SELECT CAST(`code` AS VARCHAR(255)) AS `code`, CAST(`notes` AS STRING) AS `notes` FROM (SELECT `notes`, `code` FROM `db`.`staging_notes`) AS `_subquery`"
+    )
+
+    # 5. `DorisConnectionConfig` TLS dictionary with `ssl_verify_cert=False` sets `check_hostname=False`
+    #    (preventing Python 3.13 `SSLContext` `ValueError`) and preserves `ca` when `ssl` is a dict.
+    cfg_ca_no_verify = DorisConnectionConfig(
+        host="fe.internal",
+        user="root",
+        ssl={"ca": "/path/to/ca.pem"},
+        ssl_verify_cert=False,
+    )
+    assert cfg_ca_no_verify._static_connection_kwargs["ssl"] == {
+        "ca": "/path/to/ca.pem",
+        "verify_mode": False,
+        "check_hostname": False,
+    }

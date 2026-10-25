@@ -2781,30 +2781,35 @@ class DorisConnectionConfig(ConnectionConfig):
             "local_infile": False,
         }
         if not self.ssl_disabled:
-            ssl_config: t.Dict[str, t.Any] = dict(self.ssl) if isinstance(self.ssl, dict) else {}
+            ssl_config: t.Dict[str, t.Any] = (
+                dict(self.ssl) if isinstance(self.ssl, dict) else {}  # type: ignore[arg-type]
+            )
             for key in ("ca", "cert", "key"):
                 val = getattr(self, f"ssl_{key}", None)
                 if val is not None:
                     ssl_config[key] = val
             if self.ssl_verify_cert is not None:
                 ssl_config["verify_mode"] = self.ssl_verify_cert
+                if (
+                    self.ssl_verify_cert is False
+                    and self.ssl_verify_identity is None
+                    and "check_hostname" not in ssl_config
+                ):
+                    ssl_config["check_hostname"] = False
             if self.ssl_verify_identity is not None:
-                ssl_config["check_hostname"] = bool(self.ssl_verify_identity)
-            if not ssl_config and (self.ssl is not None and self.ssl is not False):
                 ssl_config["check_hostname"] = bool(self.ssl_verify_identity)
             if ssl_config:
                 kwargs["ssl"] = ssl_config
-            for key in (
-                "ssl_ca",
-                "ssl_cert",
-                "ssl_key",
-                "ssl_verify_cert",
-                "ssl_verify_identity",
-            ):
-                val = getattr(self, key, None)
-                if val is not None:
-                    kwargs[key] = val
+            elif self.ssl is True:
+                kwargs["ssl"] = {"check_hostname": False}
         return kwargs
+
+    @property
+    def _extra_engine_config(self) -> t.Dict[str, t.Any]:
+        return {
+            "database": self.database,
+            "catalog": self.catalog,
+        }
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
