@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import datetime
+from decimal import Decimal
 import itertools
 import logging
 import re
+import threading
 import typing as t
 
 import pandas as pd  # noqa: TID253
@@ -39,6 +42,7 @@ if t.TYPE_CHECKING:
     from sqlmesh.core.engine_adapter._typing import DF, QueryOrDF
     from sqlmesh.core.node import IntervalUnit
     from sqlmesh.core.schema_diff import TableAlterOperation
+    from sqlmesh.utils.date import TimeLike
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,7 @@ class DorisEngineAdapter(
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
     RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False
     SUPPORTS_CREATE_DROP_CATALOG = False
+    SUPPORTS_QUERY_EXECUTION_TRACKING = True
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
     CURRENT_CATALOG_EXPRESSION = exp.func("current_catalog")
     RESOLVE_TABLE_REFS_IN_PHYSICAL_PROPERTIES: t.FrozenSet[str] = frozenset(
@@ -158,6 +163,47 @@ class DorisEngineAdapter(
         "AGG_STATE",
     }
 
+    def _get_thread_state(self) -> threading.local:
+        state = getattr(self._connection_pool, "_doris_thread_state", None)
+        if not isinstance(state, threading.local):
+            state = self._extra_config.get("_doris_thread_state")
+            if not isinstance(state, threading.local):
+                state = getattr(self, "_doris_thread_state", None)
+                if not isinstance(state, threading.local):
+                    state = threading.local()
+            self._doris_thread_state = state
+            if isinstance(getattr(self, "_extra_config", None), dict):
+                self._extra_config["_doris_thread_state"] = state
+            try:
+                setattr(self._connection_pool, "_doris_thread_state", state)
+            except Exception:
+                pass
+        return state
+
+    @property
+    def _active_catalog(self) -> t.Optional[str]:
+        return getattr(self._get_thread_state(), "active_catalog", None)
+
+    @_active_catalog.setter
+    def _active_catalog(self, value: t.Optional[str]) -> None:
+        self._get_thread_state().active_catalog = value
+
+    @property
+    def _needs_catalog_restore(self) -> bool:
+        return bool(getattr(self._get_thread_state(), "needs_catalog_restore", False))
+
+    @_needs_catalog_restore.setter
+    def _needs_catalog_restore(self, value: bool) -> None:
+        self._get_thread_state().needs_catalog_restore = bool(value)
+
+    @property
+    def _last_described_key_cols(self) -> t.Set[str]:
+        return getattr(self._get_thread_state(), "last_described_key_cols", set())
+
+    @_last_described_key_cols.setter
+    def _last_described_key_cols(self, value: t.Set[str]) -> None:
+        self._get_thread_state().last_described_key_cols = set(value)
+
     @property
     def catalog_support(self) -> CatalogSupport:
         return CatalogSupport.FULL_SUPPORT
@@ -178,11 +224,11 @@ class DorisEngineAdapter(
     def set_current_catalog(self, catalog: str) -> None:
         catalog_sql = self._to_sql(exp.to_identifier(catalog, quoted=True))
         self.execute(exp.Command(this="SWITCH", expression=catalog_sql))
-        self._active_catalog: t.Optional[str] = catalog
-        self._needs_catalog_restore: bool = False
+        self._active_catalog = catalog
+        self._needs_catalog_restore = False
 
     def _restore_active_catalog_on_reconnect(self, sql: t.Optional[str] = None) -> None:
-        active_cat = getattr(self, "_active_catalog", None)
+        active_cat = self._active_catalog
         self._needs_catalog_restore = False
         if not active_cat:
             return
@@ -194,6 +240,11 @@ class DorisEngineAdapter(
             return
         catalog_sql = self._to_sql(exp.to_identifier(active_cat, quoted=True))
         self.cursor.execute(f"SWITCH {catalog_sql}")
+        database = self._extra_config.get("database")
+        default_cat = self.default_catalog or "internal"
+        if database and active_cat.lower() == str(default_cat).lower():
+            db_sql = self._to_sql(exp.to_identifier(str(database), quoted=True))
+            self.cursor.execute(f"USE {db_sql}")
 
     def _is_iceberg_table(
         self,
@@ -1091,6 +1142,104 @@ class DorisEngineAdapter(
             **kwargs,
         )
 
+    _TIME_UNIT_PRECEDENCE: t.ClassVar[t.Dict[str, int]] = {
+        "second": 0,
+        "minute": 1,
+        "hour": 2,
+        "day": 3,
+        "month": 4,
+        "year": 5,
+    }
+
+    @classmethod
+    def _extract_time_partition_transform(
+        cls, expr: exp.Expr
+    ) -> t.Optional[t.Tuple[exp.Column, str]]:
+        """Extract `(column, unit)` from time-truncation partition expressions (`DATE_TRUNC`,
+        `TO_DATE`, `DATE`, `YEAR`/`YEARS`, `MONTH`/`MONTHS`, `DAY`/`DAYS`, `HOUR`/`HOURS`).
+        """
+        curr = expr.unnest()
+        col_node: t.Optional[exp.Column] = None
+        raw_unit: t.Optional[str] = None
+
+        if isinstance(curr, (exp.TimestampTrunc, exp.DateTrunc)):
+            unit_arg = curr.args.get("unit")
+            if isinstance(curr.this, exp.Column):
+                col_node = curr.this
+                raw_unit = cls._extract_str_value(unit_arg)
+            elif isinstance(unit_arg, exp.Column):
+                col_node = unit_arg
+                raw_unit = cls._extract_str_value(curr.this)
+        elif isinstance(curr, (exp.TsOrDsToDate, exp.Date)):
+            if isinstance(curr.this, exp.Column):
+                col_node = curr.this
+                raw_unit = "day"
+        elif isinstance(curr, (exp.Year, exp.Month, exp.Day, exp.Hour)):
+            inner_arg = curr.this.unnest() if isinstance(curr.this, exp.Expr) else None
+            if isinstance(inner_arg, (exp.TsOrDsToDate, exp.Date)) and isinstance(
+                inner_arg.this, exp.Expr
+            ):
+                inner_arg = inner_arg.this.unnest()
+            if isinstance(inner_arg, exp.Column):
+                col_node = inner_arg
+                if isinstance(curr, exp.Year):
+                    raw_unit = "year"
+                elif isinstance(curr, exp.Month):
+                    raw_unit = "month"
+                elif isinstance(curr, exp.Day):
+                    raw_unit = "day"
+                else:
+                    raw_unit = "hour"
+        elif isinstance(curr, exp.Anonymous):
+            fn_name = curr.name.upper()
+            if fn_name == "DATE_TRUNC" and len(curr.expressions) == 2:
+                arg0, arg1 = curr.expressions
+                if isinstance(arg0, exp.Column):
+                    col_node = arg0
+                    raw_unit = cls._extract_str_value(arg1)
+                elif isinstance(arg1, exp.Column):
+                    col_node = arg1
+                    raw_unit = cls._extract_str_value(arg0)
+            elif (
+                fn_name in ("TO_DATE", "DATE")
+                and len(curr.expressions) == 1
+                and isinstance(curr.expressions[0], exp.Column)
+            ):
+                col_node = curr.expressions[0]
+                raw_unit = "day"
+            elif (
+                fn_name
+                in (
+                    "YEAR",
+                    "YEARS",
+                    "MONTH",
+                    "MONTHS",
+                    "DAY",
+                    "DAYS",
+                    "HOUR",
+                    "HOURS",
+                    "MINUTE",
+                    "MINUTES",
+                    "SECOND",
+                    "SECONDS",
+                )
+                and len(curr.expressions) == 1
+                and isinstance(curr.expressions[0], exp.Column)
+            ):
+                col_node = curr.expressions[0]
+                raw_unit = fn_name.lower()
+
+        if col_node is not None and raw_unit:
+            unit_clean = str(raw_unit).strip().strip("'\"").lower()
+            if unit_clean.endswith("s") and unit_clean[:-1] in cls._TIME_UNIT_PRECEDENCE:
+                unit_clean = unit_clean[:-1]
+            if unit_clean in cls._TIME_UNIT_PRECEDENCE:
+                clean_col = exp.column(
+                    col_node.name, quoted=bool(getattr(col_node.this, "quoted", False))
+                )
+                return clean_col, unit_clean
+        return None
+
     def insert_overwrite_by_partition(
         self,
         table_name: TableName,
@@ -1100,28 +1249,72 @@ class DorisEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
     ) -> None:
         parsed_exprs, _ = self._parse_partition_expressions(partitioned_by)
-        raw_key_exprs: t.List[exp.Expr] = []
+        col_order: t.List[str] = []
+        col_to_expr: t.Dict[str, exp.Column] = {}
+        col_to_unit: t.Dict[str, t.Optional[str]] = {}
+
         for expr in parsed_exprs or partitioned_by:
             if isinstance(expr, exp.Column):
-                raw_key_exprs.append(expr)
-            else:
-                cols = list(expr.find_all(exp.Column))
-                if cols:
-                    raw_key_exprs.extend(cols)
-                else:
-                    raw_key_exprs.append(expr)
-        key_exprs: t.List[exp.Expr] = []
-        seen_cols: t.Set[str] = set()
-        for expr in raw_key_exprs:
-            if isinstance(expr, exp.Column):
                 col_lower = expr.name.lower()
-                if col_lower not in seen_cols:
-                    seen_cols.add(col_lower)
-                    key_exprs.append(
-                        exp.column(expr.name, quoted=bool(getattr(expr.this, "quoted", False)))
-                    )
+                if col_lower not in col_to_expr:
+                    col_order.append(col_lower)
+                col_to_expr[col_lower] = exp.column(
+                    expr.name, quoted=bool(getattr(expr.this, "quoted", False))
+                )
+                col_to_unit[col_lower] = None
+            elif isinstance(expr, exp.Identifier):
+                col_lower = expr.name.lower()
+                if col_lower not in col_to_expr:
+                    col_order.append(col_lower)
+                col_to_expr[col_lower] = exp.column(expr.name, quoted=bool(expr.quoted))
+                col_to_unit[col_lower] = None
+            elif (transform := self._extract_time_partition_transform(expr)) is not None:
+                col_expr, unit = transform
+                col_lower = col_expr.name.lower()
+                if col_lower not in col_to_expr:
+                    col_order.append(col_lower)
+                    col_to_expr[col_lower] = col_expr
+                    col_to_unit[col_lower] = unit
+                elif col_to_unit[col_lower] is not None:
+                    prev_unit = col_to_unit[col_lower]
+                    assert prev_unit is not None
+                    if self._TIME_UNIT_PRECEDENCE[unit] < self._TIME_UNIT_PRECEDENCE[prev_unit]:
+                        col_to_unit[col_lower] = unit
             else:
-                key_exprs.append(expr)
+                raise SQLMeshError(
+                    f"Doris insert_overwrite_by_partition does not support partition expression '{expr.sql(dialect=self.dialect)}'. "
+                    "Only column names and time-truncation transforms (DATE_TRUNC, TO_DATE, DATE, YEAR, MONTH, DAY, HOUR) are supported."
+                )
+
+        key_exprs: t.List[exp.Expr] = []
+        for col_lower in col_order:
+            col_expr = col_to_expr[col_lower]
+            col_unit = col_to_unit[col_lower]
+            if col_unit is None:
+                key_exprs.append(col_expr)
+            else:
+                key_exprs.append(
+                    exp.Anonymous(
+                        this="DATE_TRUNC",
+                        expressions=[col_expr, exp.Literal.string(col_unit)],
+                    )
+                )
+
+        target_table = exp.to_table(table_name)
+        if (
+            target_columns_to_types
+            and columns_to_types_all_known(target_columns_to_types)
+            and not self._is_iceberg_table(catalog_name=target_table.catalog)
+        ):
+            target_columns_to_types = self._reorder_olap_columns(
+                target_columns_to_types, {"partitioned_by": partitioned_by}
+            )
+            if source_columns:
+                source_col_set = set(source_columns)
+                source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                    c for c in source_columns if c not in target_columns_to_types
+                ]
+
         super().insert_overwrite_by_partition(
             table_name,
             query_or_df,
@@ -1311,6 +1504,14 @@ class DorisEngineAdapter(
                 normalized_keys.append(k)
             elif isinstance(k, exp.Identifier):
                 normalized_keys.append(exp.Column(this=k.copy()))
+            elif (transform := self._extract_time_partition_transform(k)) is not None:
+                col_expr, unit = transform
+                normalized_keys.append(
+                    exp.Anonymous(
+                        this="DATE_TRUNC",
+                        expressions=[col_expr, exp.Literal.string(unit)],
+                    )
+                )
             else:
                 return None
 
@@ -1556,6 +1757,10 @@ class DorisEngineAdapter(
         extra_conditions: t.List[exp.Expr],
     ) -> None:
         """Execute DELETE FROM ... USING (SELECT ...) in Doris, with literal batch fallback for DUPLICATE KEY/Iceberg."""
+        if any(self._extract_time_partition_transform(k) is not None for k in key_exprs):
+            self._delete_by_time_transform_keys(table_name, key_exprs, subquery, extra_conditions)
+            return
+
         target_table = exp.to_table(table_name)
         if self._is_iceberg_table(catalog_name=target_table.catalog):
             self._delete_by_literal_keys(table_name, key_exprs, subquery, extra_conditions)
@@ -1641,6 +1846,108 @@ class DorisEngineAdapter(
             pass
         return val
 
+    @staticmethod
+    def _to_delete_literal_expr(val: t.Any, *, is_ast_values: bool = False) -> exp.Expr:
+        if is_ast_values and isinstance(val, exp.Expr):
+            return val.copy()
+        if isinstance(val, (datetime.date, datetime.datetime, datetime.time)):
+            return exp.Literal.string(str(val))
+        if isinstance(val, Decimal):
+            return exp.Literal.number(str(val))
+        return exp.convert(val)
+
+    def _delete_by_time_transform_keys(
+        self,
+        table_name: TableName,
+        key_exprs: t.List[exp.Expr],
+        subquery: t.Union[exp.Subquery, exp.Select],
+        extra_conditions: t.Optional[t.List[exp.Expr]] = None,
+    ) -> None:
+        """Delete partition ranges for time-truncation partition keys (`DATE_TRUNC`, `DAY`, `MONTH`, `YEAR`, `HOUR`, `TO_DATE`)
+        using Doris-compatible half-open bare-column range predicates (`col >= <low> AND col < <high>`).
+        """
+        select_query = (
+            subquery.this.copy() if isinstance(subquery, exp.Subquery) else subquery.copy()
+        )
+        if not isinstance(select_query, exp.Select):
+            return
+
+        projections: t.List[exp.Expr] = []
+        for idx, k in enumerate(key_exprs):
+            transform = self._extract_time_partition_transform(k)
+            if transform is not None:
+                col_expr, unit = transform
+                trunc_expr = exp.Anonymous(
+                    this="DATE_TRUNC",
+                    expressions=[col_expr.copy(), exp.Literal.string(unit)],
+                )
+                upper_expr = exp.DateAdd(
+                    this=trunc_expr.copy(),
+                    expression=exp.Literal.number(1),
+                    unit=exp.var(unit.upper()),
+                )
+                projections.append(exp.alias_(trunc_expr, f"_low_{idx}", quoted=True))
+                projections.append(exp.alias_(upper_expr, f"_high_{idx}", quoted=True))
+            else:
+                col_expr = exp.column(k.name, quoted=bool(getattr(k.this, "quoted", False)))
+                projections.append(exp.alias_(col_expr, f"_val_{idx}", quoted=True))
+
+        select_query.set("expressions", projections)
+        select_query = select_query.distinct()
+        rows = self.fetchall(select_query, quote_identifiers=True)
+        if not rows or not isinstance(rows, (list, tuple)):
+            return
+
+        target_table = exp.to_table(table_name)
+        cleaned_extra_conditions: t.List[exp.Expr] = []
+        for extra in extra_conditions or []:
+            cleaned_extra = extra.copy()
+            for col in cleaned_extra.find_all(exp.Column):
+                if not col.find_ancestor(exp.Subquery, exp.Select) and (
+                    col.table and col.table.lower() == target_table.name.lower()
+                ):
+                    col.set("table", None)
+                    col.set("db", None)
+                    col.set("catalog", None)
+            cleaned_extra_conditions.append(cleaned_extra)
+
+        for row in rows:
+            predicates: t.List[exp.Expr] = []
+            pos = 0
+            for k in key_exprs:
+                transform = self._extract_time_partition_transform(k)
+                if transform is not None:
+                    col_expr, _ = transform
+                    target_col = exp.column(col_expr.name, quoted=True)
+                    low_val = self._sanitize_key_value(row[pos])
+                    high_val = self._sanitize_key_value(row[pos + 1])
+                    pos += 2
+                    if low_val is None or high_val is None:
+                        predicates.append(target_col.is_(exp.null()))
+                    else:
+                        predicates.append(
+                            exp.GTE(
+                                this=target_col.copy(),
+                                expression=self._to_delete_literal_expr(low_val),
+                            )
+                        )
+                        predicates.append(
+                            exp.LT(
+                                this=target_col.copy(),
+                                expression=self._to_delete_literal_expr(high_val),
+                            )
+                        )
+                else:
+                    target_col = exp.column(k.name, quoted=True)
+                    val = self._sanitize_key_value(row[pos])
+                    pos += 1
+                    if val is None:
+                        predicates.append(target_col.is_(exp.null()))
+                    else:
+                        predicates.append(target_col.eq(self._to_delete_literal_expr(val)))
+            predicates.extend(cleaned_extra_conditions)
+            self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
+
     def _delete_by_literal_keys(
         self,
         table_name: TableName,
@@ -1702,9 +2009,7 @@ class DorisEngineAdapter(
             return False
 
         def _to_expr(val: t.Any) -> exp.Expr:
-            if is_ast_values and isinstance(val, exp.Expr):
-                return val.copy()
-            return exp.convert(val)
+            return self._to_delete_literal_expr(val, is_ast_values=is_ast_values)
 
         if len(cols) == 1:
             col = cols[0]
@@ -1867,6 +2172,102 @@ class DorisEngineAdapter(
             exists=exists,
             table_description=table_description,
             column_descriptions=column_descriptions,
+            **kwargs,
+        )
+
+    def replace_query(
+        self,
+        table_name: TableName,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        supports_replace_table_override: t.Optional[bool] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        target_table = exp.to_table(table_name)
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=target_table.catalog,
+            table_properties=kwargs.get("table_properties"),
+        )
+        if (
+            not is_iceberg
+            and target_columns_to_types
+            and columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self._reorder_olap_columns(target_columns_to_types, kwargs)
+            if source_columns:
+                source_col_set = set(source_columns)
+                source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                    c for c in source_columns if c not in target_columns_to_types
+                ]
+        super().replace_query(
+            table_name,
+            query_or_df,
+            target_columns_to_types=target_columns_to_types,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            source_columns=source_columns,
+            supports_replace_table_override=supports_replace_table_override,
+            **kwargs,
+        )
+
+    def _scd_type_2(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        unique_key: t.Sequence[exp.Expr],
+        valid_from_col: exp.Column,
+        valid_to_col: exp.Column,
+        execution_time: t.Union[TimeLike, exp.Column],
+        invalidate_hard_deletes: bool = True,
+        updated_at_col: t.Optional[exp.Column] = None,
+        check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Expr]]] = None,
+        updated_at_as_valid_from: bool = False,
+        execution_time_as_valid_from: bool = False,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        truncate: bool = False,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        table = exp.to_table(target_table)
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=table.catalog,
+            table_properties=kwargs.get("table_properties"),
+        )
+        if (
+            not is_iceberg
+            and target_columns_to_types
+            and columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self._reorder_olap_columns(target_columns_to_types, kwargs)
+            if source_columns:
+                source_col_set = set(source_columns)
+                source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                    c for c in source_columns if c not in target_columns_to_types
+                ]
+        super()._scd_type_2(
+            target_table=target_table,
+            source_table=source_table,
+            unique_key=unique_key,
+            valid_from_col=valid_from_col,
+            valid_to_col=valid_to_col,
+            execution_time=execution_time,
+            invalidate_hard_deletes=invalidate_hard_deletes,
+            updated_at_col=updated_at_col,
+            check_columns=check_columns,
+            updated_at_as_valid_from=updated_at_as_valid_from,
+            execution_time_as_valid_from=execution_time_as_valid_from,
+            target_columns_to_types=target_columns_to_types,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            truncate=truncate,
+            source_columns=source_columns,
             **kwargs,
         )
 
@@ -2199,6 +2600,24 @@ class DorisEngineAdapter(
             )
         return False
 
+    def _infer_projection_type(self, proj: exp.Expr) -> exp.DataType:
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        inner = inner.unnest()
+        if isinstance(inner, (exp.Cast, exp.TryCast)) and isinstance(inner.to, exp.DataType):
+            return inner.to.copy()
+        if self._is_integer_indicator_projection(proj):
+            return exp.DataType.build("INT", dialect=self.dialect)
+        if isinstance(inner, exp.Literal):
+            if inner.is_int:
+                return exp.DataType.build("INT", dialect=self.dialect)
+            if inner.is_number:
+                return exp.DataType.build("DOUBLE", dialect=self.dialect)
+            if inner.is_string:
+                return exp.DataType.build("VARCHAR(255)", dialect=self.dialect)
+        if isinstance(inner, exp.Boolean):
+            return exp.DataType.build("BOOLEAN", dialect=self.dialect)
+        return exp.DataType.build("UNKNOWN")
+
     def _reorder_unannotated_ctas_query(
         self, expression: exp.Expr, kwargs: t.Dict[str, t.Any]
     ) -> exp.Expr:
@@ -2217,16 +2636,41 @@ class DorisEngineAdapter(
             }
             if proj_by_name and len(proj_by_name) == len(expression.expressions):
                 select_cols_to_types = {
-                    proj.alias_or_name: exp.DataType.build("UNKNOWN")
+                    proj.alias_or_name: self._infer_projection_type(proj)
                     for proj in expression.expressions
                 }
                 reordered_select_cols = self._reorder_olap_columns(select_cols_to_types, kwargs)
-                if list(reordered_select_cols) != list(select_cols_to_types):
+                order_changed = list(reordered_select_cols) != list(select_cols_to_types)
+                types_changed = any(
+                    reordered_select_cols[c] != select_cols_to_types[c]
+                    for c in reordered_select_cols
+                )
+                if order_changed or types_changed:
                     expression = expression.copy()
-                    expression.set(
-                        "expressions",
-                        [proj_by_name[c.lower()] for c in reordered_select_cols],
-                    )
+                    updated_projs: t.List[exp.Expr] = []
+                    for c, new_dtype in reordered_select_cols.items():
+                        proj = proj_by_name[c.lower()].copy()
+                        if types_changed and select_cols_to_types[c] != new_dtype:
+                            if isinstance(proj, exp.Alias) and isinstance(
+                                proj.this, (exp.Cast, exp.TryCast)
+                            ):
+                                proj.this.set("to", new_dtype.copy())
+                            elif isinstance(proj, (exp.Cast, exp.TryCast)):
+                                proj = exp.alias_(
+                                    exp.cast(proj.this.copy(), to=new_dtype.copy()),
+                                    c,
+                                    quoted=True,
+                                )
+                            elif isinstance(proj, exp.Alias):
+                                proj.set("this", exp.cast(proj.this.copy(), to=new_dtype.copy()))
+                            elif isinstance(proj, exp.Column):
+                                proj = exp.alias_(
+                                    exp.cast(proj.copy(), to=new_dtype.copy()),
+                                    proj.name,
+                                    quoted=bool(getattr(proj.this, "quoted", True)),
+                                )
+                        updated_projs.append(proj)
+                    expression.set("expressions", updated_projs)
             elif any(isinstance(proj, exp.Star) for proj in expression.expressions):
                 table_props = kwargs.get("table_properties") or {}
                 resolved_uk, resolved_dk, resolved_ak = self._resolve_table_type_and_keys(
@@ -2250,23 +2694,26 @@ class DorisEngineAdapter(
                             and cte.alias.lower() == target_cte_name
                             and isinstance(cte.this, exp.Select)
                             and len(cte.this.expressions) >= 2
-                            and not self._is_integer_indicator_projection(cte.this.expressions[0])
                         ):
-                            indicator_idx = next(
-                                (
-                                    idx
-                                    for idx, p in enumerate(cte.this.expressions)
-                                    if idx > 0 and self._is_integer_indicator_projection(p)
-                                ),
-                                None,
-                            )
-                            if indicator_idx is not None:
+                            indicator_projs = [
+                                p
+                                for p in cte.this.expressions
+                                if self._is_integer_indicator_projection(p)
+                            ]
+                            other_projs = [
+                                p
+                                for p in cte.this.expressions
+                                if not self._is_integer_indicator_projection(p)
+                            ]
+                            if (
+                                indicator_projs
+                                and list(cte.this.expressions[: len(indicator_projs)])
+                                != indicator_projs
+                            ):
                                 expression = expression.copy()
                                 copied_cte = expression.args["with_"].expressions[cte_idx]
                                 copied_select = copied_cte.this
-                                projs = list(copied_select.expressions)
-                                indicator_proj = projs.pop(indicator_idx)
-                                copied_select.set("expressions", [indicator_proj, *projs])
+                                copied_select.set("expressions", indicator_projs + other_projs)
                             break
         return expression
 
@@ -2383,6 +2830,14 @@ class DorisEngineAdapter(
         first_dtype = updated_types[col_names[0]]
         if not self._is_valid_olap_key_type(first_dtype):
             valid_col = next(
+                (
+                    c
+                    for c in col_names
+                    if self._is_valid_olap_key_type(updated_types[c])
+                    and not updated_types[c].is_type("unknown", "null")
+                ),
+                None,
+            ) or next(
                 (c for c in col_names if self._is_valid_olap_key_type(updated_types[c])),
                 None,
             )

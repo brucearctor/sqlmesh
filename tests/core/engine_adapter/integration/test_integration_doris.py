@@ -277,6 +277,51 @@ def test_auto_partition_and_insert_overwrite_by_partition(ctx: TestContext):
         (20, "2022-01-02", "b_updated"),
     ]
 
+    # Verify DATETIME partition overwrite deletes the entire day range even when timestamps differ
+    ts_table = ctx.table("test_auto_partition_ts")
+    ts_cols = {
+        "payload": exp.DataType.build("STRING", dialect="doris"),
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "ts": exp.DataType.build("DATETIME", dialect="doris"),
+    }
+    ts_partitioned_by = [parse_one("RANGE(DATE_TRUNC(ts, 'day'))", read="doris")]
+    ctx.engine_adapter.create_table(
+        ts_table,
+        ts_cols,
+        partitioned_by=ts_partitioned_by,
+        table_properties={"auto_partition": exp.Literal.string("true")},
+    )
+    ts_initial = pd.DataFrame(
+        [
+            {"payload": "d1", "id": 1, "ts": "2022-01-01 09:00:00"},
+            {"payload": "d2_morning", "id": 2, "ts": "2022-01-02 08:00:00"},
+            {"payload": "d2_evening", "id": 3, "ts": "2022-01-02 18:00:00"},
+        ]
+    )
+    ctx.engine_adapter.insert_append(
+        ts_table,
+        ctx.input_data(ts_initial, ts_cols),
+        target_columns_to_types=ts_cols,
+    )
+    ts_overwrite = pd.DataFrame(
+        [
+            {"payload": "d2_replaced", "id": 20, "ts": "2022-01-02 14:30:00"},
+        ]
+    )
+    ctx.engine_adapter.insert_overwrite_by_partition(
+        ts_table,
+        ctx.input_data(ts_overwrite, ts_cols),
+        partitioned_by=ts_partitioned_by,
+        target_columns_to_types=ts_cols,
+    )
+    ts_rows = ctx.engine_adapter.fetchall(
+        exp.select("id", "payload").from_(ts_table).order_by("id")
+    )
+    assert list(ts_rows) == [
+        (1, "d1"),
+        (20, "d2_replaced"),
+    ]
+
 
 def test_unique_key_order_by_and_key_reordering(ctx: TestContext):
     import pandas as pd  # noqa: TID253

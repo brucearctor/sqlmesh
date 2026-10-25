@@ -1125,6 +1125,11 @@ def test_insert_overwrite_by_partition_unwraps_wrappers_and_transforms(
         "_get_temp_table",
         return_value=exp.table_("__temp_tbl", db="db"),
     )
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[("2024-01-15 00:00:00", "2024-01-16 00:00:00")],
+    )
 
     adapter.insert_overwrite_by_partition(
         "db.events",
@@ -1143,11 +1148,29 @@ def test_insert_overwrite_by_partition_unwraps_wrappers_and_transforms(
         "DELETE FROM `db`.`events` WHERE DATE_TRUNC(`ds`, 'day') IN (SELECT DISTINCT DATE_TRUNC(`ds`, 'day') FROM `db`.`__temp_tbl`)"
         not in sql_calls
     )
-    assert any(
-        "SELECT DISTINCT `ds` FROM `db`.`__temp_tbl`" in call
-        or "USING (SELECT DISTINCT `ds` FROM `db`.`__temp_tbl`)" in call
-        for call in sql_calls
+    assert (
+        "SELECT DISTINCT DATE_TRUNC(`ds`, 'day') AS `_low_0`, DATE_ADD(DATE_TRUNC(`ds`, 'day'), INTERVAL 1 DAY) AS `_high_0` FROM `db`.`__temp_tbl`"
+        in sql_calls
     )
+    assert (
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-15 00:00:00' AND `ds` < '2024-01-16 00:00:00'"
+        in sql_calls
+    )
+
+    # Unsupported non-range partition transforms (e.g. BUCKET) raise a clear SQLMeshError
+    with pytest.raises(
+        SQLMeshError,
+        match="Doris insert_overwrite_by_partition does not support partition expression",
+    ):
+        adapter.insert_overwrite_by_partition(
+            "db.events",
+            parse_one("SELECT id, ds FROM db.src", read="doris"),
+            partitioned_by=[parse_one("BUCKET(16, id)", read="doris")],
+            target_columns_to_types={
+                "id": exp.DataType.build("INT"),
+                "ds": exp.DataType.build("DATETIME"),
+            },
+        )
 
 
 def test_sync_materialized_view_drop_and_replace(
@@ -1940,12 +1963,17 @@ def test_delete_tautology_and_union_subquery_and_dedup_partition_overwrite(
         "DELETE FROM `db`.`tbl` AS `_t1` USING (SELECT `other_id` + 1 AS `_col_0` FROM `db`.`a`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`_col_0`",
     ]
 
-    # 4. insert_overwrite_by_partition deduplicates columns and strips table qualifiers
+    # 4. insert_overwrite_by_partition deduplicates time transforms to finest unit (MONTH) and strips table qualifiers
     adapter.cursor.execute.reset_mock()
     mocker.patch.object(
         adapter,
         "_get_temp_table",
         return_value=exp.table_("__temp_tbl", db="db"),
+    )
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[("2024-01-01", "2024-02-01")],
     )
     adapter.insert_overwrite_by_partition(
         "db.events",
@@ -1960,10 +1988,13 @@ def test_delete_tautology_and_union_subquery_and_dedup_partition_overwrite(
         },
     )
     overwrite_calls = to_sql_calls(adapter)
-    assert any(
-        "DELETE FROM `db`.`events` AS `_t1` USING (SELECT DISTINCT `ds` FROM `db`.`__temp_tbl`) AS `_t2` WHERE `_t1`.`ds` = `_t2`.`ds`"
-        == call
-        for call in overwrite_calls
+    assert (
+        "SELECT DISTINCT DATE_TRUNC(`ds`, 'month') AS `_low_0`, DATE_ADD(DATE_TRUNC(`ds`, 'month'), INTERVAL 1 MONTH) AS `_high_0` FROM `db`.`__temp_tbl`"
+        in overwrite_calls
+    )
+    assert (
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2024-02-01'"
+        in overwrite_calls
     )
 
 
@@ -2447,7 +2478,7 @@ def test_is_bool_rewrites_negative_or_keys_union_delete_and_table_diff_ctas(
         "DELETE FROM `sqlmesh`.`_intervals` WHERE `id` = -1 AND `is_dev` IN (TRUE)",
         "DELETE FROM `sqlmesh`.`_intervals` WHERE `id` = -2 AND `is_dev` IN (FALSE)",
         "DELETE FROM `db`.`target_tbl` AS `_t1` USING (SELECT `a`.`id`, `b`.`id` AS `_col_1` FROM `db`.`a` AS `a` JOIN `db`.`b` AS `b` ON `a`.`id` = `b`.`id` UNION ALL SELECT `c`.`id`, `d`.`id` FROM `db`.`c` AS `c` JOIN `db`.`d` AS `d` ON `c`.`id` = `d`.`id`) AS `_t2` WHERE `_t1`.`k1` = `_t2`.`id` AND `_t1`.`k2` = `_t2`.`_col_1`",
-        "CREATE TABLE IF NOT EXISTS `sqlmesh_temp`.`diff` AS WITH `__source` AS (SELECT `s`.`name` AS `name`, `s`.`id` AS `__sqlmesh_join_key` FROM `db`.`src` AS `s`), `__target` AS (SELECT `t`.`name` AS `name`, `t`.`id` AS `__sqlmesh_join_key` FROM `db`.`tgt` AS `t`), `__stats` AS (SELECT CASE WHEN NOT `s`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `s_exists`, `s`.`name` AS `s__name`, `t`.`name` AS `t__name`, CASE WHEN NOT `t`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `t_exists` FROM `__source` AS `s` LEFT JOIN `__target` AS `t` ON `s`.`__sqlmesh_join_key` = `t`.`__sqlmesh_join_key`) SELECT *, CASE WHEN `s__name` = `t__name` THEN 1 ELSE 0 END AS `row_full_match` FROM `__stats`",
+        "CREATE TABLE IF NOT EXISTS `sqlmesh_temp`.`diff` AS WITH `__source` AS (SELECT `s`.`name` AS `name`, `s`.`id` AS `__sqlmesh_join_key` FROM `db`.`src` AS `s`), `__target` AS (SELECT `t`.`name` AS `name`, `t`.`id` AS `__sqlmesh_join_key` FROM `db`.`tgt` AS `t`), `__stats` AS (SELECT CASE WHEN NOT `s`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `s_exists`, CASE WHEN NOT `t`.`__sqlmesh_join_key` IS NULL THEN 1 ELSE 0 END AS `t_exists`, `s`.`name` AS `s__name`, `t`.`name` AS `t__name` FROM `__source` AS `s` LEFT JOIN `__target` AS `t` ON `s`.`__sqlmesh_join_key` = `t`.`__sqlmesh_join_key`) SELECT *, CASE WHEN `s__name` = `t__name` THEN 1 ELSE 0 END AS `row_full_match` FROM `__stats`",
     ]
 
     # 5. Unannotated 2-part/internal Iceberg CTAS raises a clear SQLMeshError instead of silently dropping ENGINE=iceberg
@@ -2762,3 +2793,190 @@ def test_time_range_delete_cast_unwrap_partition_key_prefix_scd_type_2_and_recon
         "SWITCH `iceberg_cat`",
         "SELECT 1",
     ]
+
+
+def test_thread_local_state_isolation_time_transform_partition_delete_table_diff_and_pm_features(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    from datetime import date, datetime
+    from decimal import Decimal
+    import threading
+    import pandas as pd
+    from sqlmesh.cli.project_init import InitCliMode, ProjectTemplate, _gen_config
+
+    adapter = make_mocked_engine_adapter(
+        DorisEngineAdapter, default_catalog="internal", database="analytics"
+    )
+    assert adapter.SUPPORTS_QUERY_EXECUTION_TRACKING is True
+
+    # 1. Thread-local state isolation for `_active_catalog`, `_needs_catalog_restore`, and
+    #    `_last_described_key_cols` across worker threads, `with_settings()`, and `pool.close()`.
+    adapter._active_catalog = "internal"
+    adapter._needs_catalog_restore = False
+    adapter._last_described_key_cols = {"main_key"}
+
+    cloned = t.cast(DorisEngineAdapter, adapter.with_settings(correlation_id="test_corr_id"))
+    assert cloned._active_catalog == "internal"
+    assert cloned._last_described_key_cols == {"main_key"}
+
+    worker_results: t.Dict[str, t.Any] = {}
+
+    def worker_fn() -> None:
+        worker_results["initial_cat"] = adapter._active_catalog
+        worker_results["initial_keys"] = set(adapter._last_described_key_cols)
+        adapter._active_catalog = "iceberg_worker"
+        adapter._needs_catalog_restore = True
+        adapter._last_described_key_cols = {"worker_key"}
+        worker_results["updated_cat"] = cloned._active_catalog
+        worker_results["updated_keys"] = set(cloned._last_described_key_cols)
+
+    thread = threading.Thread(target=worker_fn)
+    thread.start()
+    thread.join()
+
+    assert worker_results == {
+        "initial_cat": None,
+        "initial_keys": set(),
+        "updated_cat": "iceberg_worker",
+        "updated_keys": {"worker_key"},
+    }
+    # Main thread state was not overwritten by worker thread and survives connection pool close
+    adapter._connection_pool.close()
+    assert adapter._active_catalog == "internal"
+    assert adapter._needs_catalog_restore is False
+    assert adapter._last_described_key_cols == {"main_key"}
+
+    # 2. Reconnect in `_restore_active_catalog_on_reconnect` restores both `SWITCH <default_catalog>`
+    #    and `USE <database>` when `database` is configured on the default catalog.
+    adapter.cursor.execute.reset_mock()
+    adapter._needs_catalog_restore = True
+    adapter._restore_active_catalog_on_reconnect("SELECT 1")
+    assert to_sql_calls(adapter) == [
+        "SWITCH `internal`",
+        "USE `analytics`",
+    ]
+
+    # 3. TableDiff-style query with 4 integer indicators and DOUBLE/STRING user columns promotes all
+    #    indicators to the front of `__stats` (covering all 3 slots of `shortkey_max_column_count = 3`).
+    adapter.cursor.execute.reset_mock()
+    four_indicator_diff = parse_one(
+        "WITH `__stats` AS ("
+        "SELECT `s`.`score` AS `s__score`, `t`.`score` AS `t__score`, `s`.`bio` AS `s__bio`, "
+        "IF(NOT `s`.`k` IS NULL, 1, 0) AS `s_exists`, "
+        "IF(NOT `t`.`k` IS NULL, 1, 0) AS `t_exists`, "
+        "IF(NOT `s`.`k` IS NULL AND NOT `t`.`k` IS NULL, 1, 0) AS `row_joined`, "
+        "IF(`s`.`id` IS NULL AND `t`.`id` IS NULL, 1, 0) AS `null_grain` "
+        "FROM `db`.`s` LEFT JOIN `db`.`t` ON `s`.`k` = `t`.`k`"
+        ") SELECT *, CASE WHEN `s__score` = `t__score` THEN 1 ELSE 0 END AS `row_full_match` FROM `__stats`",
+        read="doris",
+    )
+    adapter.ctas("sqlmesh_temp.diff_4", four_indicator_diff)
+    diff_sql = to_sql_calls(adapter)[0]
+    assert (
+        "`__stats` AS (SELECT CASE WHEN NOT `s`.`k` IS NULL THEN 1 ELSE 0 END AS `s_exists`, "
+        "CASE WHEN NOT `t`.`k` IS NULL THEN 1 ELSE 0 END AS `t_exists`, "
+        "CASE WHEN NOT `s`.`k` IS NULL AND NOT `t`.`k` IS NULL THEN 1 ELSE 0 END AS `row_joined`, "
+        "CASE WHEN `s`.`id` IS NULL AND `t`.`id` IS NULL THEN 1 ELSE 0 END AS `null_grain`, "
+        "`s`.`score` AS `s__score`" in diff_sql
+    )
+
+    # 4. Non-star unannotated CTAS infers explicit CAST types (`DOUBLE`, `STRING`, `INT`) and
+    #    prefers known valid key columns (`id` INT) or coerces `STRING` to `VARCHAR(255)` at column 0.
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        "db.unannotated_cast_reordered",
+        parse_one(
+            "SELECT CAST(score AS DOUBLE) AS score, raw_col, CAST(id AS INT) AS id FROM db.src",
+            read="doris",
+        ),
+    )
+    adapter.ctas(
+        "db.unannotated_cast_string",
+        parse_one(
+            "SELECT CAST(score AS DOUBLE) AS score, CAST(label AS STRING) AS label FROM db.src",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`unannotated_cast_reordered` AS SELECT CAST(`id` AS INT) AS `id`, CAST(`score` AS DOUBLE) AS `score`, `raw_col` FROM `db`.`src`",
+        "CREATE TABLE IF NOT EXISTS `db`.`unannotated_cast_string` AS SELECT CAST(`label` AS VARCHAR(255)) AS `label`, CAST(`score` AS DOUBLE) AS `score` FROM `db`.`src`",
+    ]
+
+    # 5. `replace_query` on an existing table and `scd_type_2_by_column` when column 0 is `DOUBLE`
+    #    or `TEXT` reorder/coerce `target_columns_to_types` (and `source_columns`).
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "get_data_object",
+        return_value=DataObject(
+            catalog="internal", schema="db", name="existing_seed", type=DataObjectType.TABLE
+        ),
+    )
+    seed_df = pd.DataFrame([{"score": 9.5, "code": "us"}])
+    adapter.replace_query(
+        "db.existing_seed",
+        seed_df,
+        target_columns_to_types={
+            "score": exp.DataType.build("DOUBLE", dialect="doris"),
+            "code": exp.DataType.build("TEXT", dialect="doris"),
+        },
+        source_columns=["score", "code"],
+    )
+    replace_calls = to_sql_calls(adapter)
+    assert replace_calls == [
+        "TRUNCATE TABLE `db`.`existing_seed`",
+        "INSERT INTO `db`.`existing_seed` (`code`, `score`) SELECT CAST(`code` AS VARCHAR(255)) AS `code`, CAST(`score` AS DOUBLE) AS `score` FROM (SELECT 'us' AS `code`, 9.5 AS `score`) AS `t`",
+    ]
+
+    adapter.cursor.execute.reset_mock()
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="efgh5678")
+    adapter.scd_type_2_by_column(
+        target_table="db.scd_col_tbl",
+        source_table=t.cast(
+            exp.Select,
+            parse_one("SELECT score, id FROM db.src_tbl", read="doris"),
+        ),
+        unique_key=[exp.column("id")],
+        valid_from_col=exp.column("valid_from", quoted=True),
+        valid_to_col=exp.column("valid_to", quoted=True),
+        check_columns=[exp.column("score")],
+        target_columns_to_types={
+            "score": exp.DataType.build("DOUBLE", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "valid_from": exp.DataType.build("DATETIME", dialect="doris"),
+            "valid_to": exp.DataType.build("DATETIME", dialect="doris"),
+        },
+        execution_time=datetime(2024, 1, 2, 0, 0, 0),
+    )
+    scd_col_calls = to_sql_calls(adapter)
+    assert scd_col_calls[0].startswith(
+        "CREATE TABLE IF NOT EXISTS `db`.`scd_col_tbl` (`id` INT, `score` DOUBLE, `valid_from` DATETIME, `valid_to` DATETIME)"
+    )
+
+    # 6. `_delete_by_literal_keys` with Python `date`, `datetime`, and `Decimal` values from PyMySQL
+    #    emits plain string/number literals (`'2024-01-01'`, `12.5`) instead of `CAST('...' AS DATE)`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "fetchall",
+        return_value=[(date(2024, 1, 1), datetime(2024, 1, 1, 12, 30, 0), Decimal("12.50"))],
+    )
+    adapter._delete_by_literal_keys(
+        "db.typed_keys",
+        [exp.column("dt"), exp.column("ts"), exp.column("amt")],
+        parse_one("SELECT dt, ts, amt FROM db.staging", read="doris", into=exp.Select),
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`typed_keys` WHERE `dt` = '2024-01-01' AND `ts` = '2024-01-01 12:30:00' AND `amt` IN (12.50)"
+    ]
+
+    # 7. `sqlmesh init doris` generates a working `state_connection` block (`type: duckdb`).
+    doris_init_cfg = _gen_config(
+        engine_type="doris",
+        settings=None,
+        start="2024-01-01",
+        template=ProjectTemplate.DEFAULT,
+        cli_mode=InitCliMode.DEFAULT,
+    )
+    assert "state_connection:\n      type: duckdb\n      database: state.db" in doris_init_cfg
+    assert "dialect: doris" in doris_init_cfg

@@ -517,6 +517,22 @@ FROM raw.logs;
 
 ---
 
+## Supported Model Kinds & Catalog Matrix
+
+| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal`) | External Apache Iceberg Catalog (`table_format iceberg`) |
+| --- | :---: | :---: |
+| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) |
+| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`) |
+| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT`) | Supported (Batched key `DELETE` + `INSERT`) |
+| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` / partition `DELETE` + `INSERT`) |
+| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported |
+| `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) |
+| `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs |
+| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported |
+| `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported |
+
+---
+
 ## Migrating from `dbt-doris` or StarRocks
 
 If you are migrating an existing `dbt-doris` project or StarRocks SQLMesh models to Doris, map your configuration keys as follows:
