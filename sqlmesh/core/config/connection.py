@@ -2780,7 +2780,7 @@ class DorisConnectionConfig(ConnectionConfig):
             "charset": self.charset or "utf8mb4",
             "local_infile": False,
         }
-        if not self.ssl_disabled:
+        if not self.ssl_disabled and self.ssl is not False:
             ssl_config: t.Dict[str, t.Any] = (
                 dict(self.ssl) if isinstance(self.ssl, dict) else {}  # type: ignore[arg-type]
             )
@@ -2798,9 +2798,15 @@ class DorisConnectionConfig(ConnectionConfig):
                     ssl_config["check_hostname"] = False
             if self.ssl_verify_identity is not None:
                 ssl_config["check_hostname"] = bool(self.ssl_verify_identity)
+            verify_mode = ssl_config.get("verify_mode")
+            if verify_mode is False or (
+                isinstance(verify_mode, str)
+                and verify_mode.strip().lower() in ("false", "0", "no", "none")
+            ):
+                ssl_config["check_hostname"] = False
             if ssl_config:
                 kwargs["ssl"] = ssl_config
-            elif self.ssl is True:
+            elif self.ssl is True or (isinstance(self.ssl, dict) and len(self.ssl) == 0):
                 kwargs["ssl"] = {"check_hostname": False}
         return kwargs
 

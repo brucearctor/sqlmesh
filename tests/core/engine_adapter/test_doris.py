@@ -1,5 +1,6 @@
 import typing as t
 
+import pandas as pd  # noqa: TID253
 import pytest
 from pytest_mock.plugin import MockerFixture
 from sqlglot import expressions as exp
@@ -3758,3 +3759,426 @@ def test_nested_delete_and_mixed_union_time_transform_and_merge_text_preservatio
         "verify_mode": False,
         "check_hostname": False,
     }
+
+
+def test_doris_schema_tmp_shortening_across_fetchall_fetchdf_and_data_objects(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, patch_get_data_objects=False)
+    long_tmp_name = "temp_very_long_model_name_exceeding_sixty_four_characters_abcdefgh_schema_tmp"
+    assert len(long_tmp_name) > 64
+    short_tmp_name = adapter._shorten_schema_tmp_name(long_tmp_name)
+    assert len(short_tmp_name) <= 64
+    assert short_tmp_name.endswith("_schema_tmp")
+
+    # 1. `fetchall` / `_to_sql` rewrites Table, TableAlias, and Column.table qualifiers for >64-char `_schema_tmp`
+    mocker.patch.object(adapter.cursor, "fetchall", return_value=[(1,)])
+    query_with_qualifiers = parse_one(
+        f"SELECT `{long_tmp_name}`.`id` FROM `db`.`{long_tmp_name}` AS `{long_tmp_name}`",
+        read="doris",
+    )
+    assert adapter.fetchall(query_with_qualifiers) == [(1,)]
+    assert to_sql_calls(adapter) == [
+        f"SELECT `{short_tmp_name}`.`id` FROM `db`.`{short_tmp_name}` AS `{short_tmp_name}`"
+    ]
+
+    # 2. `fetchdf` (`_fetch_native_df`) normalizes >64-char `_schema_tmp` identifiers before `pd.read_sql_query`
+    mock_read_sql = mocker.patch(
+        "pandas.io.sql.read_sql_query",
+        return_value=pd.DataFrame({"id": [1]}),
+    )
+    df = adapter.fetchdf(query_with_qualifiers)
+    assert list(df["id"]) == [1]
+    assert (
+        mock_read_sql.call_args[0][0]
+        == f"SELECT `{short_tmp_name}`.`id` FROM `db`.`{short_tmp_name}` AS `{short_tmp_name}`"
+    )
+
+    # 3. `_get_data_objects` queries `information_schema.tables` using the shortened `_schema_tmp` name
+    #    and restores the caller's original unshortened name on the returned `DataObject`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[
+            [("db", short_tmp_name, "BASE TABLE")],
+            [],
+        ],
+    )
+    objs = adapter._get_data_objects("db", object_names={long_tmp_name})
+    assert len(objs) == 1
+    assert objs[0].name == long_tmp_name
+    query_arg = adapter.fetchall.call_args_list[0][0][0]
+    rendered_info_schema_sql = adapter._to_sql(query_arg)
+    assert short_tmp_name.lower() in rendered_info_schema_sql.lower()
+    assert long_tmp_name.lower() not in rendered_info_schema_sql.lower()
+
+
+def test_doris_delete_by_time_transform_validation_and_deduplication(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Non-YEAR date-part extract `MONTH(ds) IN (SELECT MONTH(src_ds) ...)` raises `SQLMeshError`
+    #    instead of silently deleting an entire calendar month.
+    with pytest.raises(
+        SQLMeshError,
+        match="cannot rewrite non-year date-part predicate",
+    ):
+        adapter.delete_from(
+            "db.events",
+            where=parse_one(
+                "MONTH(ds) IN (SELECT MONTH(src_ds) FROM db.staging)",
+                read="doris",
+            ),
+        )
+
+    # 2. Mismatched subquery time-transform unit (`DATE_TRUNC(ds, 'day') IN (SELECT YEAR(src_ds) ...)`)
+    #    raises `SQLMeshError`.
+    with pytest.raises(
+        SQLMeshError,
+        match="with mismatched subquery projection",
+    ):
+        adapter.delete_from(
+            "db.events",
+            where=parse_one(
+                "DATE_TRUNC(ds, 'day') IN (SELECT YEAR(src_ds) FROM db.staging)",
+                read="doris",
+            ),
+        )
+
+    # 3. `YEAR(ds) IN (SELECT ds FROM db.staging)` where `staging.ds` returns ISO date strings
+    #    in the same year parses the year prefix and deduplicates identical `DELETE` statements.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[("2024-05-10",), ("2024-08-20",)],
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "YEAR(ds) IN (SELECT ds FROM db.staging)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT `ds` AS `_val_0` FROM `db`.`staging`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+    ]
+
+
+def test_doris_replace_by_key_merge_and_partition_overwrite_edge_cases(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+
+    # 1. `insert_overwrite_by_partition` / `_replace_by_key` with `{"notes": TEXT, "region": VARCHAR(16)}`
+    #    and `partitioned_by=[region]` moves `region` to column 0 in the temp table so `notes` stays `STRING`
+    #    (never truncated to `VARCHAR(255)`).
+    adapter.insert_overwrite_by_partition(
+        table_name="db.notes_by_region",
+        query_or_df=parse_one("SELECT notes, region FROM db.src_notes", read="doris"),
+        partitioned_by=[exp.to_column("region")],
+        target_columns_to_types={
+            "notes": exp.DataType.build("TEXT", dialect="doris"),
+            "region": exp.DataType.build("VARCHAR(16)", dialect="doris"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE `db`.`__temp_notes_by_region_abcd1234` AS SELECT CAST(`region` AS VARCHAR(16)) AS `region`, CAST(`notes` AS STRING) AS `notes` FROM (SELECT `notes`, `region` FROM `db`.`src_notes`) AS `_subquery`",
+        "DELETE FROM `db`.`notes_by_region` AS `_t1` USING (SELECT DISTINCT `region` FROM `db`.`__temp_notes_by_region_abcd1234`) AS `_t2` WHERE `_t1`.`region` = `_t2`.`region`",
+        "INSERT INTO `db`.`notes_by_region` (`region`, `notes`) SELECT `region`, `notes` FROM `db`.`__temp_notes_by_region_abcd1234`",
+        "DROP TABLE IF EXISTS `db`.`__temp_notes_by_region_abcd1234`",
+    ]
+
+    # 2. `merge` when `target_columns_to_types` contains `UNKNOWN` falls back to `self.columns(target_table)`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "columns",
+        return_value={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "val": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+        },
+    )
+    adapter.merge(
+        target_table="db.unknown_cols_target",
+        source_table=parse_one("SELECT id, val FROM db.staging", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("UNKNOWN"),
+            "val": exp.DataType.build("UNKNOWN"),
+        },
+        unique_key=[exp.to_column("id")],
+    )
+    assert (
+        to_sql_calls(adapter)[0]
+        == "CREATE TABLE `db`.`__temp_unknown_cols_target_abcd1234` UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 AS SELECT CAST(`id` AS INT) AS `id`, CAST(`val` AS VARCHAR(64)) AS `val` FROM (SELECT `id`, `val` FROM `db`.`staging`) AS `_subquery`"
+    )
+
+    # 3. `merge` with 2-part table name and `table_format="iceberg"` routes to Iceberg `_replace_by_key`
+    #    (no OLAP `UNIQUE KEY` or `DISTRIBUTED BY` on the temp table, and literal-key DELETE instead of DELETE ... USING).
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[(10,)],
+    )
+    adapter.merge(
+        target_table="iceberg_db.events",
+        source_table=parse_one("SELECT id, payload FROM iceberg_db.staging", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "payload": exp.DataType.build("STRING", dialect="doris"),
+        },
+        unique_key=[exp.to_column("id")],
+        table_format="iceberg",
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE `iceberg_db`.`__temp_events_abcd1234` (`id` INT, `payload` STRING) ENGINE=iceberg",
+        "INSERT INTO `iceberg_db`.`__temp_events_abcd1234` (`id`, `payload`) SELECT CAST(`id` AS INT) AS `id`, CAST(`payload` AS STRING) AS `payload` FROM (SELECT `id`, `payload` FROM `iceberg_db`.`staging`) AS `_subquery`",
+        "SELECT DISTINCT `id` FROM `iceberg_db`.`__temp_events_abcd1234`",
+        "DELETE FROM `iceberg_db`.`events` WHERE `id` IN (10)",
+        "INSERT INTO `iceberg_db`.`events` (`id`, `payload`) SELECT `id`, `payload` FROM (SELECT `id` AS `id`, `payload` AS `payload`, ROW_NUMBER() OVER (PARTITION BY `id` ORDER BY `id`) AS _row_number FROM `iceberg_db`.`__temp_events_abcd1234`) AS _t WHERE _row_number = 1",
+        "DROP TABLE IF EXISTS `iceberg_db`.`__temp_events_abcd1234`",
+    ]
+
+    # 4. `insert_overwrite_by_time_partition` with DataFrame and `{"val": DOUBLE, "ds": DATE, "id": INT}`
+    #    reorders `target_columns_to_types` and `source_columns` so the temp table created by `_values_to_sql`
+    #    places a valid OLAP key column (`ds` / `id`) before `val DOUBLE`.
+    adapter.cursor.execute.reset_mock()
+    df = pd.DataFrame(
+        {
+            "val": [3.14],
+            "ds": ["2024-01-01"],
+            "id": [42],
+        }
+    )
+    adapter.insert_overwrite_by_time_partition(
+        table_name="db.metrics",
+        query_or_df=df,
+        start="2024-01-01",
+        end="2024-01-01",
+        time_formatter=lambda x, _: exp.Literal.string(str(x)),
+        time_column="ds",
+        target_columns_to_types={
+            "val": exp.DataType.build("DOUBLE", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+    )
+    time_part_calls = to_sql_calls(adapter)
+    assert time_part_calls == [
+        "DELETE FROM `db`.`metrics` WHERE `ds` >= '2024-01-01 00:00:00+00:00' AND `ds` <= '2024-01-01 23:59:59.999999+00:00'",
+        "INSERT INTO `db`.`metrics` (`ds`, `val`, `id`) SELECT `ds`, `val`, `id` FROM (SELECT CAST(`ds` AS DATE) AS `ds`, CAST(`val` AS DOUBLE) AS `val`, CAST(`id` AS INT) AS `id` FROM (SELECT '2024-01-01' AS `ds`, 3.14 AS `val`, 42 AS `id`) AS `t`) AS `_subquery` WHERE `ds` BETWEEN '2024-01-01 00:00:00+00:00' AND '2024-01-01 23:59:59.999999+00:00'",
+    ]
+
+
+def test_doris_unannotated_ctas_union_all_and_cte_column_reordering(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. `UNION ALL` where Branch 1 has `1 AS metric` (INT) and Branch 2 has `1.5 AS metric` (DOUBLE):
+    #    Doris widens `metric` to DOUBLE across the UNION, so `id` (INT across all branches) is promoted to col 0.
+    adapter.ctas(
+        table_name="db.union_metrics",
+        query_or_df=parse_one(
+            "SELECT 1 AS metric, 10 AS id UNION ALL SELECT 1.5 AS metric, 20 AS id",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`union_metrics` AS SELECT 10 AS `id`, 1 AS `metric` UNION ALL SELECT 20 AS `id`, 1.5 AS `metric`"
+    ]
+
+    # 2. CTE (`WITH agg AS (...) SELECT avg_score, id FROM agg`) propagates CTE column types to the outer SELECT
+    #    and reorders `id` before `avg_score` (`AVG` -> `DOUBLE`).
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        table_name="db.cte_explicit_cols",
+        query_or_df=parse_one(
+            "WITH agg AS (SELECT AVG(score) AS avg_score, CAST(id AS INT) AS id FROM db.src GROUP BY id) "
+            "SELECT avg_score, id FROM agg",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`cte_explicit_cols` AS WITH `agg` AS (SELECT AVG(`score`) AS `avg_score`, CAST(`id` AS INT) AS `id` FROM `db`.`src` GROUP BY `id`) SELECT `id`, `avg_score` FROM `agg`"
+    ]
+
+    # 3. CTE with `SELECT * FROM agg` reorders the inner CTE projection when the CTE starts with `AVG(score)`.
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        table_name="db.cte_star",
+        query_or_df=parse_one(
+            "WITH agg AS (SELECT AVG(score) AS avg_score, CAST(id AS INT) AS id FROM db.src GROUP BY id) "
+            "SELECT * FROM agg",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`cte_star` AS WITH `agg` AS (SELECT CAST(`id` AS INT) AS `id`, AVG(`score`) AS `avg_score` FROM `db`.`src` GROUP BY `id`) SELECT * FROM `agg`"
+    ]
+
+    # 4. `_reorder_olap_columns` prefers coercible `STRING` over `UNKNOWN` when column 0 is `DOUBLE`.
+    reordered_cols = adapter._reorder_olap_columns(
+        {
+            "metric": exp.DataType.build("DOUBLE", dialect="doris"),
+            "mystery": exp.DataType.build("UNKNOWN"),
+            "label": exp.DataType.build("STRING", dialect="doris"),
+        }
+    )
+    assert list(reordered_cols.keys()) == ["label", "metric", "mystery"]
+    assert reordered_cols["label"] == exp.DataType.build("VARCHAR(255)", dialect="doris")
+
+
+def test_doris_sync_mv_source_tables_persistence_and_isolation(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Creating a sync MV in `db1` and `db2` with the same view name does not collide,
+    #    survives `adapter.with_settings()`, and `drop_view` with `materialized_type='SYNC'`
+    #    (without `source_table` in `view_properties`) still finds the recorded base table.
+    adapter.create_view(
+        "db1.shared_mv",
+        parse_one("SELECT id, SUM(val) AS total FROM db1.orders GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+    adapter.create_view(
+        "db2.shared_mv",
+        parse_one("SELECT id, SUM(val) AS total FROM db2.events GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+
+    cloned_adapter = adapter.with_settings()
+    adapter.cursor.execute.reset_mock()
+    cloned_adapter.drop_view(
+        "db1.shared_mv",
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+    cloned_adapter.drop_view(
+        "db2.shared_mv",
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+    assert to_sql_calls(adapter) == [
+        "DROP MATERIALIZED VIEW IF EXISTS `db1`.`shared_mv` ON `db1`.`orders`",
+        "DROP MATERIALIZED VIEW IF EXISTS `db2`.`shared_mv` ON `db2`.`events`",
+    ]
+
+    # 2. Recreating a view name as an async MTMV pops any stale sync MV entry so subsequent
+    #    `drop_view(materialized=True)` emits `DROP MATERIALIZED VIEW IF EXISTS db1.shared_mv`.
+    adapter.create_view(
+        "db1.shared_mv",
+        parse_one("SELECT id, SUM(val) AS total FROM db1.orders GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+    adapter.create_view(
+        "db1.shared_mv",
+        parse_one("SELECT id, val FROM db1.orders", read="doris"),
+        replace=False,
+        materialized=True,
+    )
+    adapter.cursor.execute.reset_mock()
+    adapter.drop_view("db1.shared_mv", materialized=True)
+    assert to_sql_calls(adapter) == [
+        "DROP MATERIALIZED VIEW IF EXISTS `db1`.`shared_mv`",
+    ]
+
+
+def test_doris_reconnect_catalog_db_restore_union_star_delete_and_extra_or_conditions(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    class OperationalError(Exception):
+        pass
+
+    adapter = make_mocked_engine_adapter(
+        DorisEngineAdapter,
+        default_catalog=None,
+        database="analytics",
+    )
+
+    # 1. `set_current_catalog("internal")` restores `USE \`analytics\`` when `database` is configured.
+    adapter.set_current_catalog("iceberg_cat")
+    adapter.set_current_catalog("internal")
+    assert to_sql_calls(adapter) == [
+        "SWITCH `iceberg_cat`",
+        "SWITCH `internal`",
+        "USE `analytics`",
+    ]
+
+    # 2. When a query fails with an operational error and the reconnect's `SWITCH` also fails,
+    #    `_needs_catalog_restore` stays `True` until restoration succeeds on a subsequent call.
+    adapter.set_current_catalog("iceberg_cat")
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.execute.side_effect = [
+        OperationalError(2013, "Lost connection to MySQL server during query"),
+        OperationalError(2006, "MySQL server has gone away"),
+        None,
+        None,
+    ]
+    with pytest.raises(OperationalError, match="MySQL server has gone away"):
+        adapter.execute("SELECT 1")
+    assert adapter._needs_catalog_restore is True
+
+    adapter.execute("SELECT 1")
+    assert adapter._needs_catalog_restore is False
+    assert to_sql_calls(adapter) == [
+        "SELECT 1",
+        "SWITCH `iceberg_cat`",
+        "SWITCH `iceberg_cat`",
+        "SELECT 1",
+    ]
+
+    # 3. `delete_from` with `UNION ALL` where the second branch uses `SELECT *` expands/projects key columns
+    #    and slices extra trailing columns in `_delete_by_literal_keys`.
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.execute.side_effect = None
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[(101, "ignored_extra_col"), (102, "ignored_extra_col")],
+    )
+    adapter.delete_from(
+        "db.target",
+        where=parse_one(
+            "id IN (SELECT id FROM db.s1 UNION ALL SELECT * FROM db.s2)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT `id` FROM `db`.`s1` UNION ALL SELECT * FROM `db`.`s2`",
+        "DELETE FROM `db`.`target` WHERE `id` IN (101, 102)",
+    ]
+
+    # 4. Extra `OR` condition alongside `IN (SELECT ...)` (`id IN (SELECT id FROM db.s1) AND (status = 'a' OR status IS NULL)`)
+    #    on an Iceberg or literal-key delete path is distributed into separate `OR`-free `DELETE` statements so Doris does not
+    #    reject the `DELETE` with `WhereClause only supports compound predicate, binary predicate, is_null predicate or in predicate`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[(1,), (2,)],
+    )
+    adapter.delete_from(
+        "iceberg_cat.db.target",
+        where=parse_one(
+            "id IN (SELECT id FROM db.s1) AND (status = 'a' OR status IS NULL)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT `id` FROM `db`.`s1`",
+        "DELETE FROM `iceberg_cat`.`db`.`target` WHERE `id` IN (1, 2) AND `status` = 'a'",
+        "DELETE FROM `iceberg_cat`.`db`.`target` WHERE `id` IN (1, 2) AND `status` IS NULL",
+    ]

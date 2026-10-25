@@ -2578,9 +2578,61 @@ def test_doris(make_config):
         host="doris-fe",
         user="admin",
         ssl=False,
+        ssl_ca="/path/to/ca.pem",
         check_import=False,
     )
     assert "ssl" not in ssl_false_config._static_connection_kwargs
+
+    ssl_empty_dict_config = make_config(
+        type="doris",
+        host="doris-fe",
+        user="admin",
+        ssl={},
+        check_import=False,
+    )
+    assert ssl_empty_dict_config._static_connection_kwargs["ssl"] == {"check_hostname": False}
+
+    ssl_verify_cert_false_identity_true = make_config(
+        type="doris",
+        host="doris-fe",
+        user="admin",
+        ssl_ca="/path/to/ca.pem",
+        ssl_verify_cert=False,
+        ssl_verify_identity=True,
+        check_import=False,
+    )
+    assert ssl_verify_cert_false_identity_true._static_connection_kwargs["ssl"] == {
+        "ca": "/path/to/ca.pem",
+        "verify_mode": False,
+        "check_hostname": False,
+    }
+
+    ssl_dict_verify_mode_false = make_config(
+        type="doris",
+        host="doris-fe",
+        user="admin",
+        ssl={"ca": "/path/to/ca.pem", "verify_mode": False, "check_hostname": True},
+        check_import=False,
+    )
+    assert ssl_dict_verify_mode_false._static_connection_kwargs["ssl"] == {
+        "ca": "/path/to/ca.pem",
+        "verify_mode": False,
+        "check_hostname": False,
+    }
+
+    ssl_dict_verify_mode_none_str = make_config(
+        type="doris",
+        host="doris-fe",
+        user="admin",
+        ssl={"ca": "/path/to/ca.pem", "verify_mode": "none"},
+        ssl_verify_identity=True,
+        check_import=False,
+    )
+    assert ssl_dict_verify_mode_none_str._static_connection_kwargs["ssl"] == {
+        "ca": "/path/to/ca.pem",
+        "verify_mode": "none",
+        "check_hostname": False,
+    }
 
     with pytest.raises(ConfigError, match="Invalid Doris session variable name"):
         make_config(

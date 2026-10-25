@@ -42,6 +42,7 @@ from sqlmesh.utils.errors import SQLMeshError
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
     from sqlmesh.core.engine_adapter._typing import DF, QueryOrDF
+    from sqlmesh.core.model.kind import TimeColumn
     from sqlmesh.core.node import IntervalUnit
     from sqlmesh.core.schema_diff import TableAlterOperation
     from sqlmesh.utils.date import TimeLike
@@ -228,6 +229,24 @@ class DorisEngineAdapter(
         self._get_thread_state().last_described_key_cols = set(value)
 
     @property
+    def _sync_mv_source_tables(self) -> t.Dict[str, exp.Table]:
+        registry = getattr(self._connection_pool, "_doris_sync_mv_source_tables", None)
+        if not isinstance(registry, dict):
+            registry = self._extra_config.get("_doris_sync_mv_source_tables")
+            if not isinstance(registry, dict):
+                registry = getattr(self, "_doris_sync_mv_source_tables", None)
+                if not isinstance(registry, dict):
+                    registry = {}
+            self._doris_sync_mv_source_tables = registry
+            if isinstance(getattr(self, "_extra_config", None), dict):
+                self._extra_config["_doris_sync_mv_source_tables"] = registry
+            try:
+                setattr(self._connection_pool, "_doris_sync_mv_source_tables", registry)
+            except Exception:
+                pass
+        return registry
+
+    @property
     def catalog_support(self) -> CatalogSupport:
         return CatalogSupport.FULL_SUPPORT
 
@@ -249,25 +268,33 @@ class DorisEngineAdapter(
         self.execute(exp.Command(this="SWITCH", expression=catalog_sql))
         self._active_catalog = catalog
         self._needs_catalog_restore = False
+        database = self._extra_config.get("database")
+        default_cat = self.default_catalog or "internal"
+        if database and catalog.lower() == str(default_cat).lower():
+            db_sql = self._to_sql(exp.to_identifier(str(database), quoted=True))
+            self.execute(f"USE {db_sql}")
 
     def _restore_active_catalog_on_reconnect(self, sql: t.Optional[str] = None) -> None:
-        active_cat = self._active_catalog
-        self._needs_catalog_restore = False
-        if not active_cat:
+        active_cat = self._active_catalog or self.default_catalog
+        database = self._extra_config.get("database")
+        if not active_cat and not database:
+            self._needs_catalog_restore = False
             return
         if sql and re.match(
             r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*SWITCH\b",
             sql,
             flags=re.IGNORECASE | re.DOTALL,
         ):
+            self._needs_catalog_restore = False
             return
-        catalog_sql = self._to_sql(exp.to_identifier(active_cat, quoted=True))
-        self.cursor.execute(f"SWITCH {catalog_sql}")
-        database = self._extra_config.get("database")
+        if active_cat:
+            catalog_sql = self._to_sql(exp.to_identifier(active_cat, quoted=True))
+            self.cursor.execute(f"SWITCH {catalog_sql}")
         default_cat = self.default_catalog or "internal"
-        if database and active_cat.lower() == str(default_cat).lower():
+        if database and (not active_cat or active_cat.lower() == str(default_cat).lower()):
             db_sql = self._to_sql(exp.to_identifier(str(database), quoted=True))
             self.cursor.execute(f"USE {db_sql}")
+        self._needs_catalog_restore = False
 
     def _is_iceberg_table(
         self,
@@ -378,6 +405,8 @@ class DorisEngineAdapter(
     def _fetch_native_df(
         self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> DF:
+        if isinstance(query, exp.Expr):
+            query = self._normalize_schema_tmp_identifiers(query)
         if self._pre_ping:
             try:
                 self.ping()
@@ -385,10 +414,10 @@ class DorisEngineAdapter(
                 logger.info("Connection to the database was lost. Reconnecting...")
                 self._connection_pool.close()
                 self._needs_catalog_restore = True
-        self._connection_pool.get_cursor()
-        if getattr(self, "_needs_catalog_restore", False):
-            self._restore_active_catalog_on_reconnect()
         try:
+            self._connection_pool.get_cursor()
+            if getattr(self, "_needs_catalog_restore", False):
+                self._restore_active_catalog_on_reconnect()
             return super()._fetch_native_df(query, quote_identifiers=quote_identifiers)
         except Exception as e:
             err_code = e.args[0] if getattr(e, "args", None) else None
@@ -434,31 +463,28 @@ class DorisEngineAdapter(
         self._connection_pool.get().ping(reconnect=False)
 
     @classmethod
+    def _shorten_schema_tmp_name(cls, name: str) -> str:
+        max_len = cls.MAX_IDENTIFIER_LENGTH or 64
+        suffix = "_schema_tmp"
+        if len(name) > max_len and name.endswith(suffix):
+            digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+            prefix_len = max_len - len(suffix) - 9
+            return f"{name[:prefix_len]}_{digest}{suffix}"
+        return name
+
+    @classmethod
     def _normalize_schema_tmp_identifiers(cls, expression: exp.Expr) -> exp.Expr:
         max_len = cls.MAX_IDENTIFIER_LENGTH or 64
         suffix = "_schema_tmp"
-        changed = False
-        for tbl in expression.find_all(exp.Table):
-            if (
-                isinstance(tbl.this, exp.Identifier)
-                and len(tbl.name) > max_len
-                and tbl.name.endswith(suffix)
-            ):
-                if not changed:
-                    expression = expression.copy()
-                    changed = True
-                    break
-        if changed:
-            for tbl in expression.find_all(exp.Table):
-                if (
-                    isinstance(tbl.this, exp.Identifier)
-                    and len(tbl.name) > max_len
-                    and tbl.name.endswith(suffix)
-                ):
-                    digest = hashlib.md5(tbl.name.encode("utf-8")).hexdigest()[:8]
-                    prefix_len = max_len - len(suffix) - 9
-                    short_name = f"{tbl.name[:prefix_len]}_{digest}{suffix}"
-                    tbl.set("this", exp.to_identifier(short_name, quoted=bool(tbl.this.quoted)))
+        if not any(
+            len(ident.name) > max_len and ident.name.endswith(suffix)
+            for ident in expression.find_all(exp.Identifier)
+        ):
+            return expression
+        expression = expression.copy()
+        for ident in expression.find_all(exp.Identifier):
+            if len(ident.name) > max_len and ident.name.endswith(suffix):
+                ident.set("this", cls._shorten_schema_tmp_name(ident.name))
         return expression
 
     def execute(
@@ -516,9 +542,9 @@ class DorisEngineAdapter(
                 logger.info("Connection to the database was lost. Reconnecting...")
                 self._connection_pool.close()
                 self._needs_catalog_restore = True
-        if getattr(self, "_needs_catalog_restore", False):
-            self._restore_active_catalog_on_reconnect(sql)
         try:
+            if getattr(self, "_needs_catalog_restore", False):
+                self._restore_active_catalog_on_reconnect(sql)
             super()._execute(sql, track_rows_processed=track_rows_processed, **kwargs)
         except Exception as e:
             err_code = e.args[0] if getattr(e, "args", None) else None
@@ -772,8 +798,14 @@ class DorisEngineAdapter(
                 )
             )
         )
+        short_to_orig: t.Dict[str, str] = {}
         if object_names:
-            lowered_names = [name.lower() for name in object_names]
+            lowered_names: t.List[str] = []
+            for name in object_names:
+                short_name = self._shorten_schema_tmp_name(name)
+                if short_name != name:
+                    short_to_orig[short_name.lower()] = name
+                lowered_names.append(short_name.lower())
             query = query.where(exp.func("LOWER", exp.column("table_name")).isin(*lowered_names))
 
         result: t.List[DataObject] = []
@@ -781,6 +813,8 @@ class DorisEngineAdapter(
             try:
                 schema_str = _decoded_str(row_schema) if row_schema is not None else schema_exp.db
                 name_str = _decoded_str(table_name) if table_name is not None else "unknown"
+                if name_str.lower() in short_to_orig:
+                    name_str = short_to_orig[name_str.lower()]
                 obj_type = _decoded_str(table_type) if table_type is not None else "table"
 
                 upper_type = obj_type.upper()
@@ -1087,20 +1121,23 @@ class DorisEngineAdapter(
                 ),
                 quote_identifiers=self.QUOTE_IDENTIFIERS_IN_VIEWS,
             )
+            registry = self._sync_mv_source_tables
             if is_sync_mv and sync_source_tbl is not None:
-                registry = getattr(self, "_sync_mv_source_tables", None)
-                if registry is None:
-                    registry = {}
-                    self._sync_mv_source_tables = registry
-                registry[target_table.name.lower()] = sync_source_tbl.copy()
                 if target_table.db:
                     registry[f"{target_table.db.lower()}.{target_table.name.lower()}"] = (
                         sync_source_tbl.copy()
                     )
-                elif sync_source_tbl.db:
-                    registry[f"{sync_source_tbl.db.lower()}.{target_table.name.lower()}"] = (
-                        sync_source_tbl.copy()
-                    )
+                else:
+                    registry[target_table.name.lower()] = sync_source_tbl.copy()
+                    if sync_source_tbl.db:
+                        registry[f"{sync_source_tbl.db.lower()}.{target_table.name.lower()}"] = (
+                            sync_source_tbl.copy()
+                        )
+            elif not is_sync_mv:
+                if target_table.db:
+                    registry.pop(f"{target_table.db.lower()}.{target_table.name.lower()}", None)
+                else:
+                    registry.pop(target_table.name.lower(), None)
             build_mode = (
                 self._to_upper_str(view_properties["build"])
                 if view_properties and view_properties.get("build") is not None
@@ -1145,20 +1182,28 @@ class DorisEngineAdapter(
 
         view_properties = kwargs.pop("view_properties", None)
         sync_source_table: t.Any = None
+        is_explicit_async = False
         if materialized and view_properties:
             mat_type = self._extract_str_value(view_properties.get("materialized_type"))
             if mat_type and mat_type.upper() == "SYNC":
                 sync_source_table = view_properties.get("source_table")
-        elif materialized:
-            registry = getattr(self, "_sync_mv_source_tables", None) or {}
-            lookup_key = (
-                f"{target_table.db.lower()}.{target_table.name.lower()}"
-                if target_table.db
-                else target_table.name.lower()
-            )
-            sync_source_table = registry.get(lookup_key) or registry.get(target_table.name.lower())
+            elif mat_type and mat_type.upper() != "SYNC":
+                is_explicit_async = True
+        if materialized and sync_source_table is None and not is_explicit_async:
+            registry = self._sync_mv_source_tables
+            if target_table.db:
+                sync_source_table = registry.get(
+                    f"{target_table.db.lower()}.{target_table.name.lower()}"
+                )
+            else:
+                sync_source_table = registry.get(target_table.name.lower())
 
         if sync_source_table is not None:
+            registry = self._sync_mv_source_tables
+            if target_table.db:
+                registry.pop(f"{target_table.db.lower()}.{target_table.name.lower()}", None)
+            else:
+                registry.pop(target_table.name.lower(), None)
             view_table_sql = self._to_sql(target_table)
             source_tbl_exp = self._to_source_table(sync_source_table)
             # Unqualified synchronous materialized views require the source table's database
@@ -1506,12 +1551,64 @@ class DorisEngineAdapter(
                     c for c in source_columns if c not in target_columns_to_types
                 ]
 
-        super().insert_overwrite_by_partition(
+        if self.INSERT_OVERWRITE_STRATEGY.is_insert_overwrite:
+            super().insert_overwrite_by_partition(
+                table_name,
+                query_or_df,
+                key_exprs or partitioned_by,
+                target_columns_to_types=target_columns_to_types,
+                source_columns=source_columns,
+            )
+        else:
+            self._replace_by_key(
+                table_name,
+                query_or_df,
+                target_columns_to_types,
+                key_exprs or partitioned_by,
+                is_unique_key=False,
+                source_columns=source_columns,
+                **kwargs,
+            )
+
+    def insert_overwrite_by_time_partition(
+        self,
+        table_name: TableName,
+        query_or_df: QueryOrDF,
+        start: TimeLike,
+        end: TimeLike,
+        time_formatter: t.Callable[[TimeLike, t.Optional[t.Dict[str, exp.DataType]]], exp.Expr],
+        time_column: TimeColumn | exp.Expr | str,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        target_table = exp.to_table(table_name)
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=target_table.catalog,
+            table_properties=kwargs.get("table_properties"),
+        )
+        if (
+            not is_iceberg
+            and target_columns_to_types
+            and columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self._reorder_olap_columns(target_columns_to_types, kwargs)
+            if source_columns:
+                source_col_set = set(source_columns)
+                source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                    c for c in source_columns if c not in target_columns_to_types
+                ]
+        return super().insert_overwrite_by_time_partition(
             table_name,
             query_or_df,
-            key_exprs or partitioned_by,
+            start=start,
+            end=end,
+            time_formatter=time_formatter,
+            time_column=time_column,
             target_columns_to_types=target_columns_to_types,
             source_columns=source_columns,
+            **kwargs,
         )
 
     def delete_from(
@@ -1643,6 +1740,24 @@ class DorisEngineAdapter(
                     continue
             normalized.append(cond)
         return normalized
+
+    def _expand_or_free_extra_condition_sets(
+        self, extra_conditions: t.Sequence[exp.Expr]
+    ) -> t.List[t.List[exp.Expr]]:
+        condition_sets: t.List[t.List[exp.Expr]] = [[]]
+        for cond in extra_conditions:
+            disjuncts = [
+                self._normalize_single_boolean_conjunct(d) or d
+                for d in self._flatten_or_disjuncts(cond)
+            ]
+            if len(disjuncts) <= 1:
+                for cset in condition_sets:
+                    cset.extend(disjuncts)
+            else:
+                condition_sets = [
+                    [*cset, branch.copy()] for cset in condition_sets for branch in disjuncts
+                ]
+        return condition_sets
 
     @classmethod
     def _unwrap_literal_casts_in_where(cls, where: exp.Expr) -> exp.Expr:
@@ -1992,21 +2107,33 @@ class DorisEngineAdapter(
             return
 
         target_table = exp.to_table(table_name)
-        if self._is_iceberg_table(catalog_name=target_table.catalog):
+        if self._is_iceberg_table(catalog_name=target_table.catalog) or getattr(
+            self, "_in_iceberg_replace_by_key", False
+        ):
             self._delete_by_literal_keys(table_name, key_exprs, subquery, extra_conditions)
             return
 
         join_conditions: t.List[exp.Expr] = []
         orig_subquery = subquery.copy()
         subquery = subquery.copy()
-        first_select = subquery.this
-        while isinstance(first_select, exp.SetOperation):
-            first_select = first_select.this
-        if isinstance(first_select, exp.Select) and any(
-            isinstance(e, exp.Star) for e in first_select.expressions
+        subq_branches: t.List[exp.Select] = []
+
+        def _collect_subq_branches(node: t.Optional[exp.Expr]) -> None:
+            if isinstance(node, exp.SetOperation):
+                _collect_subq_branches(node.this)
+                _collect_subq_branches(node.expression)
+            elif isinstance(node, exp.Select):
+                subq_branches.append(node)
+
+        _collect_subq_branches(subquery.this)
+        if not subq_branches or any(
+            len(b.expressions) < len(key_exprs)
+            or any(isinstance(e, exp.Star) for e in b.expressions)
+            for b in subq_branches
         ):
             self._delete_by_literal_keys(table_name, key_exprs, orig_subquery, extra_conditions)
             return
+        first_select = subq_branches[0]
         used_t2_aliases: t.Set[str] = set()
         for idx, col in enumerate(key_exprs):
             col_name = col.name
@@ -2110,6 +2237,18 @@ class DorisEngineAdapter(
         """Delete partition ranges for time-truncation partition keys (`DATE_TRUNC`, `DAY`, `MONTH`, `YEAR`, `HOUR`, `TO_DATE`)
         using Doris-compatible half-open bare-column range predicates (`col >= <low> AND col < <high>`).
         """
+        for k in key_exprs:
+            k_transform = self._extract_time_partition_transform(k)
+            if (
+                k_transform is not None
+                and self._is_date_part_extract_fn(k)
+                and k_transform[1] != "year"
+            ):
+                raise SQLMeshError(
+                    f"Doris delete_from cannot rewrite non-year date-part predicate '{k.sql(dialect=self.dialect)}' "
+                    "into a contiguous range. Use DATE_TRUNC, TO_DATE, DATE, or YEAR instead."
+                )
+
         select_query = (
             subquery.this.copy() if isinstance(subquery, exp.Subquery) else subquery.copy()
         )
@@ -2137,16 +2276,20 @@ class DorisEngineAdapter(
                     is_extract_fn = self._is_date_part_extract_fn(k)
                     is_year_fn = unit == "year" and is_extract_fn
                     src_transform = self._extract_time_partition_transform(raw_sel)
-                    if src_transform is not None:
+                    if (
+                        src_transform is not None
+                        and src_transform[1] == unit
+                        and (not self._is_date_part_extract_fn(raw_sel) or unit == "year")
+                    ):
                         src_arg: exp.Expr = src_transform[0].copy()
                     elif is_year_fn:
                         raw_year_indices.add(idx)
                         projections.append(exp.alias_(raw_sel.copy(), f"_val_{idx}", quoted=True))
                         continue
-                    elif is_extract_fn:
+                    elif src_transform is not None or self._is_date_part_extract_fn(raw_sel):
                         raise SQLMeshError(
-                            f"Doris delete_from cannot rewrite date-part predicate '{k.sql(dialect=self.dialect)}' "
-                            f"with non-date subquery projection '{raw_sel.sql(dialect=self.dialect)}' into a contiguous range."
+                            f"Doris delete_from cannot rewrite time-partition predicate '{k.sql(dialect=self.dialect)}' "
+                            f"with mismatched subquery projection '{raw_sel.sql(dialect=self.dialect)}' into a contiguous range."
                         )
                     else:
                         src_arg = raw_sel.copy()
@@ -2198,9 +2341,16 @@ class DorisEngineAdapter(
                     unwrapped_indices.clear()
                     break
                 for idx in list(unwrapped_indices):
+                    expected_transform = self._extract_time_partition_transform(key_exprs[idx])
+                    expected_unit = expected_transform[1] if expected_transform else ""
                     sel_item = branch.expressions[idx]
                     raw_sel = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
-                    if self._extract_time_partition_transform(raw_sel) is None:
+                    src_transform = self._extract_time_partition_transform(raw_sel)
+                    if (
+                        src_transform is None
+                        or src_transform[1] != expected_unit
+                        or (self._is_date_part_extract_fn(raw_sel) and expected_unit != "year")
+                    ):
                         unwrapped_indices.discard(idx)
 
             if any(branch.args.get("group") for branch in all_branches) and (
@@ -2222,6 +2372,25 @@ class DorisEngineAdapter(
                         branch.set("group", None)
                     branch.set("expressions", branch_exprs)
 
+            for idx, k in enumerate(key_exprs):
+                transform = self._extract_time_partition_transform(k)
+                if transform is not None and idx not in unwrapped_indices:
+                    _, unit = transform
+                    is_year_fn = unit == "year" and self._is_date_part_extract_fn(k)
+                    if not is_year_fn:
+                        for branch in all_branches:
+                            if idx < len(branch.expressions):
+                                b_sel = branch.expressions[idx]
+                                b_raw = b_sel.this if isinstance(b_sel, exp.Alias) else b_sel
+                                b_trans = self._extract_time_partition_transform(b_raw)
+                                if self._is_date_part_extract_fn(b_raw) or (
+                                    b_trans is not None and b_trans[1] != unit
+                                ):
+                                    raise SQLMeshError(
+                                        f"Doris delete_from cannot rewrite time-partition predicate '{k.sql(dialect=self.dialect)}' "
+                                        f"with mismatched subquery projection '{b_raw.sql(dialect=self.dialect)}' into a contiguous range."
+                                    )
+
             new_first_exprs = list(first_select.expressions)
             for idx, sel_item in enumerate(new_first_exprs):
                 inner_expr = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
@@ -2239,11 +2408,6 @@ class DorisEngineAdapter(
                         raw_year_indices.add(idx)
                         projections.append(exp.alias_(sq_col, f"_val_{idx}", quoted=True))
                         continue
-                    if idx not in unwrapped_indices and is_extract_fn:
-                        raise SQLMeshError(
-                            f"Doris delete_from cannot rewrite date-part predicate '{k.sql(dialect=self.dialect)}' "
-                            "into a contiguous range when subquery branches return non-date expressions."
-                        )
                     trunc_expr = exp.Anonymous(
                         this="DATE_TRUNC",
                         expressions=[sq_col, exp.Literal.string(unit)],
@@ -2281,6 +2445,8 @@ class DorisEngineAdapter(
                     col.set("db", None)
                     col.set("catalog", None)
             cleaned_extra_conditions.append(cleaned_extra)
+        extra_condition_sets = self._expand_or_free_extra_condition_sets(cleaned_extra_conditions)
+        executed_delete_sqls: t.Set[str] = set()
 
         for row in rows:
             predicates: t.List[exp.Expr] = []
@@ -2296,11 +2462,17 @@ class DorisEngineAdapter(
                         if yr_val is None:
                             predicates.append(target_col.is_(exp.null()))
                         else:
-                            yr_int = (
-                                yr_val.year
-                                if isinstance(yr_val, (datetime.date, datetime.datetime))
-                                else int(yr_val)
-                            )
+                            if isinstance(yr_val, (datetime.date, datetime.datetime)):
+                                yr_int = yr_val.year
+                            elif isinstance(yr_val, str):
+                                yr_str = yr_val.strip()
+                                yr_int = (
+                                    int(yr_str[:4])
+                                    if len(yr_str) >= 4 and yr_str[:4].isdigit()
+                                    else int(yr_str)
+                                )
+                            else:
+                                yr_int = int(yr_val)
                             low_val: t.Any = f"{yr_int:04d}-01-01"
                             high_val: t.Any = f"{yr_int + 1:04d}-01-01"
                             predicates.append(
@@ -2342,8 +2514,12 @@ class DorisEngineAdapter(
                         predicates.append(target_col.is_(exp.null()))
                     else:
                         predicates.append(target_col.eq(self._to_delete_literal_expr(val)))
-            predicates.extend(cleaned_extra_conditions)
-            self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
+            for extra_set in extra_condition_sets:
+                delete_expr = exp.delete(table_name, where=exp.and_(*predicates, *extra_set))
+                delete_sql = self._to_sql(delete_expr)
+                if delete_sql not in executed_delete_sqls:
+                    executed_delete_sqls.add(delete_sql)
+                    self.execute(delete_expr)
 
     def _delete_by_literal_keys(
         self,
@@ -2361,7 +2537,12 @@ class DorisEngineAdapter(
         rows = self.fetchall(select_query, quote_identifiers=True)
         if not rows:
             return
-        sanitized_rows = [tuple(self._sanitize_key_value(v) for v in row) for row in rows]
+        num_keys = len(key_exprs)
+        sanitized_rows = [
+            tuple(self._sanitize_key_value(v) for v in row[:num_keys])
+            for row in rows
+            if len(row) >= num_keys
+        ]
         self._delete_key_rows(
             table_name,
             key_exprs,
@@ -2394,7 +2575,7 @@ class DorisEngineAdapter(
                     col.set("db", None)
                     col.set("catalog", None)
             cleaned_extra_conditions.append(cleaned_extra)
-        extra_conditions = cleaned_extra_conditions
+        extra_condition_sets = self._expand_or_free_extra_condition_sets(cleaned_extra_conditions)
         cols = [exp.column(k.name, quoted=True) for k in key_exprs]
         batch_size = self.DEFAULT_BATCH_SIZE
 
@@ -2425,12 +2606,14 @@ class DorisEngineAdapter(
 
             for i in range(0, len(non_null_vals), batch_size):
                 batch = non_null_vals[i : i + batch_size]
-                predicates: t.List[exp.Expr] = [col.isin(*batch), *extra_conditions]
-                self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
+                for extra_set in extra_condition_sets:
+                    predicates: t.List[exp.Expr] = [col.isin(*batch), *extra_set]
+                    self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
 
             if has_null:
-                predicates = [col.is_(exp.null()), *extra_conditions]
-                self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
+                for extra_set in extra_condition_sets:
+                    predicates = [col.is_(exp.null()), *extra_set]
+                    self.execute(exp.delete(table_name, where=exp.and_(*predicates)))
             return
 
         # Composite key (N >= 2): dynamically select the column index to batch via IN (...)
@@ -2457,12 +2640,14 @@ class DorisEngineAdapter(
 
             for i in range(0, len(non_null_batch), batch_size):
                 batch = non_null_batch[i : i + batch_size]
-                preds = [*prefix_preds, batch_col.isin(*batch), *extra_conditions]
-                self.execute(exp.delete(table_name, where=exp.and_(*preds)))
+                for extra_set in extra_condition_sets:
+                    preds = [*prefix_preds, batch_col.isin(*batch), *extra_set]
+                    self.execute(exp.delete(table_name, where=exp.and_(*preds)))
 
             if has_null_batch:
-                preds = [*prefix_preds, batch_col.is_(exp.null()), *extra_conditions]
-                self.execute(exp.delete(table_name, where=exp.and_(*preds)))
+                for extra_set in extra_condition_sets:
+                    preds = [*prefix_preds, batch_col.is_(exp.null()), *extra_set]
+                    self.execute(exp.delete(table_name, where=exp.and_(*preds)))
 
     @classmethod
     def _resolve_table_type_and_keys(
@@ -2621,6 +2806,32 @@ class DorisEngineAdapter(
             **kwargs,
         )
 
+    def merge(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        unique_key: t.Sequence[exp.Expr],
+        when_matched: t.Optional[exp.Whens] = None,
+        merge_filter: t.Optional[exp.Expr] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        if when_matched or merge_filter:
+            prop = "when_matched" if when_matched else "merge_filter"
+            raise SQLMeshError(
+                f"This engine does not support MERGE expressions and therefore `{prop}` is not supported."
+            )
+        self._replace_by_key(
+            target_table,
+            source_table,
+            target_columns_to_types,
+            unique_key,
+            is_unique_key=True,
+            source_columns=source_columns,
+            **kwargs,
+        )
+
     def _replace_by_key(
         self,
         target_table: TableName,
@@ -2629,26 +2840,41 @@ class DorisEngineAdapter(
         key: t.Sequence[exp.Expr],
         is_unique_key: bool,
         source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
     ) -> None:
-        if target_columns_to_types is None:
+        if not target_columns_to_types or not columns_to_types_all_known(target_columns_to_types):
             target_columns_to_types = self.columns(target_table)
 
         table = exp.to_table(target_table)
-        is_iceberg = self._is_iceberg_table(catalog_name=table.catalog)
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=table.catalog,
+            table_properties=kwargs.get("table_properties"),
+        )
+        normalized_key: t.List[exp.Expr] = [
+            exp.column(k.name, quoted=bool(k.quoted)) if isinstance(k, exp.Identifier) else k
+            for k in key
+        ]
         key_cols: t.List[exp.Column] = []
-        if is_unique_key and all(isinstance(k, (exp.Column, exp.Identifier)) for k in key):
-            key_cols = [exp.column(k.name) for k in key]
+        if is_unique_key and all(isinstance(k, exp.Column) for k in normalized_key):
+            key_cols = [exp.column(k.name) for k in normalized_key]
 
         temp_table_props: t.Optional[t.Dict[str, t.Any]] = None
-        if not is_iceberg and key_cols:
-            temp_table_props = {
-                "unique_key": (
-                    key_cols[0] if len(key_cols) == 1 else exp.Tuple(expressions=key_cols)
-                )
-            }
+        if not is_iceberg:
+            if key_cols:
+                temp_table_props = {
+                    "unique_key": (
+                        key_cols[0] if len(key_cols) == 1 else exp.Tuple(expressions=key_cols)
+                    )
+                }
             if target_columns_to_types and columns_to_types_all_known(target_columns_to_types):
+                reorder_kwargs: t.Dict[str, t.Any] = (
+                    {"table_properties": temp_table_props}
+                    if temp_table_props
+                    else ({"partitioned_by": list(normalized_key)} if normalized_key else {})
+                )
                 target_columns_to_types = self._reorder_olap_columns(
-                    target_columns_to_types, {"table_properties": temp_table_props}
+                    target_columns_to_types, reorder_kwargs
                 )
                 if source_columns:
                     source_col_set = set(source_columns)
@@ -2658,9 +2884,9 @@ class DorisEngineAdapter(
 
         temp_table = self._get_temp_table(target_table)
         key_exp = (
-            exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", *key, dialect=self.dialect)
-            if len(key) > 1
-            else key[0]
+            exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", *normalized_key, dialect=self.dialect)
+            if len(normalized_key) > 1
+            else normalized_key[0]
         )
         column_names = list(target_columns_to_types or [])
 
@@ -2672,6 +2898,7 @@ class DorisEngineAdapter(
                 exists=False,
                 source_columns=source_columns,
                 table_properties=temp_table_props,
+                table_format=kwargs.get("table_format"),
             )
 
             try:
@@ -2680,7 +2907,7 @@ class DorisEngineAdapter(
                 if not is_unique_key:
                     delete_query = delete_query.distinct()
                 else:
-                    insert_query = insert_query.distinct(*key)
+                    insert_query = insert_query.distinct(*normalized_key)
 
                 insert_statement = exp.insert(
                     insert_query,
@@ -2690,7 +2917,12 @@ class DorisEngineAdapter(
                 delete_filter = key_exp.isin(query=delete_query)
 
                 if not self.INSERT_OVERWRITE_STRATEGY.is_replace_where:
-                    self.delete_from(target_table, delete_filter)
+                    prev_iceberg_ctx = getattr(self, "_in_iceberg_replace_by_key", False)
+                    self._in_iceberg_replace_by_key = is_iceberg
+                    try:
+                        self.delete_from(target_table, delete_filter)
+                    finally:
+                        self._in_iceberg_replace_by_key = prev_iceberg_ctx
                 else:
                     insert_statement.set("where", delete_filter)
                     insert_statement.set("this", exp.to_table(target_table))
@@ -3145,9 +3377,13 @@ class DorisEngineAdapter(
             )
         return False
 
-    def _infer_projection_type(self, proj: exp.Expr) -> exp.DataType:
+    def _infer_projection_type(
+        self, proj: exp.Expr, cte_types: t.Optional[t.Dict[str, exp.DataType]] = None
+    ) -> exp.DataType:
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         inner = inner.unnest()
+        if isinstance(inner, exp.Column) and cte_types and inner.name.lower() in cte_types:
+            return cte_types[inner.name.lower()].copy()
         if isinstance(inner, (exp.Cast, exp.TryCast)) and isinstance(inner.to, exp.DataType):
             return inner.to.copy()
         if self._is_integer_indicator_projection(proj):
@@ -3233,8 +3469,21 @@ class DorisEngineAdapter(
         return exp.DataType.build("UNKNOWN")
 
     def _reorder_unannotated_ctas_query(
-        self, expression: exp.Expr, kwargs: t.Dict[str, t.Any]
+        self,
+        expression: exp.Expr,
+        kwargs: t.Dict[str, t.Any],
+        cte_types: t.Optional[t.Dict[str, exp.DataType]] = None,
     ) -> exp.Expr:
+        cte_col_types: t.Dict[str, exp.DataType] = dict(cte_types or {})
+        with_node = expression.args.get("with_")
+        if isinstance(with_node, exp.With):
+            for cte_item in with_node.expressions:
+                if isinstance(cte_item, exp.CTE) and isinstance(cte_item.this, exp.Select):
+                    for cte_proj in cte_item.this.expressions:
+                        if cte_proj.alias_or_name and not isinstance(cte_proj, exp.Star):
+                            inferred_cte_t = self._infer_projection_type(cte_proj, cte_col_types)
+                            if inferred_cte_t.this != exp.DataType.Type.UNKNOWN:
+                                cte_col_types[cte_proj.alias_or_name.lower()] = inferred_cte_t
         if isinstance(expression, exp.SetOperation):
             expression = expression.copy()
             branches: t.List[exp.Select] = []
@@ -3270,13 +3519,34 @@ class DorisEngineAdapter(
                 orig_names = [p.alias_or_name for p in first_exprs]
                 merged_cols_to_types: t.Dict[str, exp.DataType] = {}
                 for col_idx, col_name in enumerate(orig_names):
-                    inferred = exp.DataType.build("UNKNOWN")
-                    for b in branches:
-                        cand = self._infer_projection_type(b.expressions[col_idx])
-                        if cand.this != exp.DataType.Type.UNKNOWN:
-                            inferred = cand
-                            break
-                    merged_cols_to_types[col_name] = inferred
+                    branch_cands = [
+                        cand
+                        for b in branches
+                        if (
+                            cand := self._infer_projection_type(
+                                b.expressions[col_idx], cte_col_types
+                            )
+                        ).this
+                        != exp.DataType.Type.UNKNOWN
+                    ]
+                    non_coercible_invalid = next(
+                        (
+                            c
+                            for c in branch_cands
+                            if not self._is_valid_olap_key_type(c)
+                            and not self._is_coercible_string_key_type(c)
+                        ),
+                        None,
+                    )
+                    coercible_str = next(
+                        (c for c in branch_cands if self._is_coercible_string_key_type(c)),
+                        None,
+                    )
+                    merged_cols_to_types[col_name] = (
+                        non_coercible_invalid
+                        or coercible_str
+                        or (branch_cands[0] if branch_cands else exp.DataType.build("UNKNOWN"))
+                    )
                 reordered_select_cols = self._reorder_olap_columns(merged_cols_to_types, kwargs)
                 perm = [orig_names.index(c) for c in reordered_select_cols]
                 coercions = {
@@ -3322,9 +3592,13 @@ class DorisEngineAdapter(
                             updated_branch_projs.append(proj)
                         branch.set("expressions", updated_branch_projs)
                 return expression
-            expression.set("this", self._reorder_unannotated_ctas_query(expression.this, kwargs))
             expression.set(
-                "expression", self._reorder_unannotated_ctas_query(expression.expression, kwargs)
+                "this",
+                self._reorder_unannotated_ctas_query(expression.this, kwargs, cte_col_types),
+            )
+            expression.set(
+                "expression",
+                self._reorder_unannotated_ctas_query(expression.expression, kwargs, cte_col_types),
             )
             return expression
         if isinstance(expression, exp.Select):
@@ -3335,7 +3609,7 @@ class DorisEngineAdapter(
             }
             if proj_by_name and len(proj_by_name) == len(expression.expressions):
                 select_cols_to_types = {
-                    proj.alias_or_name: self._infer_projection_type(proj)
+                    proj.alias_or_name: self._infer_projection_type(proj, cte_col_types)
                     for proj in expression.expressions
                 }
                 reordered_select_cols = self._reorder_olap_columns(select_cols_to_types, kwargs)
@@ -3381,8 +3655,7 @@ class DorisEngineAdapter(
                 with_clause = expression.args.get("with_")
                 from_clause = expression.args.get("from_")
                 if (
-                    not has_explicit_key
-                    and isinstance(with_clause, exp.With)
+                    isinstance(with_clause, exp.With)
                     and isinstance(from_clause, exp.From)
                     and isinstance(from_clause.this, exp.Table)
                 ):
@@ -3405,7 +3678,8 @@ class DorisEngineAdapter(
                                 if not self._is_integer_indicator_projection(p)
                             ]
                             if (
-                                indicator_projs
+                                not has_explicit_key
+                                and indicator_projs
                                 and list(cte.this.expressions[: len(indicator_projs)])
                                 != indicator_projs
                             ):
@@ -3413,6 +3687,18 @@ class DorisEngineAdapter(
                                 copied_cte = expression.args["with_"].expressions[cte_idx]
                                 copied_select = copied_cte.this
                                 copied_select.set("expressions", indicator_projs + other_projs)
+                            elif (
+                                len(expression.expressions) == 1
+                                and isinstance(expression.expressions[0], exp.Star)
+                                and not expression.args.get("joins")
+                            ):
+                                reordered_cte_sel = self._reorder_unannotated_ctas_query(
+                                    cte.this, kwargs, cte_col_types
+                                )
+                                if reordered_cte_sel != cte.this:
+                                    expression = expression.copy()
+                                    copied_cte = expression.args["with_"].expressions[cte_idx]
+                                    copied_cte.set("this", reordered_cte_sel)
                             break
         return expression
 
@@ -3428,8 +3714,9 @@ class DorisEngineAdapter(
     def _reorder_olap_columns(
         self,
         target_columns_to_types: t.Dict[str, exp.DataType],
-        kwargs: t.Dict[str, t.Any],
+        kwargs: t.Optional[t.Dict[str, t.Any]] = None,
     ) -> t.Dict[str, exp.DataType]:
+        kwargs = kwargs or {}
         table_props = kwargs.get("table_properties") or {}
         if table_props.get("primary_key") is not None or kwargs.get("primary_key") is not None:
             raise SQLMeshError(
@@ -3565,7 +3852,7 @@ class DorisEngineAdapter(
 
         first_dtype = updated_types[col_names[0]]
         if not self._is_valid_olap_key_type(first_dtype):
-            valid_col = next(
+            known_valid_col = next(
                 (
                     c
                     for c in col_names
@@ -3573,23 +3860,25 @@ class DorisEngineAdapter(
                     and not updated_types[c].is_type("unknown", "null")
                 ),
                 None,
-            ) or next(
+            )
+            coercible_col = next(
+                (c for c in col_names if self._is_coercible_string_key_type(updated_types[c])),
+                None,
+            )
+            unknown_valid_col = next(
                 (c for c in col_names if self._is_valid_olap_key_type(updated_types[c])),
                 None,
             )
-            if valid_col:
-                col_names = [valid_col] + [c for c in col_names if c != valid_col]
-            else:
-                coercible_col = next(
-                    (c for c in col_names if self._is_coercible_string_key_type(updated_types[c])),
-                    None,
+            if known_valid_col:
+                col_names = [known_valid_col] + [c for c in col_names if c != known_valid_col]
+            elif coercible_col:
+                updated_types[coercible_col] = exp.DataType.build(
+                    "VARCHAR(255)", dialect=self.dialect
                 )
-                if coercible_col:
-                    updated_types[coercible_col] = exp.DataType.build(
-                        "VARCHAR(255)", dialect=self.dialect
-                    )
-                    if col_names[0] != coercible_col:
-                        col_names = [coercible_col] + [c for c in col_names if c != coercible_col]
+                if col_names[0] != coercible_col:
+                    col_names = [coercible_col] + [c for c in col_names if c != coercible_col]
+            elif unknown_valid_col:
+                col_names = [unknown_valid_col] + [c for c in col_names if c != unknown_valid_col]
 
         # Ensure OLAP partition/time columns are included in Doris's implicit DUPLICATE KEY prefix:
         # Doris stops implicit key inference at the first non-keyable column, immediately after the
@@ -4353,6 +4642,7 @@ class DorisEngineAdapter(
         return None
 
     def _to_sql(self, expression: exp.Expr, quote: bool = True, **kwargs: t.Any) -> str:
+        expression = self._normalize_schema_tmp_identifiers(expression)
         if expression.find(exp.Lock):
             expression = expression.copy()
             for select_node in expression.find_all(exp.Select):
