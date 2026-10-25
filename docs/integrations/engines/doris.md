@@ -18,6 +18,26 @@ This page describes SQLMesh support for the [Apache Doris](https://doris.apache.
 pip install "sqlmesh[doris]"
 ```
 
+### 5-Minute Quickstart
+
+1. **Initialize a new Doris project** (generates `config.yaml` with `dialect: doris` and a local DuckDB `state_connection`):
+   ```bash
+   mkdir doris_demo && cd doris_demo
+   sqlmesh init doris
+   ```
+2. **Single-BE Docker / Local Dev Tip**: Doris defaults to `replication_num = 3`. When running against a single-BE Docker container, set `replication_num = 1` in `model_defaults.physical_properties` inside `config.yaml`:
+   ```yaml
+   model_defaults:
+     dialect: doris
+     start: 2024-01-01
+     physical_properties:
+       replication_num: 1
+   ```
+3. **Plan and apply**:
+   ```bash
+   sqlmesh plan
+   ```
+
 ### Connection options
 
 | Option | Description | Type | Required |
@@ -48,34 +68,60 @@ pip install "sqlmesh[doris]"
 
 ### Connection configuration example
 
-```yaml
-gateways:
-  doris:
-    connection:
-      type: doris
-      host: fe.doris.cluster
-      port: 9030
-      user: doris_user
-      password: {{ env_var('DORIS_PASSWORD') }}
-      database: analytics
-      catalog: internal
-      connect_timeout: 30
-      session_variables:
-        workload_group: etl_group
-        query_timeout: 3600
-    state_connection:
-      type: postgres
-      host: state-db.internal
-      port: 5432
-      user: sqlmesh
-      password: {{ env_var('POSTGRES_PASSWORD') }}
-      database: sqlmesh_state
+=== "Local Development (DuckDB State)"
 
-default_gateway: doris
+    ```yaml
+    gateways:
+      doris:
+        connection:
+          type: doris
+          host: 127.0.0.1
+          port: 9030
+          user: root
+          password: ""
+          database: analytics
+        state_connection:
+          type: duckdb
+          database: state.db
 
-model_defaults:
-  dialect: doris
-```
+    default_gateway: doris
+
+    model_defaults:
+      dialect: doris
+      physical_properties:
+        replication_num: 1
+    ```
+
+=== "Production (Postgres / MySQL State)"
+
+    ```yaml
+    gateways:
+      doris:
+        connection:
+          type: doris
+          host: fe.doris.cluster
+          port: 9030
+          user: doris_user
+          password: {{ env_var('DORIS_PASSWORD') }}
+          database: analytics
+          catalog: internal
+          connect_timeout: 30
+          session_variables:
+            workload_group: etl_group
+            query_timeout: 3600
+        state_connection:
+          type: postgres
+          host: state-db.internal
+          port: 5432
+          user: sqlmesh
+          password: {{ env_var('POSTGRES_PASSWORD') }}
+          database: sqlmesh_state
+
+    default_gateway: doris
+
+    model_defaults:
+      dialect: doris
+    ```
 
 ---
 
@@ -225,7 +271,7 @@ MODEL (
 
 ### Auto partitioning (`auto_partition = true`)
 
-In Doris 2.1+, `AUTO PARTITION` automatically creates partitions on demand as new data arrives:
+In Doris 2.1+, `AUTO PARTITION` automatically creates partitions on demand as new data arrives (and SQLMesh automatically marks the range partition column `NOT NULL` and wraps CTAS projections in `NON_NULLABLE(...)`):
 
 ```sql
 MODEL (
@@ -236,6 +282,28 @@ MODEL (
   partitioned_by RANGE(DATE_TRUNC(event_time, 'day')),
   physical_properties (
     auto_partition = 'true'
+  )
+);
+```
+
+### Dynamic partitioning (`dynamic_partition.enable = 'true'`)
+
+For rolling retention windows managed by Doris FE's dynamic partition scheduler:
+
+```sql
+MODEL (
+  name analytics.rolling_daily_events,
+  kind INCREMENTAL_BY_TIME_RANGE (
+    time_column event_date
+  ),
+  partitioned_by RANGE(event_date),
+  physical_properties (
+    'dynamic_partition.enable' = 'true',
+    'dynamic_partition.time_unit' = 'DAY',
+    'dynamic_partition.start' = '-30',
+    'dynamic_partition.end' = '3',
+    'dynamic_partition.prefix' = 'p',
+    'dynamic_partition.buckets' = '16'
   )
 );
 ```
@@ -469,6 +537,7 @@ GROUP BY user_id, CAST(event_time AS DATE);
 
 !!! note "Automatic Physical Table Resolution & Non-Destructive Evaluation"
     - Doris materialized views are only created on initial deployment or when a rebuild is required (`RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False`), preserving MTMV refresh state across routine `sqlmesh run` invocations.
+    - When `build = 'DEFERRED'` is used on an asynchronous MTMV that also defines `audits (...)`, SQLMesh automatically executes `REFRESH MATERIALIZED VIEW <mv> AUTO` after creation so audits evaluate against populated data rather than an empty view.
     - When `excluded_trigger_tables` (supports a single string, comma-separated string, or tuple `('db.t1', 'db.t2')` on async MTMVs) or `source_table` (on synchronous MVs) references a SQLMesh-managed model, SQLMesh automatically resolves the model name to its underlying physical snapshot table name.
 
 ### Synchronous Materialized Views (`materialized_type = 'SYNC'`)
@@ -535,7 +604,7 @@ FROM raw.logs;
 
 ## Migrating from `dbt-doris` or StarRocks
 
-If you are migrating an existing `dbt-doris` project or StarRocks SQLMesh models to Doris, map your configuration keys as follows:
+SQLMesh supports loading existing `dbt-doris` projects directly (`type: doris` in `profiles.yml`) as well as native SQLMesh Doris models. If you are migrating a `dbt-doris` project or StarRocks SQLMesh models to native SQLMesh Doris models, map your configuration keys as follows:
 
 | `dbt-doris` / StarRocks Config | SQLMesh Doris Equivalent |
 | --- | --- |
@@ -548,3 +617,14 @@ If you are migrating an existing `dbt-doris` project or StarRocks SQLMesh models
 | `distributed_by=['c1']`, `buckets=10` | `clustered_by (c1), physical_properties (buckets = 10)` or `physical_properties (distributed_by = ('c1'), buckets = 10)` |
 | `partition_by` | Supported in `physical_properties (partition_by = ...)` or top-level `partitioned_by` |
 | `properties={...}` | Key-value entries inside `physical_properties (...)` |
+
+---
+
+## Troubleshooting & Doris Gotchas
+
+| Symptom / Doris Error | Cause | Resolution |
+| --- | --- | --- |
+| `errCode = 2, replication num 3 is larger than available backends 1` | Doris defaults to `replication_num = 3`, which fails on single-BE local/CI clusters. | Set `replication_num: 1` under `model_defaults.physical_properties` in `config.yaml` for local dev. |
+| `PARTITION BY` omitted on OLAP table (logged as a warning) | Doris OLAP tables with `PARTITION BY (...) ()` and no partition creation strategy have zero partitions and reject all `INSERT`s. | Add `auto_partition = 'true'`, `'dynamic_partition.enable' = 'true'`, or explicit `partitions = '...'` to `physical_properties`. |
+| `Doris only supports creating views in the 'internal' catalog` | External Iceberg catalogs do not support Doris `VIEW` or `MATERIALIZED VIEW` objects. | Set `virtual_environment_mode: dev_only` and `environment_catalog_mapping: {"^(?!prod$).*": "internal"}` in `config.yaml`. |
+| `Key column cannot be of type STRING / DOUBLE / ARRAY` | Doris forbids `STRING`/`TEXT`, floating-point (`FLOAT`/`DOUBLE`), and complex types as OLAP key columns. | SQLMesh automatically reorders valid key columns first and coerces `STRING`/`TEXT` key columns to `VARCHAR(255)`. For explicit keys on `DOUBLE`/`FLOAT`, use `DECIMAL` or an integer/date key column. |

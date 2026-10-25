@@ -536,7 +536,9 @@ class DorisEngineAdapter(
         ignore_additive: bool = False,
     ) -> t.List[TableAlterOperation]:
         from sqlmesh.core.schema_diff import (
+            TableAlterAddColumnOperation,
             TableAlterChangeColumnTypeOperation,
+            TableAlterDropColumnOperation,
             TableAlterOperation,
         )
 
@@ -556,6 +558,11 @@ class DorisEngineAdapter(
         if current_cols and not current_key_cols:
             current_key_cols = {next(iter(current_cols)).lower()}
         target_cols = self.columns(target_table_name)
+        invalid_target_key_cols = {
+            c.lower()
+            for c, dtype in target_cols.items()
+            if c.lower() in current_key_cols and not self._is_valid_olap_key_type(dtype)
+        }
         operations = t.cast(
             t.List[TableAlterOperation],
             self.schema_differ.compare_columns(
@@ -570,9 +577,15 @@ class DorisEngineAdapter(
             op
             for op in operations
             if not (
-                isinstance(op, TableAlterChangeColumnTypeOperation)
-                and op.column.name.lower() in current_key_cols
-                and not self._is_valid_olap_key_type(op.column_type)
+                (
+                    isinstance(op, TableAlterChangeColumnTypeOperation)
+                    and op.column.name.lower() in current_key_cols
+                    and not self._is_valid_olap_key_type(op.column_type)
+                )
+                or (
+                    isinstance(op, (TableAlterDropColumnOperation, TableAlterAddColumnOperation))
+                    and op.column.name.lower() in invalid_target_key_cols
+                )
             )
         ]
 
@@ -798,9 +811,6 @@ class DorisEngineAdapter(
         # handling to _get_source_queries_and_columns_to_types, which would otherwise materialize
         # a temporary table that gets dropped as soon as the SourceQuery context manager exits.
         if isinstance(query_or_df, pd.DataFrame):
-            values: t.List[t.Tuple[t.Any, ...]] = list(
-                query_or_df.itertuples(index=False, name=None)
-            )
             target_columns_to_types, source_columns = self._columns_to_types(
                 query_or_df, target_columns_to_types, source_columns
             )
@@ -808,6 +818,10 @@ class DorisEngineAdapter(
                 raise SQLMeshError("columns_to_types must be provided for dataframes")
             source_columns_to_types = get_source_columns_to_types(
                 target_columns_to_types, source_columns
+            )
+            ordered_df = query_or_df[list(source_columns or target_columns_to_types)]
+            values: t.List[t.Tuple[t.Any, ...]] = list(
+                ordered_df.itertuples(index=False, name=None)
             )
             query_or_df = self._values_to_sql(
                 values,
@@ -1482,17 +1496,13 @@ class DorisEngineAdapter(
 
         lhs_concat = self._unwrap_concat_ws(lhs)
         if lhs_concat is not None:
-            if not (isinstance(select_expr, exp.Select) and len(select_expr.expressions) == 1):
-                return None
-            first_sel = select_expr.expressions[0]
-            raw_sel = first_sel.this if isinstance(first_sel, exp.Alias) else first_sel
-            sel_concat = self._unwrap_concat_ws(raw_sel)
-            if sel_concat is None or len(sel_concat.expressions) != len(lhs_concat.expressions):
+            unwrapped_select_expr = self._unwrap_concat_ws_in_query(
+                select_expr, len(lhs_concat.expressions)
+            )
+            if unwrapped_select_expr is None:
                 return None
             key_exprs = [e.copy() for e in lhs_concat.expressions[1:]]
-            select_expr = select_expr.copy()
-            select_expr.set("expressions", [e.copy() for e in sel_concat.expressions[1:]])
-            subquery = exp.Subquery(this=select_expr)
+            subquery = exp.Subquery(this=unwrapped_select_expr)
         elif isinstance(lhs, exp.Tuple):
             key_exprs = [e.copy() for e in lhs.expressions]
         else:
@@ -1734,6 +1744,30 @@ class DorisEngineAdapter(
             return curr
         return None
 
+    @classmethod
+    def _unwrap_concat_ws_in_query(
+        cls, query_expr: exp.Expr, expected_arity: int
+    ) -> t.Optional[exp.Expr]:
+        if isinstance(query_expr, exp.SetOperation):
+            left = cls._unwrap_concat_ws_in_query(query_expr.this, expected_arity)
+            right = cls._unwrap_concat_ws_in_query(query_expr.expression, expected_arity)
+            if left is None or right is None:
+                return None
+            unwrapped_set = query_expr.copy()
+            unwrapped_set.set("this", left)
+            unwrapped_set.set("expression", right)
+            return unwrapped_set
+        if isinstance(query_expr, exp.Select) and len(query_expr.expressions) == 1:
+            first_sel = query_expr.expressions[0]
+            raw_sel = first_sel.this if isinstance(first_sel, exp.Alias) else first_sel
+            sel_concat = cls._unwrap_concat_ws(raw_sel)
+            if sel_concat is None or len(sel_concat.expressions) != expected_arity:
+                return None
+            unwrapped_sel = query_expr.copy()
+            unwrapped_sel.set("expressions", [e.copy() for e in sel_concat.expressions[1:]])
+            return unwrapped_sel
+        return None
+
     @staticmethod
     def _get_in_subquery(in_expr: exp.In) -> t.Optional[exp.Subquery]:
         query = in_expr.args.get("query")
@@ -1767,6 +1801,7 @@ class DorisEngineAdapter(
             return
 
         join_conditions: t.List[exp.Expr] = []
+        orig_subquery = subquery.copy()
         subquery = subquery.copy()
         first_select = subquery.this
         while isinstance(first_select, exp.SetOperation):
@@ -1778,7 +1813,11 @@ class DorisEngineAdapter(
             t2_col_name = col_name
             if isinstance(first_select, exp.Select) and idx < len(first_select.expressions):
                 sel_item = first_select.expressions[idx]
-                candidate_name = sel_item.alias_or_name
+                candidate_name = (
+                    sel_item.alias_or_name
+                    if isinstance(sel_item, (exp.Column, exp.Alias, exp.Identifier))
+                    else ""
+                )
                 if candidate_name and candidate_name.lower() not in used_t2_aliases:
                     t2_col_name = candidate_name
                 else:
@@ -1831,7 +1870,7 @@ class DorisEngineAdapter(
                     table_name,
                     e,
                 )
-                self._delete_by_literal_keys(table_name, key_exprs, subquery, extra_conditions)
+                self._delete_by_literal_keys(table_name, key_exprs, orig_subquery, extra_conditions)
             else:
                 raise
 
@@ -1860,7 +1899,7 @@ class DorisEngineAdapter(
         self,
         table_name: TableName,
         key_exprs: t.List[exp.Expr],
-        subquery: t.Union[exp.Subquery, exp.Select],
+        subquery: t.Union[exp.Subquery, exp.Select, exp.SetOperation],
         extra_conditions: t.Optional[t.List[exp.Expr]] = None,
     ) -> None:
         """Delete partition ranges for time-truncation partition keys (`DATE_TRUNC`, `DAY`, `MONTH`, `YEAR`, `HOUR`, `TO_DATE`)
@@ -1869,32 +1908,102 @@ class DorisEngineAdapter(
         select_query = (
             subquery.this.copy() if isinstance(subquery, exp.Subquery) else subquery.copy()
         )
-        if not isinstance(select_query, exp.Select):
+        first_select = select_query
+        while isinstance(first_select, exp.SetOperation):
+            first_select = first_select.this
+        if not isinstance(first_select, exp.Select):
             return
 
         projections: t.List[exp.Expr] = []
-        for idx, k in enumerate(key_exprs):
-            transform = self._extract_time_partition_transform(k)
-            if transform is not None:
-                col_expr, unit = transform
-                trunc_expr = exp.Anonymous(
-                    this="DATE_TRUNC",
-                    expressions=[col_expr.copy(), exp.Literal.string(unit)],
-                )
-                upper_expr = exp.DateAdd(
-                    this=trunc_expr.copy(),
-                    expression=exp.Literal.number(1),
-                    unit=exp.var(unit.upper()),
-                )
-                projections.append(exp.alias_(trunc_expr, f"_low_{idx}", quoted=True))
-                projections.append(exp.alias_(upper_expr, f"_high_{idx}", quoted=True))
-            else:
-                col_expr = exp.column(k.name, quoted=bool(getattr(k.this, "quoted", False)))
-                projections.append(exp.alias_(col_expr, f"_val_{idx}", quoted=True))
+        if (
+            isinstance(select_query, exp.Select)
+            and len(select_query.expressions) == len(key_exprs)
+            and not select_query.args.get("group")
+            and not select_query.args.get("having")
+            and not select_query.args.get("limit")
+        ):
+            for idx, k in enumerate(key_exprs):
+                sel_item = select_query.expressions[idx]
+                raw_sel = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
+                transform = self._extract_time_partition_transform(k)
+                if transform is not None:
+                    _, unit = transform
+                    src_transform = self._extract_time_partition_transform(raw_sel)
+                    if src_transform is not None:
+                        src_arg: exp.Expr = src_transform[0].copy()
+                    else:
+                        src_arg = raw_sel.copy()
+                    trunc_expr = exp.Anonymous(
+                        this="DATE_TRUNC",
+                        expressions=[src_arg, exp.Literal.string(unit)],
+                    )
+                    upper_expr = exp.DateAdd(
+                        this=trunc_expr.copy(),
+                        expression=exp.Literal.number(1),
+                        unit=exp.var(unit.upper()),
+                    )
+                    projections.append(exp.alias_(trunc_expr, f"_low_{idx}", quoted=True))
+                    projections.append(exp.alias_(upper_expr, f"_high_{idx}", quoted=True))
+                else:
+                    projections.append(exp.alias_(raw_sel.copy(), f"_val_{idx}", quoted=True))
+            select_query.set("expressions", projections)
+            fetch_query: exp.Select = select_query.distinct()
+        elif len(first_select.expressions) == len(key_exprs):
+            all_branches: t.List[exp.Select] = []
 
-        select_query.set("expressions", projections)
-        select_query = select_query.distinct()
-        rows = self.fetchall(select_query, quote_identifiers=True)
+            def _collect_select_branches(node: exp.Expr) -> None:
+                if isinstance(node, exp.SetOperation):
+                    _collect_select_branches(node.this)
+                    _collect_select_branches(node.expression)
+                elif isinstance(node, exp.Select):
+                    all_branches.append(node)
+
+            _collect_select_branches(select_query)
+            for branch in all_branches:
+                if len(branch.expressions) == len(key_exprs) and not branch.args.get("group"):
+                    branch_exprs = list(branch.expressions)
+                    for idx, k in enumerate(key_exprs):
+                        if self._extract_time_partition_transform(k) is not None:
+                            sel_item = branch_exprs[idx]
+                            raw_sel = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
+                            src_transform = self._extract_time_partition_transform(raw_sel)
+                            if src_transform is not None:
+                                branch_exprs[idx] = src_transform[0].copy()
+                    branch.set("expressions", branch_exprs)
+
+            new_first_exprs = list(first_select.expressions)
+            for idx, sel_item in enumerate(new_first_exprs):
+                inner_expr = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
+                new_first_exprs[idx] = exp.alias_(inner_expr.copy(), f"_col_{idx}", quoted=True)
+            first_select.set("expressions", new_first_exprs)
+
+            for idx, k in enumerate(key_exprs):
+                sq_col = exp.column(f"_col_{idx}", quoted=True)
+                transform = self._extract_time_partition_transform(k)
+                if transform is not None:
+                    _, unit = transform
+                    trunc_expr = exp.Anonymous(
+                        this="DATE_TRUNC",
+                        expressions=[sq_col, exp.Literal.string(unit)],
+                    )
+                    upper_expr = exp.DateAdd(
+                        this=trunc_expr.copy(),
+                        expression=exp.Literal.number(1),
+                        unit=exp.var(unit.upper()),
+                    )
+                    projections.append(exp.alias_(trunc_expr, f"_low_{idx}", quoted=True))
+                    projections.append(exp.alias_(upper_expr, f"_high_{idx}", quoted=True))
+                else:
+                    projections.append(exp.alias_(sq_col, f"_val_{idx}", quoted=True))
+            fetch_query = (
+                exp.select(*projections)
+                .from_(exp.alias_(exp.Subquery(this=select_query), "_sq", table=True))
+                .distinct()
+            )
+        else:
+            return
+
+        rows = self.fetchall(fetch_query, quote_identifiers=True)
         if not rows or not isinstance(rows, (list, tuple)):
             return
 
@@ -2011,9 +2120,19 @@ class DorisEngineAdapter(
         def _to_expr(val: t.Any) -> exp.Expr:
             return self._to_delete_literal_expr(val, is_ast_values=is_ast_values)
 
+        def _dedup_exprs(exprs: t.List[exp.Expr]) -> t.List[exp.Expr]:
+            seen: t.Set[str] = set()
+            unique_exprs: t.List[exp.Expr] = []
+            for e in exprs:
+                key_sql = e.sql(dialect=self.dialect)
+                if key_sql not in seen:
+                    seen.add(key_sql)
+                    unique_exprs.append(e)
+            return unique_exprs
+
         if len(cols) == 1:
             col = cols[0]
-            non_null_vals = [_to_expr(r[0]) for r in rows if not _is_null_val(r[0])]
+            non_null_vals = _dedup_exprs([_to_expr(r[0]) for r in rows if not _is_null_val(r[0])])
             has_null = any(_is_null_val(r[0]) for r in rows)
 
             for i in range(0, len(non_null_vals), batch_size):
@@ -2045,7 +2164,7 @@ class DorisEngineAdapter(
                 p_col.eq(_to_expr(p_val)) if not _is_null_val(p_val) else p_col.is_(exp.null())
                 for p_col, p_val in zip(prefix_cols, prefix_vals)
             ]
-            non_null_batch = [_to_expr(v) for v in batch_vals if not _is_null_val(v)]
+            non_null_batch = _dedup_exprs([_to_expr(v) for v in batch_vals if not _is_null_val(v)])
             has_null_batch = any(_is_null_val(v) for v in batch_vals)
 
             for i in range(0, len(non_null_batch), batch_size):
@@ -2616,6 +2735,75 @@ class DorisEngineAdapter(
                 return exp.DataType.build("VARCHAR(255)", dialect=self.dialect)
         if isinstance(inner, exp.Boolean):
             return exp.DataType.build("BOOLEAN", dialect=self.dialect)
+        if isinstance(
+            inner,
+            (
+                exp.Avg,
+                exp.Stddev,
+                exp.StddevPop,
+                exp.StddevSamp,
+                exp.Variance,
+                exp.VariancePop,
+            ),
+        ):
+            return exp.DataType.build("DOUBLE", dialect=self.dialect)
+        if isinstance(inner, (exp.Array, exp.ArrayAgg)):
+            return exp.DataType.build("ARRAY<INT>", dialect=self.dialect)
+        if isinstance(inner, (exp.Map, exp.VarMap)):
+            return exp.DataType.build("MAP<VARCHAR(255), VARCHAR(255)>", dialect=self.dialect)
+        if isinstance(inner, exp.Struct):
+            return exp.DataType.build("STRUCT<a: INT>", dialect=self.dialect, udt=True)
+        if isinstance(inner, (exp.JSONObject, exp.JSONArray)):
+            return exp.DataType.build("JSON", dialect=self.dialect)
+        if isinstance(inner, exp.GroupConcat):
+            return exp.DataType.build("TEXT", dialect=self.dialect)
+        if isinstance(inner, (exp.Count, exp.RowNumber, exp.Rank, exp.DenseRank)):
+            return exp.DataType.build("BIGINT", dialect=self.dialect)
+        if isinstance(
+            inner,
+            (
+                exp.Year,
+                exp.Month,
+                exp.Day,
+                exp.Hour,
+                exp.Minute,
+                exp.Second,
+                exp.DayOfWeek,
+                exp.DayOfYear,
+                exp.WeekOfYear,
+            ),
+        ):
+            return exp.DataType.build("INT", dialect=self.dialect)
+        if isinstance(inner, (exp.CurrentDate, exp.Date, exp.TsOrDsToDate)):
+            return exp.DataType.build("DATE", dialect=self.dialect)
+        if isinstance(inner, (exp.CurrentTimestamp, exp.DateTrunc, exp.TimestampTrunc)):
+            return exp.DataType.build("DATETIME", dialect=self.dialect)
+        if isinstance(inner, exp.Anonymous):
+            fn_upper = inner.name.upper()
+            if fn_upper in (
+                "AVG",
+                "STDDEV",
+                "STDDEV_POP",
+                "STDDEV_SAMP",
+                "VARIANCE",
+                "VAR_POP",
+                "VAR_SAMP",
+            ):
+                return exp.DataType.build("DOUBLE", dialect=self.dialect)
+            if fn_upper in ("ARRAY", "ARRAY_AGG", "COLLECT_LIST", "COLLECT_SET"):
+                return exp.DataType.build("ARRAY<INT>", dialect=self.dialect)
+            if fn_upper in ("MAP", "MAP_AGG"):
+                return exp.DataType.build("MAP<VARCHAR(255), VARCHAR(255)>", dialect=self.dialect)
+            if fn_upper in ("STRUCT", "NAMED_STRUCT"):
+                return exp.DataType.build("STRUCT<a: INT>", dialect=self.dialect, udt=True)
+            if fn_upper in ("JSON_OBJECT", "JSON_ARRAY", "TO_JSON"):
+                return exp.DataType.build("JSON", dialect=self.dialect)
+            if fn_upper == "GROUP_CONCAT":
+                return exp.DataType.build("TEXT", dialect=self.dialect)
+            if fn_upper == "DATE_TRUNC":
+                return exp.DataType.build("DATETIME", dialect=self.dialect)
+            if fn_upper == "TO_DATE":
+                return exp.DataType.build("DATE", dialect=self.dialect)
         return exp.DataType.build("UNKNOWN")
 
     def _reorder_unannotated_ctas_query(
@@ -2794,7 +2982,8 @@ class DorisEngineAdapter(
                         updated_types[k] = exp.DataType.build("VARCHAR(255)", dialect=self.dialect)
                     else:
                         raise SQLMeshError(
-                            f"Doris key column '{k}' has type '{k_dtype.sql(dialect=self.dialect)}' which is not supported as an OLAP key column."
+                            f"Doris key column '{k}' has type '{k_dtype.sql(dialect=self.dialect)}' which is not supported as an OLAP key column. "
+                            "Use an integer, DATE/DATETIME, DECIMAL, CHAR, or VARCHAR(n) column instead."
                         )
             key_cols_set = set(key_cols)
             new_order = (
@@ -3050,6 +3239,10 @@ class DorisEngineAdapter(
         # On Doris OLAP tables, if no explicit partitions, auto_partition, or dynamic_partition.enable
         # are configured, omit PARTITION BY so Doris does not create a 0-partition table that rejects inserts.
         if not partitions and not is_auto and not dynamic_partition_enabled:
+            logger.warning(
+                "[Doris] Omitting PARTITION BY on OLAP table because none of 'auto_partition = true', "
+                "'dynamic_partition.enable = true', or explicit 'partitions' were configured in physical_properties."
+            )
             return None
 
         create_expressions: t.Optional[t.List[exp.Expr]] = None
@@ -3271,7 +3464,8 @@ class DorisEngineAdapter(
             if order_by_cols and not is_materialized_view:
                 if not unique_key_cols:
                     raise SQLMeshError(
-                        "Doris table property 'order_by' is only supported on UNIQUE KEY tables."
+                        "Doris table property 'order_by' is only supported on UNIQUE KEY tables. "
+                        "For DUPLICATE KEY or AGGREGATE KEY tables, sort order is determined by the key columns."
                     )
                 if col_by_lower:
                     missing_order_cols = [k for k in order_by_cols if k.lower() not in col_by_lower]
@@ -3559,6 +3753,27 @@ class DorisEngineAdapter(
             f"Invalid buckets value for Doris DISTRIBUTED BY: {raw_buckets}. Expected a positive integer or 'AUTO'."
         )
 
+    @classmethod
+    def _eval_int_limit_expr(cls, node: t.Optional[exp.Expr]) -> t.Optional[int]:
+        if node is None:
+            return None
+        curr = node.unnest()
+        if isinstance(curr, exp.Literal) and not curr.is_string:
+            try:
+                return int(str(curr.this).strip())
+            except ValueError:
+                return None
+        if isinstance(curr, (exp.Add, exp.Sub, exp.Mul)):
+            left = cls._eval_int_limit_expr(curr.this)
+            right = cls._eval_int_limit_expr(curr.expression)
+            if left is not None and right is not None:
+                if isinstance(curr, exp.Add):
+                    return left + right
+                if isinstance(curr, exp.Sub):
+                    return max(0, left - right)
+                return left * right
+        return None
+
     def _to_sql(self, expression: exp.Expr, quote: bool = True, **kwargs: t.Any) -> str:
         if expression.find(exp.Lock):
             expression = expression.copy()
@@ -3566,6 +3781,15 @@ class DorisEngineAdapter(
                 if select_node.args.get("locks"):
                     select_node.set("locks", None)
             logger.debug("[Doris] Removed unsupported FOR UPDATE lock from SELECT statement")
+        if any(
+            not isinstance(lim.expression, exp.Literal) for lim in expression.find_all(exp.Limit)
+        ):
+            expression = expression.copy()
+            for lim in expression.find_all(exp.Limit):
+                if not isinstance(lim.expression, exp.Literal):
+                    folded = self._eval_int_limit_expr(lim.expression)
+                    if folded is not None:
+                        lim.set("expression", exp.Literal.number(folded))
         if any(
             isinstance(is_node.expression, exp.Boolean) for is_node in expression.find_all(exp.Is)
         ):

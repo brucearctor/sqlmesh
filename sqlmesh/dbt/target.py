@@ -16,6 +16,7 @@ from sqlmesh.core.config.connection import (
     ClickhouseConnectionConfig,
     ConnectionConfig,
     DatabricksConnectionConfig,
+    DorisConnectionConfig,
     DuckDBConnectionConfig,
     MSSQLConnectionConfig,
     PostgresConnectionConfig,
@@ -137,6 +138,8 @@ class TargetConfig(abc.ABC, DbtConfig):
             return ClickhouseConfig(**data)
         if db_type == "athena":
             return AthenaConfig(**data)
+        if db_type == "doris":
+            return DorisConfig(**data)
 
         raise ConfigError(f"{db_type} not supported.")
 
@@ -1098,6 +1101,68 @@ class AthenaConfig(TargetConfig):
         )
 
 
+class DorisConfig(TargetConfig):
+    """
+    Project connection and operational configuration for the Apache Doris target (`dbt-doris`).
+    """
+
+    type: t.Literal["doris"] = "doris"
+    host: str = "localhost"
+    port: int = 9030
+    user: str = Field(default="root", validation_alias=AliasChoices("user", "username"))
+    password: t.Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("password", "pass")
+    )
+    schema_: str = Field(default="default", alias="schema")
+    database: str = ""
+    catalog: t.Optional[str] = None
+    charset: t.Optional[str] = None
+    connect_timeout: int = Field(
+        default=10, validation_alias=AliasChoices("connect_timeout", "check_timeout")
+    )
+    session_variables: t.Optional[t.Dict[str, t.Any]] = None
+
+    def default_incremental_strategy(self, kind: IncrementalKind) -> str:
+        return "merge" if kind is IncrementalByUniqueKeyKind else "insert_overwrite"
+
+    @classproperty
+    def relation_class(cls) -> t.Type[BaseRelation]:
+        try:
+            from dbt.adapters.doris.relation import DorisRelation  # type: ignore
+
+            return DorisRelation
+        except ImportError:
+            return BaseRelation
+
+    @classproperty
+    def column_class(cls) -> t.Type[Column]:
+        try:
+            from dbt.adapters.doris.column import DorisColumn  # type: ignore
+
+            return DorisColumn
+        except ImportError:
+            return Column
+
+    @with_schema_differ_overrides
+    def to_sqlmesh(self, **kwargs: t.Any) -> ConnectionConfig:
+        catalog = self.catalog or (
+            self.database if self.database and self.database != self.schema_ else None
+        )
+        return DorisConnectionConfig(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.schema_,
+            catalog=catalog,
+            charset=self.charset,
+            connect_timeout=self.connect_timeout,
+            session_variables=self.session_variables,
+            concurrent_tasks=self.threads,
+            **kwargs,
+        )
+
+
 TARGET_TYPE_TO_CONFIG_CLASS: t.Dict[str, t.Type[TargetConfig]] = {
     "databricks": DatabricksConfig,
     "duckdb": DuckDbConfig,
@@ -1110,4 +1175,5 @@ TARGET_TYPE_TO_CONFIG_CLASS: t.Dict[str, t.Type[TargetConfig]] = {
     "trino": TrinoConfig,
     "athena": AthenaConfig,
     "clickhouse": ClickhouseConfig,
+    "doris": DorisConfig,
 }

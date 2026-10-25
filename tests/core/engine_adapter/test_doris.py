@@ -2980,3 +2980,184 @@ def test_thread_local_state_isolation_time_transform_partition_delete_table_diff
     )
     assert "state_connection:\n      type: duckdb\n      database: state.db" in doris_init_cfg
     assert "dialect: doris" in doris_init_cfg
+
+
+def test_union_time_transform_delete_agg_ctas_mv_df_order_limit_fold_and_dbt_target(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    import pandas as pd
+    from sqlmesh.core.config.connection import DorisConnectionConfig
+    from sqlmesh.dbt.context import DbtContext
+    from sqlmesh.dbt.model import ModelConfig
+    from sqlmesh.dbt.target import DorisConfig, TargetConfig
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. `_delete_by_time_transform_keys` uses the source subquery's projection column (`src_ds`)
+    #    when it differs from the target column (`target_ds`), and supports `UNION ALL` subqueries.
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [("2024-01-15", "2024-01-16")],
+            [("2024-01-01", "2025-01-01")],
+        ],
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "DATE_TRUNC(target_ds, 'day') IN (SELECT DATE_TRUNC(src_ds, 'day') FROM db.staging)",
+            read="doris",
+        ),
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "YEAR(ds) IN (SELECT YEAR(ds) FROM db.s1 UNION ALL SELECT YEAR(ds) FROM db.s2)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT DATE_TRUNC(`src_ds`, 'day') AS `_low_0`, DATE_ADD(DATE_TRUNC(`src_ds`, 'day'), INTERVAL 1 DAY) AS `_high_0` FROM `db`.`staging`",
+        "DELETE FROM `db`.`events` WHERE `target_ds` >= '2024-01-15' AND `target_ds` < '2024-01-16'",
+        "SELECT DISTINCT DATE_TRUNC(`_col_0`, 'year') AS `_low_0`, DATE_ADD(DATE_TRUNC(`_col_0`, 'year'), INTERVAL 1 YEAR) AS `_high_0` FROM (SELECT `ds` AS `_col_0` FROM `db`.`s1` UNION ALL SELECT `ds` FROM `db`.`s2`) AS `_sq`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+    ]
+
+    # 2. `CONCAT_WS` multi-column unwrap in `delete_from` supports `UNION ALL` subqueries,
+    #    `_execute_delete_with_subquery` aliases unaliased string literals (`'us' AS _col_0`),
+    #    and `_delete_key_rows` deduplicates repeated literal keys.
+    adapter.cursor.execute.reset_mock()
+    key_exp = exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", exp.column("id"), exp.column("ds"))
+    union_subq = exp.union(
+        exp.select(key_exp).from_("db.s1"),
+        exp.select(key_exp).from_("db.s2"),
+        distinct=False,
+    )
+    adapter.delete_from("db.target", where=key_exp.isin(query=union_subq))
+    adapter.delete_from(
+        "db.target",
+        where=parse_one("(region, id) IN (SELECT 'us', id FROM db.staging)", read="doris"),
+    )
+    adapter.delete_from(
+        "db.target",
+        where=parse_one(
+            "(region, id) IN (('us', 1), ('us', 1), ('us', 2))",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id`, `ds` FROM `db`.`s1` UNION ALL SELECT `id`, `ds` FROM `db`.`s2`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`ds` = `_t2`.`ds`",
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT 'us' AS `_col_0`, `id` FROM `db`.`staging`) AS `_t2` WHERE `_t1`.`region` = `_t2`.`_col_0` AND `_t1`.`id` = `_t2`.`id`",
+        "DELETE FROM `db`.`target` WHERE `region` = 'us' AND `id` IN (1, 2)",
+    ]
+
+    # 3. Unannotated CTAS with aggregate/complex expressions at column 0 (`AVG(...)`, `ARRAY(...)`)
+    #    infers non-key types (`DOUBLE`, `ARRAY<INT>`) and promotes valid key columns (`store_id`, `cnt`) to column 0.
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        "db.agg_ctas",
+        parse_one(
+            "SELECT AVG(price) AS avg_price, CAST(store_id AS INT) AS store_id FROM db.sales GROUP BY store_id",
+            read="doris",
+        ),
+    )
+    adapter.ctas(
+        "db.array_ctas",
+        parse_one("SELECT ARRAY(1, 2) AS arr, COUNT(*) AS cnt FROM db.src", read="doris"),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`agg_ctas` AS SELECT CAST(`store_id` AS INT) AS `store_id`, AVG(`price`) AS `avg_price` FROM `db`.`sales` GROUP BY `store_id`",
+        "CREATE TABLE IF NOT EXISTS `db`.`array_ctas` AS SELECT COUNT(*) AS `cnt`, ARRAY(1, 2) AS `arr` FROM `db`.`src`",
+    ]
+
+    # 4. `_create_materialized_view` with a DataFrame whose column order (`b`, `a`) differs from
+    #    `target_columns_to_types` (`a`, `b`) reorders the DataFrame columns before `itertuples()`.
+    adapter.cursor.execute.reset_mock()
+    mv_df = pd.DataFrame([{"b": "hello", "a": 42}])
+    adapter.create_view(
+        "db.df_mv",
+        mv_df,
+        replace=False,
+        materialized=True,
+        target_columns_to_types={
+            "a": exp.DataType.build("INT", dialect="doris"),
+            "b": exp.DataType.build("VARCHAR(20)", dialect="doris"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE MATERIALIZED VIEW `db`.`df_mv` (`a`, `b`) AS SELECT CAST(`a` AS INT) AS `a`, CAST(`b` AS VARCHAR(20)) AS `b` FROM (SELECT 42 AS `a`, 'hello' AS `b`) AS `t`",
+    ]
+
+    # 5. `get_alter_operations` suppresses destructive `DROP` + `ADD` pairs on OLAP key columns
+    #    when the target column type (`TEXT`) is an invalid OLAP key type.
+    adapter.cursor.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [("code", "VARCHAR(255)", "Yes", "true", None, "")],
+            [("code", "TEXT", "Yes", "false", None, "")],
+        ],
+    )
+    ops_destructive = adapter.get_alter_operations(
+        "db.current_tbl", "db.target_tbl", ignore_destructive=False
+    )
+    assert ops_destructive == []
+
+    # 6. `_to_sql` folds constant integer arithmetic inside `exp.Limit` (`LIMIT 10 + 1` -> `LIMIT 11`)
+    #    so built-in `number_of_rows` audit queries execute cleanly on Doris.
+    audit_query = parse_one(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM db.events WHERE TRUE LIMIT 10 + 1) AS _q HAVING COUNT(*) <= 10",
+        read="doris",
+    )
+    assert (
+        adapter._to_sql(audit_query)
+        == "SELECT COUNT(*) FROM (SELECT 1 FROM `db`.`events` WHERE TRUE LIMIT 11) AS `_q` HAVING COUNT(*) <= 10"
+    )
+
+    # 7. `dbt-doris` TargetConfig (`DorisConfig`) and `ModelConfig` integration.
+    target = TargetConfig.load(
+        {
+            "type": "doris",
+            "name": "dev",
+            "host": "fe.internal",
+            "port": 9030,
+            "username": "doris_admin",
+            "pass": "secret",
+            "schema": "analytics",
+            "catalog": "iceberg_cat",
+            "threads": 8,
+        }
+    )
+    assert isinstance(target, DorisConfig)
+    conn_cfg = target.to_sqlmesh()
+    assert isinstance(conn_cfg, DorisConnectionConfig)
+    assert conn_cfg.host == "fe.internal"
+    assert conn_cfg.user == "doris_admin"
+    assert conn_cfg.password == "secret"
+    assert conn_cfg.database == "analytics"
+    assert conn_cfg.catalog == "iceberg_cat"
+    assert conn_cfg.concurrent_tasks == 8
+
+    dbt_ctx = DbtContext()
+    dbt_ctx.project_name = "test"
+    dbt_ctx.target = target
+    dbt_model = ModelConfig(
+        name="orders_doris",
+        alias="orders_doris",
+        package_name="pkg",
+        schema="analytics",
+        materialized="incremental",
+        unique_key=["order_id"],
+        distributed_by=["order_id"],
+        buckets=16,
+        properties={"replication_num": "1"},
+        sql="SELECT 1 AS order_id",
+    )
+    sqlmesh_model = dbt_model.to_sqlmesh(dbt_ctx)
+    rendered_props = sqlmesh_model.render_physical_properties()
+    assert rendered_props["unique_key"] == exp.column("order_id", quoted=True)
+    assert rendered_props["distributed_by"] == exp.column("order_id", quoted=True)
+    assert rendered_props["buckets"] == exp.Literal.number(16)
+    assert rendered_props["replication_num"] == exp.Literal.string("1")
