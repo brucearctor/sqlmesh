@@ -607,8 +607,14 @@ class DorisEngineAdapter(
             if not (
                 (
                     isinstance(op, TableAlterChangeColumnTypeOperation)
-                    and op.column.name.lower() in current_key_cols
-                    and not self._is_valid_olap_key_type(op.column_type)
+                    and (
+                        self._to_sql(op.current_type).upper()
+                        == self._to_sql(op.column_type).upper()
+                        or (
+                            op.column.name.lower() in current_key_cols
+                            and not self._is_valid_olap_key_type(op.column_type)
+                        )
+                    )
                 )
                 or (
                     isinstance(op, (TableAlterDropColumnOperation, TableAlterAddColumnOperation))

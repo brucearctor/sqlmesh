@@ -3213,3 +3213,368 @@ def test_union_time_transform_delete_agg_ctas_mv_df_order_and_limit_fold(
     ssl_conn_cfg = DorisConnectionConfig(host="fe.internal", user="root", ssl=True)
     assert ssl_conn_cfg._static_connection_kwargs["ssl"] == {"check_hostname": False}
     assert bool(ssl_conn_cfg._static_connection_kwargs["ssl"]) is True
+
+
+def test_schema_differ_text_widening_largeint_and_key_protection(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Widening non-key value columns to TEXT (`INT -> TEXT`, `DATE -> TEXT`) emits in-place
+    #    `MODIFY COLUMN ... TEXT` operations instead of destructive `DROP` + `ADD`.
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [
+                ("id", "INT", "Yes", "true", None, ""),
+                ("val", "INT", "Yes", "false", None, ""),
+                ("dt", "DATE", "Yes", "false", None, ""),
+            ],
+            [
+                ("id", "INT", "Yes", "true", None, ""),
+                ("val", "TEXT", "Yes", "false", None, ""),
+                ("dt", "TEXT", "Yes", "false", None, ""),
+            ],
+        ],
+    )
+    ops_widen = adapter.get_alter_operations(
+        "db.current_tbl", "db.target_tbl", ignore_destructive=True
+    )
+    assert len(ops_widen) == 2
+    adapter.cursor.execute.reset_mock()
+    adapter.alter_table(ops_widen)
+    assert to_sql_calls(adapter) == [
+        "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `val` STRING",
+        "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `dt` STRING",
+    ]
+
+    # 2. `LARGEINT` vs `INT128` is treated as mutually compatible and produces zero alter operations.
+    mocker.patch.object(
+        adapter,
+        "columns",
+        side_effect=[
+            {"id": exp.DataType.build("LARGEINT", udt=True)},
+            {"id": exp.DataType.build("INT128")},
+        ],
+    )
+    assert adapter.get_alter_operations("db.current_tbl", "db.target_tbl") == []
+
+    # 3. Changing an OLAP key column to an incompatible valid key type (`DATETIME -> INT`)
+    #    is blocked from emitting a destructive `DROP COLUMN` + `ADD COLUMN` on a key column,
+    #    while non-key column destructive replacements (`DATETIME -> INT`) are still emitted when `ignore_destructive=False`.
+    mocker.stopall()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        side_effect=[
+            [
+                ("k_ts", "DATETIME", "Yes", "true", None, ""),
+                ("v_ts", "DATETIME", "Yes", "false", None, ""),
+            ],
+            [
+                ("k_ts", "INT", "Yes", "true", None, ""),
+                ("v_ts", "INT", "Yes", "false", None, ""),
+            ],
+        ],
+    )
+    ops_key_protected = adapter.get_alter_operations(
+        "db.current_tbl", "db.target_tbl", ignore_destructive=False
+    )
+    adapter.cursor.execute.reset_mock()
+    adapter.alter_table(ops_key_protected)
+    assert to_sql_calls(adapter) == [
+        "ALTER TABLE `db`.`current_tbl` DROP COLUMN `v_ts`",
+        "ALTER TABLE `db`.`current_tbl` ADD COLUMN `v_ts` INT",
+    ]
+
+
+def test_union_ctas_string_coercion_and_duplicate_key_list_partition_coercion(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Lockstep `UNION ALL` unannotated CTAS where column 0 is non-key (`AVG(score)`) and column 1
+    #    is `CAST(label AS STRING)`: both branches are reordered in lockstep AND cast `label` to `VARCHAR(255)`.
+    adapter.ctas(
+        "db.union_str_ctas",
+        parse_one(
+            "SELECT AVG(score) AS score, CAST(label AS STRING) AS label FROM db.s1 GROUP BY label "
+            "UNION ALL SELECT score, label FROM db.s2",
+            read="doris",
+        ),
+    )
+
+    # 2. Explicit `duplicate_key = ('id')` combined with `PARTITION BY LIST(region)` where `region` is `TEXT`:
+    #    `region` is automatically appended to `DUPLICATE KEY`, moved into the key prefix, AND coerced to `VARCHAR(255)`.
+    adapter.create_table(
+        "db.dup_list_part_tbl",
+        {
+            "score": exp.DataType.build("DOUBLE", dialect="doris"),
+            "region": exp.DataType.build("TEXT", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        partitioned_by=[parse_one("LIST(region)", read="doris")],
+        table_properties={
+            "duplicate_key": exp.Tuple(expressions=[exp.Literal.string("id")]),
+            "partitions": exp.Literal.string("PARTITION p_us VALUES IN ('us')"),
+            "buckets": exp.Literal.number(4),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`union_str_ctas` AS SELECT CAST(`label` AS VARCHAR(255)) AS `label`, AVG(`score`) AS `score` FROM `db`.`s1` GROUP BY `label` UNION ALL SELECT CAST(`label` AS VARCHAR(255)), `score` FROM `db`.`s2`",
+        "CREATE TABLE IF NOT EXISTS `db`.`dup_list_part_tbl` (`id` INT, `region` VARCHAR(255), `score` DOUBLE) DUPLICATE KEY (`id`, `region`) PARTITION BY LIST (`region`) (PARTITION p_us VALUES IN ('us')) DISTRIBUTED BY HASH (`id`) BUCKETS 4",
+    ]
+
+
+def test_doris_connection_config_tls_matrix():
+    from sqlmesh.core.config.connection import DorisConnectionConfig
+
+    # 1. `ssl_verify_identity=True` without explicit `ssl=True` still populates `kwargs["ssl"]` with `check_hostname=True`.
+    cfg_identity = DorisConnectionConfig(host="fe.internal", user="root", ssl_verify_identity=True)
+    assert cfg_identity._static_connection_kwargs["ssl"] == {"check_hostname": True}
+
+    # 2. `ssl_verify_cert=True` populates `verify_mode=True` in `kwargs["ssl"]`.
+    cfg_cert = DorisConnectionConfig(host="fe.internal", user="root", ssl_verify_cert=True)
+    assert cfg_cert._static_connection_kwargs["ssl"] == {"verify_mode": True}
+
+    # 3. `ssl_disabled=True` overrides `ssl=True` and omits the `ssl` dictionary.
+    cfg_disabled = DorisConnectionConfig(
+        host="fe.internal", user="root", ssl=True, ssl_disabled=True
+    )
+    assert "ssl" not in cfg_disabled._static_connection_kwargs
+
+
+def test_doris_snapshot_evaluator_end_to_end_model_kinds(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    make_snapshot: t.Callable,
+    mocker: MockerFixture,
+):
+    from sqlmesh.core.model import load_sql_based_model
+    from sqlmesh.core.dialect import parse as d_parse
+    from sqlmesh.core.snapshot import SnapshotChangeCategory, SnapshotEvaluator
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, default_catalog="internal")
+    adapter.cursor.fetchall.return_value = []
+    mocker.patch.object(DorisEngineAdapter, "_get_data_objects", return_value=[])
+    mocker.patch.object(DorisEngineAdapter, "table_exists", return_value=True)
+    mocker.patch.object(
+        DorisEngineAdapter,
+        "get_data_object",
+        side_effect=lambda t: DataObject(
+            catalog="internal",
+            schema=exp.to_table(t).db or "db",
+            name=exp.to_table(t).name,
+            type=DataObjectType.TABLE,
+        ),
+    )
+    evaluator = SnapshotEvaluator(adapter)
+
+    # 1. INCREMENTAL_BY_TIME_RANGE model evaluation through SnapshotEvaluator
+    inc_time_model = load_sql_based_model(
+        d_parse(
+            """
+            MODEL (
+                name db.inc_time,
+                kind INCREMENTAL_BY_TIME_RANGE (
+                    time_column ds
+                ),
+                dialect doris,
+                physical_properties (
+                    duplicate_key = (id),
+                    auto_partition = true,
+                    buckets = 4
+                ),
+                partitioned_by RANGE(ds)
+            );
+            SELECT CAST(id AS INT) AS id, CAST(ds AS DATE) AS ds, CAST(amount AS DOUBLE) AS amount
+            FROM db.raw_events
+            WHERE ds BETWEEN @start_ds AND @end_ds
+            """,
+            default_dialect="doris",
+        ),
+        default_catalog="internal",
+    )
+    inc_time_snap = make_snapshot(inc_time_model)
+    inc_time_snap.categorize_as(SnapshotChangeCategory.BREAKING)
+    inc_time_snap.add_interval("2023-12-31", "2023-12-31")
+
+    adapter.cursor.execute.reset_mock()
+    evaluator.create([inc_time_snap], {})
+    evaluator.evaluate(
+        inc_time_snap,
+        start="2024-01-01",
+        end="2024-01-02",
+        execution_time="2024-01-03",
+        snapshots={inc_time_snap.name: inc_time_snap},
+    )
+    time_sql = to_sql_calls(adapter)
+    assert any(
+        "DUPLICATE KEY (`id`, `ds`) AUTO PARTITION BY RANGE (`ds`) () DISTRIBUTED BY HASH (`id`) BUCKETS 4"
+        in s
+        for s in time_sql
+    )
+    assert any(
+        "DELETE FROM `internal`.`sqlmesh__db`.`db__inc_time__" in s
+        and "WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-02'" in s
+        for s in time_sql
+    )
+    assert any("INSERT INTO `internal`.`sqlmesh__db`.`db__inc_time__" in s for s in time_sql)
+
+    # 2. INCREMENTAL_BY_UNIQUE_KEY model evaluation through SnapshotEvaluator
+    inc_uk_model = load_sql_based_model(
+        d_parse(
+            """
+            MODEL (
+                name db.inc_uk,
+                kind INCREMENTAL_BY_UNIQUE_KEY (
+                    unique_key id
+                ),
+                dialect doris,
+                physical_properties (
+                    buckets = 8
+                )
+            );
+            SELECT CAST(id AS INT) AS id, CAST(status AS VARCHAR(32)) AS status
+            FROM db.raw_users
+            """,
+            default_dialect="doris",
+        ),
+        default_catalog="internal",
+    )
+    inc_uk_snap = make_snapshot(inc_uk_model)
+    inc_uk_snap.categorize_as(SnapshotChangeCategory.BREAKING)
+    inc_uk_snap.add_interval("2023-12-31", "2023-12-31")
+
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.fetchall.return_value = [
+        ("id", "INT", "Yes", "true", None, ""),
+        ("status", "VARCHAR(32)", "Yes", "false", None, ""),
+    ]
+    evaluator.create([inc_uk_snap], {})
+    evaluator.evaluate(
+        inc_uk_snap,
+        start="2024-01-01",
+        end="2024-01-02",
+        execution_time="2024-01-03",
+        snapshots={inc_uk_snap.name: inc_uk_snap},
+    )
+    uk_sql = to_sql_calls(adapter)
+    assert any("UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 8" in s for s in uk_sql)
+    assert any("INSERT INTO `internal`.`sqlmesh__db`.`db__inc_uk__" in s for s in uk_sql)
+    assert not any("MERGE INTO" in s for s in uk_sql)
+
+    # 3. SCD_TYPE_2_BY_TIME model evaluation through SnapshotEvaluator
+    scd_model = load_sql_based_model(
+        d_parse(
+            """
+            MODEL (
+                name db.scd_users,
+                kind SCD_TYPE_2_BY_TIME (
+                    unique_key id,
+                    updated_at_name updated_at,
+                    time_data_type DATETIME
+                ),
+                columns (
+                    id INT,
+                    status VARCHAR(32),
+                    updated_at DATETIME,
+                    valid_from DATETIME,
+                    valid_to DATETIME
+                ),
+                dialect doris,
+                physical_properties (
+                    buckets = 4
+                )
+            );
+            SELECT CAST(id AS INT) AS id, CAST(status AS VARCHAR(32)) AS status, CAST(updated_at AS DATETIME) AS updated_at
+            FROM db.raw_users
+            """,
+            default_dialect="doris",
+        ),
+        default_catalog="internal",
+    )
+    scd_snap = make_snapshot(scd_model)
+    scd_snap.categorize_as(SnapshotChangeCategory.BREAKING)
+    scd_snap.add_interval("2023-12-31", "2023-12-31")
+
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.fetchall.return_value = [
+        ("id", "INT", "Yes", "true", None, ""),
+        ("status", "VARCHAR(32)", "Yes", "true", None, ""),
+        ("updated_at", "DATETIME", "Yes", "false", None, ""),
+        ("valid_from", "DATETIME", "Yes", "false", None, ""),
+        ("valid_to", "DATETIME", "Yes", "false", None, ""),
+    ]
+    evaluator.create([scd_snap], {})
+    evaluator.evaluate(
+        scd_snap,
+        start="2024-01-01",
+        end="2024-01-02",
+        execution_time="2024-01-03",
+        snapshots={scd_snap.name: scd_snap},
+    )
+    scd_sql = to_sql_calls(adapter)
+    assert any(
+        "CREATE TABLE IF NOT EXISTS `internal`.`sqlmesh__db`.`db__scd_users__" in s
+        and "DISTRIBUTED BY RANDOM BUCKETS 4" in s
+        for s in scd_sql
+    )
+    assert any("TRUNCATE TABLE `internal`.`sqlmesh__db`.`db__scd_users__" in s for s in scd_sql)
+    assert any("INSERT INTO `internal`.`sqlmesh__db`.`db__scd_users__" in s for s in scd_sql)
+
+    # 4. INCREMENTAL_BY_PARTITION model evaluation through SnapshotEvaluator
+    inc_part_model = load_sql_based_model(
+        d_parse(
+            """
+            MODEL (
+                name db.inc_part,
+                kind INCREMENTAL_BY_PARTITION,
+                dialect doris,
+                partitioned_by LIST(region),
+                physical_properties (
+                    duplicate_key = (id),
+                    partitions = "PARTITION p_us VALUES IN ('us')",
+                    buckets = 4
+                )
+            );
+            SELECT CAST(id AS INT) AS id, CAST(region AS VARCHAR(16)) AS region, CAST(amount AS DOUBLE) AS amount
+            FROM db.raw_regional_sales
+            """,
+            default_dialect="doris",
+        ),
+        default_catalog="internal",
+    )
+    inc_part_snap = make_snapshot(inc_part_model)
+    inc_part_snap.categorize_as(SnapshotChangeCategory.BREAKING)
+    inc_part_snap.add_interval("2023-12-31", "2023-12-31")
+
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.fetchall.return_value = [
+        ("id", "INT", "Yes", "true", None, ""),
+        ("region", "VARCHAR(16)", "Yes", "true", None, ""),
+        ("amount", "DOUBLE", "Yes", "false", None, ""),
+    ]
+    evaluator.create([inc_part_snap], {})
+    evaluator.evaluate(
+        inc_part_snap,
+        start="2024-01-01",
+        end="2024-01-02",
+        execution_time="2024-01-03",
+        snapshots={inc_part_snap.name: inc_part_snap},
+    )
+    part_sql = to_sql_calls(adapter)
+    assert any(
+        "DUPLICATE KEY (`id`, `region`) PARTITION BY LIST (`region`) (PARTITION p_us VALUES IN ('us')) DISTRIBUTED BY HASH (`id`) BUCKETS 4"
+        in s
+        for s in part_sql
+    )
+    assert any(
+        "DELETE FROM `internal`.`sqlmesh__db`.`db__inc_part__" in s
+        and "USING (SELECT DISTINCT `region` FROM `internal`.`sqlmesh__db`.`__temp_db__inc_part__"
+        in s
+        and "WHERE `_t1`.`region` = `_t2`.`region`" in s
+        for s in part_sql
+    )
+    assert any("INSERT INTO `internal`.`sqlmesh__db`.`db__inc_part__" in s for s in part_sql)

@@ -2786,11 +2786,11 @@ class DorisConnectionConfig(ConnectionConfig):
                 val = getattr(self, f"ssl_{key}", None)
                 if val is not None:
                     ssl_config[key] = val
-            if not ssl_config and (
-                (self.ssl is not None and self.ssl is not False)
-                or self.ssl_verify_cert is not None
-                or self.ssl_verify_identity is not None
-            ):
+            if self.ssl_verify_cert is not None:
+                ssl_config["verify_mode"] = self.ssl_verify_cert
+            if self.ssl_verify_identity is not None:
+                ssl_config["check_hostname"] = bool(self.ssl_verify_identity)
+            if not ssl_config and (self.ssl is not None and self.ssl is not False):
                 ssl_config["check_hostname"] = bool(self.ssl_verify_identity)
             if ssl_config:
                 kwargs["ssl"] = ssl_config
