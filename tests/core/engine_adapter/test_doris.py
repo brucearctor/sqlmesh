@@ -1193,8 +1193,10 @@ def test_sync_materialized_view_drop_and_replace(
     )
 
     assert to_sql_calls(adapter) == [
-        "DROP MATERIALIZED VIEW IF EXISTS `db`.`sync_mv` ON `db`.`orders`",
-        "CREATE MATERIALIZED VIEW `db`.`sync_mv` AS SELECT `region` AS `mv_region`, SUM(`amount`) AS `total` FROM `db`.`orders` GROUP BY `region`",
+        "USE `db`",
+        "DROP MATERIALIZED VIEW IF EXISTS `sync_mv` ON `db`.`orders`",
+        "USE `db`",
+        "CREATE MATERIALIZED VIEW `sync_mv` AS SELECT `region` AS `mv_region`, SUM(`amount`) AS `total` FROM `db`.`orders` GROUP BY `region`",
     ]
 
     adapter.cursor.execute.reset_mock()
@@ -1277,16 +1279,24 @@ def test_rewrite_between_in_where_preserves_not_between_and_wraps_or(
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
+    raw_where = parse_one(
+        "(ds BETWEEN '2024-01-01' AND '2024-01-07' OR status = 'expired') AND id NOT BETWEEN 10 AND 20",
+        read="doris",
+    )
+    rewritten_where = adapter._rewrite_between_in_where(raw_where.copy())
+    assert (
+        adapter._to_sql(rewritten_where)
+        == "((`ds` >= '2024-01-01' AND `ds` <= '2024-01-07') OR `status` = 'expired') AND NOT `id` BETWEEN 10 AND 20"
+    )
+
     adapter.delete_from(
         "target_table",
-        where=parse_one(
-            "(ds BETWEEN '2024-01-01' AND '2024-01-07' OR status = 'expired') AND id NOT BETWEEN 10 AND 20",
-            read="doris",
-        ),
+        where=raw_where,
     )
 
     assert to_sql_calls(adapter) == [
-        "DELETE FROM `target_table` WHERE ((`ds` >= '2024-01-01' AND `ds` <= '2024-01-07') OR `status` = 'expired') AND NOT `id` BETWEEN 10 AND 20",
+        "DELETE FROM `target_table` WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-07' AND NOT `id` BETWEEN 10 AND 20",
+        "DELETE FROM `target_table` WHERE `status` = 'expired' AND NOT `id` BETWEEN 10 AND 20",
     ]
 
 
@@ -1795,9 +1805,11 @@ def test_resolve_table_refs_in_physical_properties_for_mv_and_sync_mv(
         view_properties=rendered_sync_props,
     )
     sync_calls = to_sql_calls(adapter)
-    assert sync_calls[0] == (
-        f"DROP MATERIALIZED VIEW IF EXISTS `doris_db`.`orders_sync_mv` ON `{physical_tbl.db}`.`{physical_tbl.name}`"
+    assert sync_calls[0] == "USE `doris_db`"
+    assert sync_calls[1] == (
+        f"DROP MATERIALIZED VIEW IF EXISTS `orders_sync_mv` ON `{physical_tbl.db}`.`{physical_tbl.name}`"
     )
+    assert sync_calls[-1].startswith("CREATE MATERIALIZED VIEW `orders_sync_mv` AS ")
 
 
 def test_dataframe_seed_all_string_coercion_and_batch_size(
@@ -3639,8 +3651,10 @@ def test_unannotated_unknown_columns_ctas_and_sync_mv_and_schema_tmp_truncation(
     adapter.drop_view("db.sync_mv_typed", materialized=True)
 
     assert to_sql_calls(adapter) == [
-        "CREATE MATERIALIZED VIEW `db`.`sync_mv_typed` AS SELECT `id` AS `mv_id`, SUM(`amount`) AS `total` FROM `db`.`orders` GROUP BY `id`",
-        "DROP MATERIALIZED VIEW IF EXISTS `db`.`sync_mv_typed` ON `db`.`orders`",
+        "USE `db`",
+        "CREATE MATERIALIZED VIEW `sync_mv_typed` AS SELECT `id` AS `mv_id`, SUM(`amount`) AS `total` FROM `db`.`orders` GROUP BY `id`",
+        "USE `db`",
+        "DROP MATERIALIZED VIEW IF EXISTS `sync_mv_typed` ON `db`.`orders`",
     ]
 
     # 4. Overlong `_schema_tmp` table identifier (> 64 chars) is deterministically shortened to <= 64 chars
@@ -4070,8 +4084,10 @@ def test_doris_sync_mv_source_tables_persistence_and_isolation(
         view_properties={"materialized_type": exp.Literal.string("SYNC")},
     )
     assert to_sql_calls(adapter) == [
-        "DROP MATERIALIZED VIEW IF EXISTS `db1`.`shared_mv` ON `db1`.`orders`",
-        "DROP MATERIALIZED VIEW IF EXISTS `db2`.`shared_mv` ON `db2`.`events`",
+        "USE `db1`",
+        "DROP MATERIALIZED VIEW IF EXISTS `shared_mv` ON `db1`.`orders`",
+        "USE `db2`",
+        "DROP MATERIALIZED VIEW IF EXISTS `shared_mv` ON `db2`.`events`",
     ]
 
     # 2. Recreating a view name as an async MTMV pops any stale sync MV entry so subsequent
@@ -4182,3 +4198,322 @@ def test_doris_reconnect_catalog_db_restore_union_star_delete_and_extra_or_condi
         "DELETE FROM `iceberg_cat`.`db`.`target` WHERE `id` IN (1, 2) AND `status` = 'a'",
         "DELETE FROM `iceberg_cat`.`db`.`target` WHERE `id` IN (1, 2) AND `status` IS NULL",
     ]
+
+
+def test_doris_dialect_native_types_and_complex_constructors_and_row_diff(
+    make_mocked_engine_adapter: t.Callable,
+):
+    from sqlmesh.core.dialect import parse as d_parse
+    from sqlmesh.core.model import load_sql_based_model
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Doris-native data types parse cleanly in `MODEL (columns (...))` and round-trip in Doris SQL:
+    #    `LARGEINT`, `IPV4`, `IPV6`, `JSONB`, `VARIANT`, `BITMAP`, `HLL`, `QUANTILE_STATE`, `AGG_STATE`,
+    #    `DATEV2`, `DATETIMEV2(3)`, `DECIMALV3(18, 4)`, `ARRAY`, `MAP`, and `STRUCT`.
+    model = load_sql_based_model(
+        d_parse(
+            """
+            MODEL (
+                name db.doris_rich_types,
+                kind FULL,
+                dialect doris,
+                columns (
+                    id LARGEINT,
+                    ip4 IPV4,
+                    ip6 IPV6,
+                    jb JSONB,
+                    var_col VARIANT,
+                    bm BITMAP,
+                    hll_col HLL,
+                    qs QUANTILE_STATE,
+                    agg_s AGG_STATE<max_by(INT, INT)>,
+                    dt2 DATEV2,
+                    ts2 DATETIMEV2(3),
+                    dec3 DECIMALV3(18, 4),
+                    tags ARRAY<VARCHAR(32)>,
+                    attrs MAP<STRING, INT>,
+                    profile STRUCT<uid: BIGINT, name: VARCHAR(64)>
+                )
+            );
+            SELECT
+                CAST(1 AS LARGEINT) AS id,
+                CAST('127.0.0.1' AS IPV4) AS ip4,
+                CAST('::1' AS IPV6) AS ip6,
+                CAST('{}' AS JSONB) AS jb,
+                CAST('{}' AS VARIANT) AS var_col,
+                BITMAP_EMPTY() AS bm,
+                HLL_EMPTY() AS hll_col,
+                TO_QUANTILE_STATE(1, 2048) AS qs,
+                 max_by_state(1, 2) AS agg_s,
+                CAST('2024-01-01' AS DATEV2) AS dt2,
+                CAST('2024-01-01 00:00:00' AS DATETIMEV2(3)) AS ts2,
+                CAST(12.34 AS DECIMALV3(18, 4)) AS dec3,
+                ARRAY('a', 'b') AS tags,
+                MAP('k1', 1, 'k2', 2) AS attrs,
+                STRUCT(100, 'alice') AS profile
+            """,
+            default_dialect="doris",
+        )
+    )
+    cols = model.columns_to_types
+    assert cols is not None
+    adapter.create_table("db.doris_rich_types", cols)
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`doris_rich_types` ("
+        "`id` LARGEINT, `ip4` IPV4, `ip6` IPV6, `jb` JSONB, `var_col` VARIANT, "
+        "`bm` BITMAP, `hll_col` HLL, `qs` QUANTILE_STATE, `agg_s` AGG_STATE<max_by(INT, INT)>, "
+        "`dt2` DATE, `ts2` DATETIME(3), `dec3` DECIMAL(18, 4), `tags` ARRAY<VARCHAR(32)>, "
+        "`attrs` MAP<STRING, INT>, `profile` STRUCT<`uid`: BIGINT, `name`: VARCHAR(64)>)"
+    ]
+
+    # 2. Complex literal constructors (`ARRAY`, `MAP`, `STRUCT`, `NAMED_STRUCT`), `LEFT SEMI JOIN`,
+    #    `LEFT ANTI JOIN` on unaliased tables, and `DISTINCT ON` transpile cleanly in Doris dialect.
+    query_sql = parse_one(
+        "SELECT [1, 2], MAP('a', 1, 'b', 2), STRUCT(1, 'x'), NAMED_STRUCT('id', 1, 'name', 'x') "
+        "FROM db.t1 LEFT ANTI JOIN db.t2 ON db.t1.id = db.t2.id "
+        "LEFT SEMI JOIN db.t3 ON db.t1.id = db.t3.id",
+        read="doris",
+    ).sql("doris")
+    assert (
+        query_sql
+        == "SELECT ARRAY(1, 2), MAP('a', 1, 'b', 2), STRUCT(1, 'x'), NAMED_STRUCT('id', 1, 'name', 'x') "
+        "FROM db.t1 LEFT ANTI JOIN db.t2 ON db.t1.id = db.t2.id "
+        "LEFT SEMI JOIN db.t3 ON db.t1.id = db.t3.id"
+    )
+    distinct_on_sql = parse_one(
+        "SELECT DISTINCT ON (id) id, ts FROM db.events ORDER BY id, ts DESC",
+        read="doris",
+    ).sql("doris")
+    assert "ROW_NUMBER() OVER (PARTITION BY id ORDER BY id, ts DESC)" in distinct_on_sql
+
+    # 3. `RowDiffMixin.concat_columns` (`_normalize_value`) casts complex & special Doris types
+    #    to `VARCHAR` instead of `DataType.Type.STRUCT` / `ARRAY` / `USERDEFINED`.
+    concat_expr = adapter.concat_columns(
+        {
+            "id": cols["id"],
+            "tags": cols["tags"],
+            "attrs": cols["attrs"],
+            "profile": cols["profile"],
+            "bm": cols["bm"],
+            "var_col": cols["var_col"],
+        }
+    )
+    rendered_concat = concat_expr.sql("doris")
+    assert "AS STRUCT" not in rendered_concat
+    assert "AS ARRAY" not in rendered_concat
+    assert "AS MAP" not in rendered_concat
+    assert "AS BITMAP" not in rendered_concat
+    assert "CAST(tags AS VARCHAR)" in rendered_concat
+    assert "CAST(`profile` AS VARCHAR)" in rendered_concat
+    assert (
+        adapter._normalize_nested_value(exp.column("tags", "s")).sql("doris")
+        == "CAST(s.tags AS VARCHAR)"
+    )
+
+
+def test_doris_ctas_window_partially_annotated_positional_group_order_and_subquery_union(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Unannotated CTAS with `ROW_NUMBER() OVER (...)` at col 1 and `AVG(score)` at col 0
+    #    recognizes `exp.Window` (`ROW_NUMBER` -> `BIGINT`) and promotes `rn` to col 0.
+    adapter.ctas(
+        "db.win_ctas",
+        parse_one(
+            "SELECT AVG(score) AS avg_score, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM db.src GROUP BY id",
+            read="doris",
+        ),
+    )
+
+    # 2. Partially annotated CTAS (`score: DOUBLE`, `id: INT`, `extra: UNKNOWN`) uses known column
+    #    types to promote `id` before `score` (`DOUBLE`) and remaps positional `GROUP BY 2 ORDER BY 2 DESC` -> `1`.
+    adapter.ctas(
+        "db.partial_annotated_ctas",
+        parse_one(
+            "SELECT AVG(score) AS score, id, extra FROM db.src GROUP BY 2, 3 ORDER BY 2 DESC",
+            read="doris",
+        ),
+        target_columns_to_types={
+            "score": exp.DataType.build("DOUBLE", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "extra": exp.DataType.build("UNKNOWN"),
+        },
+    )
+
+    # 3. Parenthesized `UNION ALL` branches (`(SELECT ...) UNION ALL (SELECT ...)`) with `auto_partition = true`
+    #    unwrap `exp.Subquery` nodes, reorder projections in lockstep, and wrap range partition column in `NON_NULLABLE`.
+    adapter.ctas(
+        "db.paren_union_auto_ctas",
+        parse_one(
+            "(SELECT AVG(score) AS score, CAST(id AS INT) AS id, CAST(ds AS DATE) AS ds FROM db.s1 GROUP BY 2, 3) "
+            "UNION ALL "
+            "(SELECT CAST(score AS DOUBLE) AS score, CAST(id AS INT) AS id, CAST(ds AS DATE) AS ds FROM db.s2)",
+            read="doris",
+        ),
+        partitioned_by=[parse_one("RANGE(ds)", read="doris")],
+        table_properties={"auto_partition": exp.Literal.string("true")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`win_ctas` AS SELECT ROW_NUMBER() OVER (ORDER BY `id`) AS `rn`, AVG(`score`) AS `avg_score` FROM `db`.`src` GROUP BY `id`",
+        "CREATE TABLE IF NOT EXISTS `db`.`partial_annotated_ctas` AS SELECT `id`, AVG(`score`) AS `score`, `extra` FROM `db`.`src` GROUP BY 1, 3 ORDER BY 1 DESC",
+        "CREATE TABLE IF NOT EXISTS `db`.`paren_union_auto_ctas` AUTO PARTITION BY RANGE (`ds`) () AS (SELECT CAST(`id` AS INT) AS `id`, NON_NULLABLE(CAST(`ds` AS DATE)) AS `ds`, AVG(`score`) AS `score` FROM `db`.`s1` GROUP BY 1, 2) UNION ALL (SELECT CAST(`id` AS INT) AS `id`, NON_NULLABLE(CAST(`ds` AS DATE)) AS `ds`, CAST(`score` AS DOUBLE) AS `score` FROM `db`.`s2`)",
+    ]
+
+
+def test_doris_replace_by_key_text_preservation_intersect_delete_and_direct_time_delete(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+
+    # 1. `merge` / `_replace_by_key` when `unique_key` is a `TEXT`/`STRING` column (`doc_id`) and
+    #    another valid OLAP key column (`tenant_id INT`) exists: does NOT coerce `doc_id` to `VARCHAR(255)`
+    #    on the temp table (preventing 255-byte truncation of long keys), while promoting `tenant_id` to col 0.
+    adapter.merge(
+        target_table="db.docs_tbl",
+        source_table=parse_one("SELECT doc_id, tenant_id FROM db.staging_docs", read="doris"),
+        target_columns_to_types={
+            "doc_id": exp.DataType.build("TEXT", dialect="doris"),
+            "tenant_id": exp.DataType.build("INT", dialect="doris"),
+        },
+        unique_key=[exp.to_column("doc_id")],
+    )
+    merge_sqls = to_sql_calls(adapter)
+    assert (
+        merge_sqls[0]
+        == "CREATE TABLE `db`.`__temp_docs_tbl_abcd1234` AS SELECT CAST(`tenant_id` AS INT) AS `tenant_id`, CAST(`doc_id` AS STRING) AS `doc_id` FROM (SELECT `doc_id`, `tenant_id` FROM `db`.`staging_docs`) AS `_subquery`"
+    )
+
+    # 2. `_delete_by_time_transform_keys` with `INTERSECT` or `EXCEPT` does NOT unwrap `DATE_TRUNC(ds, 'day')`
+    #    into raw `ds` inside the branches (preserving day-level set intersection/difference semantics),
+    #    and unwraps parenthesized `(SELECT ...)` branches in `DELETE ... USING`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter.cursor,
+        "fetchall",
+        return_value=[("2024-01-15", "2024-01-16")],
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "DATE_TRUNC(ds, 'day') IN ((SELECT DATE_TRUNC(ds, 'day') FROM db.s1) INTERSECT (SELECT DATE_TRUNC(ds, 'day') FROM db.s2))",
+            read="doris",
+        ),
+    )
+    adapter.delete_from(
+        "db.events",
+        where=parse_one(
+            "id IN ((SELECT id FROM db.s1) UNION ALL (SELECT id FROM db.s2))",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "SELECT DISTINCT DATE_TRUNC(`_col_0`, 'day') AS `_low_0`, DATE_ADD(DATE_TRUNC(`_col_0`, 'day'), INTERVAL 1 DAY) AS `_high_0` FROM ((SELECT DATE_TRUNC(`ds`, 'DAY') AS `_col_0` FROM `db`.`s1`) INTERSECT (SELECT DATE_TRUNC(`ds`, 'DAY') FROM `db`.`s2`)) AS `_sq`",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-16'",
+        "DELETE FROM `db`.`events` AS `_t1` USING ((SELECT `id` FROM `db`.`s1`) UNION ALL (SELECT `id` FROM `db`.`s2`)) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id`",
+    ]
+
+    # 3. Direct time-transform predicates (`DATE_TRUNC(ds, 'day') = '2024-01-15'`, `YEAR(ds) = 2024`,
+    #    `DATE_TRUNC(ds, 'day') IN ('2024-01-15', '2024-01-16')`) and heterogeneous `OR` predicates
+    #    (`a = 1 OR b = 2`) in `delete_from` are rewritten into `OR`-free bare-column predicates.
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from("db.events", "DATE_TRUNC(ds, 'day') = '2024-01-15'")
+    adapter.delete_from("db.events", "YEAR(ds) = 2024")
+    adapter.delete_from("db.events", "DATE_TRUNC(ds, 'day') IN ('2024-01-15', '2024-01-16')")
+    adapter.delete_from("db.events", "a = 1 OR b = 2")
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-16'",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-01' AND `ds` < '2025-01-01'",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-16'",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-16' AND `ds` < '2024-01-17'",
+        "DELETE FROM `db`.`events` WHERE `a` = 1",
+        "DELETE FROM `db`.`events` WHERE `b` = 2",
+    ]
+
+
+def test_doris_physical_properties_kwarg_drop_schema_cascade_and_mv_df_source_columns(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. `physical_properties={'engine': exp.Literal.string('iceberg')}` (as passed by SnapshotEvaluator)
+    #    is honored across `replace_query` / `_insert_overwrite_by_condition`.
+    mocker.patch.object(
+        adapter,
+        "get_data_object",
+        return_value=DataObject(
+            catalog="internal", schema="db", name="iceberg_by_prop", type=DataObjectType.TABLE
+        ),
+    )
+    adapter.replace_query(
+        "db.iceberg_by_prop",
+        parse_one("SELECT 1 AS id", read="doris"),
+        target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
+        physical_properties={"engine": exp.Literal.string("iceberg")},
+    )
+    assert to_sql_calls(adapter) == [
+        "INSERT OVERWRITE TABLE `db`.`iceberg_by_prop` (`id`) SELECT 1 AS `id`"
+    ]
+
+    # 2. `drop_schema(..., cascade=True)` on an external Iceberg catalog drops member tables first
+    #    before issuing `DROP DATABASE`.
+    adapter.cursor.execute.reset_mock()
+    mocker.patch.object(
+        adapter,
+        "_get_data_objects",
+        return_value=[
+            DataObject(
+                catalog="iceberg_cat", schema="silver", name="t1", type=DataObjectType.TABLE
+            ),
+            DataObject(
+                catalog="iceberg_cat", schema="silver", name="t2", type=DataObjectType.TABLE
+            ),
+        ],
+    )
+    adapter.drop_schema("iceberg_cat.silver", ignore_if_not_exists=True, cascade=True)
+    assert to_sql_calls(adapter) == [
+        "DROP TABLE IF EXISTS `iceberg_cat`.`silver`.`t1`",
+        "DROP TABLE IF EXISTS `iceberg_cat`.`silver`.`t2`",
+        "DROP DATABASE IF EXISTS `iceberg_cat`.`silver`",
+    ]
+
+    # 3. `_create_materialized_view` with a DataFrame containing extra `source_columns` not in
+    #    `target_columns_to_types` slices only `source_columns_to_types` so `_values_to_sql` never raises `ValueError`.
+    adapter.cursor.execute.reset_mock()
+    df_extra = pd.DataFrame([{"id": 1, "name": "alice", "extra_ignored": 999}])
+    adapter.create_view(
+        "db.mv_from_df_subset",
+        df_extra,
+        replace=False,
+        materialized=True,
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "name": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+        },
+        source_columns=["id", "name", "extra_ignored"],
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE MATERIALIZED VIEW `db`.`mv_from_df_subset` (`id`, `name`) AS SELECT CAST(`id` AS INT) AS `id`, CAST(`name` AS VARCHAR(32)) AS `name` FROM (SELECT 1 AS `id`, 'alice' AS `name`) AS `t`"
+    ]
+
+    # 4. `_truncate_table` normalizes >64-char `_schema_tmp` table names before `TRUNCATE TABLE` and fallback `DELETE`.
+    adapter.cursor.execute.reset_mock()
+    long_tmp = "db." + ("very_long_table_name_" * 3) + "_schema_tmp"
+    short_tmp = adapter._shorten_schema_tmp_name(exp.to_table(long_tmp).name)
+    adapter._truncate_table(long_tmp)
+    assert to_sql_calls(adapter) == [f"TRUNCATE TABLE `db`.`{short_tmp}`"]
+
+    # 5. `_fetch_native_df` with a raw string query containing `IS TRUE` or >64-char `_schema_tmp`
+    #    normalizes the SQL string before `pd.read_sql_query`.
+    mock_read_sql = mocker.patch(
+        "pandas.io.sql.read_sql_query",
+        return_value=pd.DataFrame({"id": [1]}),
+    )
+    adapter.fetchdf(f"SELECT id FROM {long_tmp} WHERE is_active IS TRUE", quote_identifiers=True)
+    assert (
+        mock_read_sql.call_args[0][0]
+        == f"SELECT `id` FROM `db`.`{short_tmp}` WHERE `is_active` = TRUE"
+    )

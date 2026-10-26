@@ -63,6 +63,8 @@ pip install "sqlmesh[doris]"
 | `ssl_key` | Path to the file that contains a PEM-formatted private key for the client certificate | string | N |
 | `ssl_verify_cert` | Set to `true` to verify the server's certificate against the CA certificate | bool | N |
 | `ssl_verify_identity` | Set to `true` to verify the server's identity in addition to the certificate | bool | N |
+| `light_schema_change_wait_timeout` | Maximum time in seconds to poll `SHOW ALTER TABLE COLUMN` when an `ALTER TABLE` statement triggers an asynchronous Doris schema change job (Default: `300.0`) | float | N |
+| `light_schema_change_poll_interval` | Interval in seconds between `SHOW ALTER TABLE COLUMN` status polls during an asynchronous Doris schema change job (Default: `0.5`) | float | N |
 | `concurrent_tasks` | The maximum number of tasks that can use this connection concurrently (Default: `4`) | int | N |
 | `register_comments` | Whether or not to register model comments with the SQL engine (Default: `True`) | bool | N |
 
@@ -542,7 +544,7 @@ GROUP BY user_id, CAST(event_time AS DATE);
 
 ### Synchronous Materialized Views (`materialized_type = 'SYNC'`)
 
-Doris also supports single-table synchronous materialized views (rollup indexes maintained atomically on base table writes) by setting `materialized_type = 'SYNC'` and `source_table` in `physical_properties`:
+Doris also supports single-table synchronous materialized views (rollup indexes maintained atomically on a single `internal`-catalog OLAP base table; queries with `JOIN`s or external catalog tables must use asynchronous MTMVs instead) by setting `materialized_type = 'SYNC'` and `source_table` in `physical_properties`:
 
 ```sql
 MODEL (

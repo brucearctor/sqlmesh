@@ -10,12 +10,14 @@ from difflib import unified_diff
 from enum import Enum, auto
 from functools import lru_cache
 
-from sqlglot import Dialect, Generator, ParseError, Parser, Tokenizer, TokenType, exp
-from sqlglot.dialects.dialect import DialectType
-from sqlglot.dialects import DuckDB, Snowflake, TSQL
+from sqlglot import Dialect, Generator, ParseError, Parser, Tokenizer, TokenType, exp, transforms
+from sqlglot.dialects.dialect import DialectType, var_map_sql
+from sqlglot.dialects import Doris, DuckDB, Snowflake, TSQL
 import sqlglot.dialects.athena as athena
 import sqlglot.generators.athena as athena_generators
+from sqlglot.parser import build_var_map
 from sqlglot.parsers.athena import AthenaTrinoParser
+from sqlglot.parsers.hive import _build_named_struct
 from sqlglot.helper import seq_get
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify_columns import quote_identifiers
@@ -484,12 +486,52 @@ def _parse_types(
     with_collation: bool = False,
 ) -> t.Optional[exp.Expr]:
     start = self._curr
+    udt_name = (
+        self._curr.text.upper()
+        if self._curr and self._curr.token_type == TokenType.USERDEFINED
+        else None
+    )
+    if udt_name == "AGG_STATE" and not check_func:
+        self._advance()
+        if self._curr and self._curr.token_type in (TokenType.LT, TokenType.L_PAREN):
+            open_tok = self._curr.token_type
+            close_tok = TokenType.GT if open_tok == TokenType.LT else TokenType.R_PAREN
+            depth = 1
+            self._advance()
+            while self._curr and depth > 0:
+                if self._curr.token_type == open_tok:
+                    depth += 1
+                elif self._curr.token_type == close_tok:
+                    depth -= 1
+                self._advance()
+            parsed_type: t.Optional[exp.Expr] = self.expression(
+                exp.DataType(
+                    this=exp.DataType.Type.USERDEFINED,
+                    kind=self._find_sql(start, self._prev),
+                )
+            )
+        else:
+            parsed_type = self.expression(
+                exp.DataType(this=exp.DataType.Type.USERDEFINED, kind="AGG_STATE")
+            )
+        if schema and parsed_type:
+            parsed_type.meta["sql"] = self._find_sql(start, self._prev)
+        return parsed_type
+
     parsed_type = self.__parse_types(  # type: ignore
         check_func=check_func,
         schema=schema,
         allow_identifiers=allow_identifiers,
         with_collation=with_collation,
     )
+
+    if (
+        udt_name
+        and isinstance(parsed_type, exp.DataType)
+        and parsed_type.this == exp.DataType.Type.USERDEFINED
+        and not parsed_type.args.get("kind")
+    ):
+        parsed_type.set("kind", udt_name)
 
     if schema and parsed_type:
         parsed_type.meta["sql"] = self._find_sql(start, self._prev)
@@ -579,6 +621,46 @@ def altercolumn_sql(self: Generator, expression: exp.AlterColumn) -> str:
         sql = f"{sql} NULL" if allow_null else f"{sql} NOT NULL"
 
     return sql
+
+
+def columndef_sql(self: Generator, expression: exp.ColumnDef, sep: str = " ") -> str:
+    return self._columndef_sql(  # type: ignore
+        expression,
+        sep=(
+            ": "
+            if isinstance(expression.parent, exp.DataType) and expression.parent.is_type("struct")
+            else sep
+        ),
+    )
+
+
+def _doris_map_sql(self: Generator, expression: exp.Map | exp.VarMap) -> str:
+    keys = expression.args.get("keys")
+    values = expression.args.get("values")
+    if isinstance(keys, exp.Array) and isinstance(values, exp.Array):
+        return var_map_sql(self, expression)
+    if keys is not None or values is not None:
+        return self.func("MAP", keys, values)
+    return self.func("MAP", *expression.expressions)
+
+
+def _doris_struct_sql(self: Generator, expression: exp.Struct) -> str:
+    if any(isinstance(e, exp.PropertyEQ) for e in expression.expressions):
+        args: t.List[str] = []
+        for e in expression.expressions:
+            if isinstance(e, exp.PropertyEQ):
+                key_sql = (
+                    self.sql(exp.Literal.string(e.this.name))
+                    if isinstance(e.this, (exp.Identifier, exp.Var))
+                    else self.sql(e.this)
+                )
+                args.append(key_sql)
+                args.append(self.sql(e.expression))
+            else:
+                args.append(self.sql(e))
+        return self.func("NAMED_STRUCT", *args)
+    values = [e.this if isinstance(e, exp.Alias) else e for e in expression.expressions]
+    return self.func("STRUCT", *values)
 
 
 def _parse_if(self: Parser) -> t.Optional[exp.Expr]:
@@ -1343,6 +1425,64 @@ def parse(
 
 def extend_sqlglot() -> None:
     """Extend SQLGlot with SQLMesh's custom macro aware dialect."""
+    Doris.SUPPORTS_USER_DEFINED_TYPES = True
+    if Doris.tokenizer_class.__name__ != "_DorisTokenizer":
+
+        class _DorisTokenizer(Doris.tokenizer_class):  # type: ignore
+            KEYWORDS = {
+                **Doris.tokenizer_class.KEYWORDS,
+                "AGG_STATE": TokenType.USERDEFINED,
+                "BITMAP": TokenType.USERDEFINED,
+                "DATETIMEV2": TokenType.DATETIME,
+                "DATEV2": TokenType.DATE,
+                "DECIMALV2": TokenType.DECIMAL,
+                "DECIMALV3": TokenType.DECIMAL,
+                "HLL": TokenType.HLLSKETCH,
+                "IPV4": TokenType.IPV4,
+                "IPV6": TokenType.IPV6,
+                "JSONB": TokenType.JSONB,
+                "LARGEINT": TokenType.INT128,
+                "QUANTILE_STATE": TokenType.USERDEFINED,
+                "VARIANT": TokenType.VARIANT,
+            }
+
+        Doris.Tokenizer = _DorisTokenizer
+        Doris.tokenizer_class = _DorisTokenizer
+
+    Doris.Parser.TABLE_ALIAS_TOKENS = Doris.Parser.TABLE_ALIAS_TOKENS - {
+        TokenType.ANTI,
+        TokenType.SEMI,
+    }
+    Doris.Parser.FUNCTIONS.update(
+        {
+            "MAP": build_var_map,
+            "NAMED_STRUCT": _build_named_struct,
+        }
+    )
+    Doris.Generator.TYPE_MAPPING.update(
+        {
+            exp.DataType.Type.HLLSKETCH: "HLL",
+            exp.DataType.Type.INT128: "LARGEINT",
+            exp.DataType.Type.IPV4: "IPV4",
+            exp.DataType.Type.IPV6: "IPV6",
+            exp.DataType.Type.JSONB: "JSONB",
+            exp.DataType.Type.VARIANT: "VARIANT",
+        }
+    )
+    Doris.Generator.TRANSFORMS.update(
+        {
+            exp.Map: _doris_map_sql,
+            exp.Select: transforms.preprocess(
+                [
+                    transforms.eliminate_distinct_on,
+                    transforms.unnest_generate_date_array_using_recursive_cte,
+                ]
+            ),
+            exp.Struct: _doris_struct_sql,
+            exp.VarMap: _doris_map_sql,
+        }
+    )
+
     tokenizers = {Tokenizer}
     parsers = {Parser}
     generators = {Generator}
@@ -1432,6 +1572,7 @@ def extend_sqlglot() -> None:
     _override(Snowflake.Parser, _parse_table_parts)
     _override(TSQL.Parser, _parse_alter_table_alter)
     _override(TSQL.Generator, altercolumn_sql)
+    _override(Doris.Generator, columndef_sql)
 
     # DuckDB's prefix absolute power operator `@` clashes with the macro syntax
     DuckDB.Parser.NO_PAREN_FUNCTION_PARSERS.pop("@", None)
