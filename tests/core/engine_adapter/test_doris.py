@@ -4828,3 +4828,202 @@ def test_doris_4_1_native_merge_into_and_timestamptz(
         and isinstance(ops[0], TableAlterChangeColumnTypeOperation)
         and ops[0].is_part_of_destructive_change is False
     )
+
+
+def test_lance_table_reading_and_write_guard(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    from sqlmesh.core.dialect import find_tables
+
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Reading from a Doris Lance catalog table extracts upstream table dependency cleanly
+    lance_select = parse_one(
+        "SELECT id, L2_DISTANCE(vec, [1.0, 2.0, 3.0]) AS dist FROM lance_cat.ml_db.embeddings ORDER BY dist LIMIT 5",
+        read="doris",
+    )
+    assert (
+        lance_select.sql("doris")
+        == "SELECT id, L2_DISTANCE(vec, ARRAY(1.0, 2.0, 3.0)) AS dist FROM lance_cat.ml_db.embeddings ORDER BY dist LIMIT 5"
+    )
+    assert find_tables(lance_select, default_catalog=None, dialect="doris") == {
+        '"lance_cat"."ml_db"."embeddings"'
+    }
+
+    # 2. Reading from a Doris Lance table-valued function (TVF)
+    lance_tvf = parse_one(
+        "SELECT id, vec FROM s3('uri' = 's3://bucket/data.lance', 'format' = 'lance')",
+        read="doris",
+    )
+    assert (
+        lance_tvf.sql("doris")
+        == "SELECT id, vec FROM S3('uri' = 's3://bucket/data.lance', 'format' = 'lance')"
+    )
+
+    # 3. Attempting to materialize / write a Lance table raises a clear SQLMeshError
+    with pytest.raises(SQLMeshError, match="Doris Lance tables are read-only"):
+        adapter.create_table(
+            "lance_cat.ml_db.out_tbl",
+            target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
+            table_format="lance",
+        )
+
+    with pytest.raises(SQLMeshError, match="Doris Lance tables are read-only"):
+        adapter.ctas(
+            "lance_cat.ml_db.out_tbl",
+            parse_one("SELECT 1 AS id", read="doris"),
+            table_properties={"engine": exp.Literal.string("lance")},
+        )
+
+
+def test_iceberg_reading_time_travel_branch_and_compaction_ddl(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    from sqlmesh.core.dialect import find_tables
+
+    _ = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Iceberg time travel (FOR TIME AS OF, FOR VERSION AS OF) and branch/tag (@branch, @tag)
+    for sql, expected in [
+        (
+            "SELECT * FROM ice_cat.db.tbl FOR TIME AS OF '2026-01-01 00:00:00' AS t",
+            "SELECT * FROM ice_cat.db.tbl FOR TIME AS OF '2026-01-01 00:00:00' AS t",
+        ),
+        (
+            "SELECT * FROM ice_cat.db.tbl FOR VERSION AS OF 123456789 AS t",
+            "SELECT * FROM ice_cat.db.tbl FOR VERSION AS OF 123456789 AS t",
+        ),
+        (
+            "SELECT * FROM ice_cat.db.tbl@branch(audit_branch) AS t",
+            "SELECT * FROM ice_cat.db.tbl @branch(audit_branch) AS t",
+        ),
+        (
+            "SELECT * FROM ice_cat.db.tbl @tag(v1_release) AS t",
+            "SELECT * FROM ice_cat.db.tbl @tag(v1_release) AS t",
+        ),
+    ]:
+        parsed = parse_one(sql, read="doris")
+        assert parsed.sql("doris") == expected
+        # Upstream table dependency extraction preserves `ice_cat.db.tbl` without `@branch(...)`
+        tables = list(parsed.find_all(exp.Table))
+        assert [(tbl.catalog, tbl.db, tbl.name) for tbl in tables] == [("ice_cat", "db", "tbl")]
+        assert find_tables(parsed, default_catalog=None, dialect="doris") == {
+            '"ice_cat"."db"."tbl"'
+        }
+
+    # 2. Iceberg compaction (rewrite_data_files), snapshot expiration, and branch/tag DDL parse as exp.Alter
+    for ddl in [
+        "ALTER TABLE ice_cat.db.tbl EXECUTE rewrite_data_files('target-file-size-bytes' = '134217728')",
+        "ALTER TABLE ice_cat.db.tbl EXECUTE expire_snapshots('older_than' = '2026-01-01 00:00:00')",
+        "ALTER TABLE ice_cat.db.tbl EXECUTE remove_orphan_files('older_than' = '2026-01-01 00:00:00')",
+        "ALTER TABLE ice_cat.db.tbl CREATE BRANCH audit_branch",
+        "ALTER TABLE ice_cat.db.tbl CREATE TAG v1_tag",
+        "ALTER TABLE ice_cat.db.tbl DROP BRANCH IF EXISTS audit_branch",
+    ]:
+        parsed_ddl = parse_one(ddl, read="doris")
+        assert isinstance(parsed_ddl, exp.Alter)
+        assert parsed_ddl.this.sql("doris") == "ice_cat.db.tbl"
+        assert parsed_ddl.sql("doris") == ddl
+
+
+def test_doris_4_1_search_indexes_compaction_and_sequence_col(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Full-text search (SEARCH, MATCH_ANY, MATCH_PHRASE, etc.) and vector distance functions
+    ft_query = parse_one(
+        "SELECT id, L1_DISTANCE(v1, v2) AS l1, INNER_PRODUCT(v1, v2) AS ip "
+        "FROM db.docs WHERE title MATCH_PHRASE 'apache doris' AND SEARCH('title:doris AND body:sqlmesh')",
+        read="doris",
+    )
+    assert (
+        ft_query.sql("doris")
+        == "SELECT id, L1_DISTANCE(v1, v2) AS l1, INNER_PRODUCT(v1, v2) AS ip "
+        "FROM db.docs WHERE title MATCH_PHRASE 'apache doris' AND SEARCH('title:doris AND body:sqlmesh')"
+    )
+
+    # 2. Index DDL: create_index with USING INVERTED / ANN, PROPERTIES, COMMENT, and BUILD INDEX
+    adapter.create_index(
+        "db.docs",
+        "idx_title_ft",
+        [exp.to_column("title")],
+        index_type="INVERTED",
+        index_properties={"parser": "english", "support_phrase": "true"},
+        comment="fulltext index",
+    )
+    adapter.create_index(
+        "db.docs",
+        "idx_vec_ann",
+        [exp.to_column("embedding")],
+        index_type="ANN",
+        index_properties={"index_type": "hnsw", "metric_type": "l2_distance", "dim": "128"},
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE INDEX IF NOT EXISTS `idx_title_ft` ON `db`.`docs`(`title`) USING INVERTED PROPERTIES ('parser'='english', 'support_phrase'='true') COMMENT 'fulltext index'",
+        "CREATE INDEX IF NOT EXISTS `idx_vec_ann` ON `db`.`docs`(`embedding`) USING ANN PROPERTIES ('index_type'='hnsw', 'metric_type'='l2_distance', 'dim'='128')",
+    ]
+
+    build_idx = parse_one("BUILD INDEX idx_title_ft ON db.docs PARTITIONS (p1, p2)", read="doris")
+    assert isinstance(build_idx, exp.Alter)
+    assert build_idx.this.sql("doris") == "db.docs"
+    assert build_idx.sql("doris") == "BUILD INDEX idx_title_ft ON db.docs PARTITIONS (p1, p2)"
+
+    alter_add_idx = parse_one(
+        "ALTER TABLE db.docs ADD INDEX idx_title (title) USING INVERTED PROPERTIES ('parser' = 'english') COMMENT 'ft'",
+        read="doris",
+    )
+    assert isinstance(alter_add_idx, exp.Alter)
+    assert (
+        alter_add_idx.sql("doris")
+        == "ALTER TABLE db.docs ADD INDEX idx_title (title) USING INVERTED PROPERTIES ('parser'='english') COMMENT 'ft'"
+    )
+    alter_drop_idx = parse_one("ALTER TABLE db.docs DROP INDEX idx_title", read="doris")
+    assert isinstance(alter_drop_idx, exp.Alter)
+    assert alter_drop_idx.sql("doris") == "ALTER TABLE db.docs DROP INDEX idx_title"
+
+    # 3. OLAP compaction_policy validation and function_column.sequence_col support
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "db.ts_metrics",
+        target_columns_to_types={
+            "id": exp.DataType.build("BIGINT", dialect="doris"),
+            "updated_at": exp.DataType.build("DATETIME", dialect="doris"),
+            "val": exp.DataType.build("DOUBLE", dialect="doris"),
+        },
+        table_properties={
+            "unique_key": exp.to_column("id"),
+            "function_column.sequence_col": exp.Literal.string("updated_at"),
+            "compaction_policy": exp.Literal.string("time_series"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`ts_metrics` (`id` BIGINT, `updated_at` DATETIME, `val` DOUBLE) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10 PROPERTIES ('function_column.sequence_col'='updated_at', 'compaction_policy'='time_series')"
+    ]
+
+    with pytest.raises(SQLMeshError, match="Invalid Doris compaction_policy"):
+        adapter.create_table(
+            "db.bad_compaction",
+            target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
+            table_properties={"compaction_policy": exp.Literal.string("invalid_policy")},
+        )
+
+    # 4. _replace_by_key skips pre-DELETE when function_column.sequence_col is configured so sequence comparison works
+    adapter.cursor.execute.reset_mock()
+    adapter._replace_by_key(
+        target_table="db.ts_metrics",
+        source_table=parse_one("SELECT id, updated_at, val FROM db.src", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("BIGINT", dialect="doris"),
+            "updated_at": exp.DataType.build("DATETIME", dialect="doris"),
+            "val": exp.DataType.build("DOUBLE", dialect="doris"),
+        },
+        key=[exp.to_column("id")],
+        is_unique_key=True,
+        table_properties={"function_column.sequence_col": exp.Literal.string("updated_at")},
+    )
+    sql_calls = to_sql_calls(adapter)
+    assert not any(call.startswith("DELETE FROM") for call in sql_calls)
+    assert any(
+        "PROPERTIES ('function_column.sequence_col'='updated_at')" in call for call in sql_calls
+    )

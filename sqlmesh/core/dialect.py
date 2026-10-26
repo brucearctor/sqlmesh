@@ -148,6 +148,15 @@ def _parse_statement(self: Parser) -> t.Optional[exp.Expr]:
             meta.comments = comments
             return meta
 
+    if (
+        isinstance(self, Doris.Parser)
+        and self._curr.text.upper() == "BUILD"
+        and self._next
+        and self._next.token_type == TokenType.INDEX
+    ):
+        self._advance()
+        return _doris_parse_build(self)
+
     try:
         return self.__parse_statement()  # type: ignore
     except ParseError:
@@ -632,6 +641,288 @@ def columndef_sql(self: Generator, expression: exp.ColumnDef, sep: str = " ") ->
             else sep
         ),
     )
+
+
+_DORIS_MATCH_OPS = {
+    "MATCH",
+    "MATCH_ANY",
+    "MATCH_ALL",
+    "MATCH_PHRASE",
+    "MATCH_PHRASE_PREFIX",
+    "MATCH_REGEXP",
+    "MATCH_PHRASE_EDGE",
+}
+
+
+def _doris_parse_range(self: Parser, this: t.Optional[exp.Expr] = None) -> t.Optional[exp.Expr]:
+    this = self.__parse_range(this)  # type: ignore
+    if this is not None:
+        idx = self._index
+        negated = self._match(TokenType.NOT)
+        if self._curr and self._curr.text.upper() in _DORIS_MATCH_OPS:
+            op_name = self._curr.text.upper()
+            self._advance()
+            rhs = self._parse_bitwise()
+            expr: exp.Expr = self.expression(exp.Anonymous(this=op_name, expressions=[this, rhs]))
+            if negated:
+                expr = self.expression(exp.Not(this=expr))
+            return expr
+        if negated:
+            self._retreat(idx)
+    return this
+
+
+_doris_parse_range.__name__ = "_parse_range"
+
+
+def _doris_anonymous_sql(self: Generator, expression: exp.Anonymous) -> str:
+    if expression.name.upper() in _DORIS_MATCH_OPS and len(expression.expressions) == 2:
+        left = self.sql(expression.expressions[0])
+        right = self.sql(expression.expressions[1])
+        return f"{left} {expression.name.upper()} {right}"
+    return self.anonymous_sql(expression)
+
+
+def _doris_parse_table_parts(
+    self: Parser,
+    schema: bool = False,
+    is_db_reference: bool = False,
+    wildcard: bool = False,
+    fast: bool = False,
+) -> exp.Table:
+    table = self.__parse_table_parts(  # type: ignore
+        schema=schema, is_db_reference=is_db_reference, wildcard=wildcard, fast=fast
+    )
+    if not isinstance(table, exp.Table):
+        return table
+    if isinstance(table.this, exp.Anonymous):
+        m = re.match(r"^(.+)@(branch|tag)$", table.this.name, flags=re.IGNORECASE)
+        if m and table.this.expressions:
+            real_name = m.group(1)
+            ref_kind = m.group(2).upper()
+            ref_arg = table.this.expressions[0]
+            if isinstance(ref_arg, exp.Column) and not ref_arg.table:
+                ref_arg = exp.var(ref_arg.name)
+            ver = exp.Version(this=ref_kind, kind="AS OF", expression=ref_arg)
+            table.set("this", exp.Identifier(this=real_name, quoted=False))
+            table.set("version", ver)
+            table.meta["doris_version"] = ver
+    return table
+
+
+_doris_parse_table_parts.__name__ = "_parse_table_parts"
+
+
+def _doris_parse_version(self: Parser) -> t.Optional[exp.Version]:
+    ver = self.__parse_version()  # type: ignore
+    if ver is not None:
+        return ver
+    if (
+        self._match_pair(TokenType.PARAMETER, TokenType.VAR, advance=False)
+        and self._next
+        and self._next.text.upper() in ("BRANCH", "TAG")
+    ):
+        saved_idx = self._index
+        self._advance()
+        ref_kind = self._curr.text.upper()
+        self._advance()
+        if self._match(TokenType.L_PAREN, advance=False):
+            ref_args = self._parse_wrapped_csv(lambda: self._parse_id_var(any_token=True))
+            if ref_args:
+                ref_arg = ref_args[0]
+                if isinstance(ref_arg, exp.Identifier) and not ref_arg.quoted:
+                    ref_arg = exp.var(ref_arg.name)
+                return self.expression(exp.Version(this=ref_kind, kind="AS OF", expression=ref_arg))
+        self._retreat(saved_idx)
+    return None
+
+
+_doris_parse_version.__name__ = "_parse_version"
+
+
+def _doris_parse_table(
+    self: Parser,
+    schema: bool = False,
+    joins: bool = False,
+    alias_tokens: t.Optional[t.Collection[TokenType]] = None,
+    parse_bracket: bool = False,
+    is_db_reference: bool = False,
+    parse_partition: bool = False,
+    consume_pipe: bool = False,
+) -> t.Optional[exp.Expr]:
+    table = self.__parse_table(  # type: ignore
+        schema=schema,
+        joins=joins,
+        alias_tokens=alias_tokens,
+        parse_bracket=parse_bracket,
+        is_db_reference=is_db_reference,
+        parse_partition=parse_partition,
+        consume_pipe=consume_pipe,
+    )
+    if (
+        isinstance(table, exp.Table)
+        and not table.args.get("version")
+        and table.meta.get("doris_version")
+    ):
+        table.set("version", table.meta.pop("doris_version"))
+    return table
+
+
+_doris_parse_table.__name__ = "_parse_table"
+
+
+def _doris_version_sql(self: Generator, expression: exp.Version) -> str:
+    this_upper = expression.name.upper()
+    if this_upper in ("BRANCH", "TAG"):
+        expr_node = expression.expression
+        expr_sql = (
+            expr_node.name
+            if isinstance(expr_node, (exp.Var, exp.Identifier))
+            and not getattr(expr_node, "quoted", False)
+            else self.sql(expr_node)
+        )
+        return f"@{this_upper.lower()}({expr_sql})"
+    kind = expression.text("kind")
+    this_sql = "TIME" if this_upper in ("TIMESTAMP", "TIME") else this_upper
+    return f"FOR {this_sql} {kind} {self.sql(expression, 'expression')}"
+
+
+def _doris_parse_index_constraint(
+    self: Parser, kind: t.Optional[str] = None
+) -> exp.IndexColumnConstraint:
+    constraint = self.__parse_index_constraint(kind=kind)  # type: ignore
+    options = list(constraint.args.get("options") or [])
+    updated = False
+    while True:
+        if self._match(TokenType.PROPERTIES) or self._match_text_seq("PROPERTIES"):
+            props = exp.Properties(expressions=self._parse_wrapped_properties())
+            options.append(self.expression(exp.IndexConstraintOption(parser=props)))
+            updated = True
+        elif self._match(TokenType.COMMENT):
+            options.append(self.expression(exp.IndexConstraintOption(comment=self._parse_string())))
+            updated = True
+        elif self._match(TokenType.USING):
+            options.append(
+                self.expression(
+                    exp.IndexConstraintOption(using=self._advance_any() and self._prev.text)
+                )
+            )
+            updated = True
+        else:
+            break
+    if updated:
+        constraint.set("options", options)
+    return constraint
+
+
+_doris_parse_index_constraint.__name__ = "_parse_index_constraint"
+
+
+def _doris_indexconstraintoption_sql(self: Generator, expression: exp.IndexConstraintOption) -> str:
+    props = expression.args.get("parser")
+    if isinstance(props, exp.Properties):
+        return self.properties(props, prefix="PROPERTIES")
+    return self._indexconstraintoption_sql(expression)  # type: ignore
+
+
+_doris_indexconstraintoption_sql.__name__ = "indexconstraintoption_sql"
+
+
+def _doris_parse_index_params(self: Parser) -> exp.IndexParameters:
+    params = self.__parse_index_params()  # type: ignore
+    while True:
+        if self._match(TokenType.USING):
+            params.set("using", self._parse_var(any_token=True))
+        elif self._match(TokenType.PROPERTIES) or self._match_text_seq("PROPERTIES"):
+            params.set("with_storage", self._parse_wrapped_properties())
+        elif self._match(TokenType.COMMENT):
+            params.set(
+                "where",
+                self.expression(exp.CommentColumnConstraint(this=self._parse_string())),
+            )
+        else:
+            break
+    return params
+
+
+_doris_parse_index_params.__name__ = "_parse_index_params"
+
+
+def _doris_indexparameters_sql(self: Generator, expression: exp.IndexParameters) -> str:
+    using = self.sql(expression, "using")
+    using = f" USING {using}" if using else ""
+    columns = self.expressions(expression, key="columns", flat=True)
+    columns = f"({columns})" if columns else ""
+    partition_by = self.expressions(expression, key="partition_by", flat=True)
+    partition_by = f" PARTITION BY {partition_by}" if partition_by else ""
+    where_node = expression.args.get("where")
+    where = (
+        f" {self.sql(where_node)}"
+        if isinstance(where_node, exp.CommentColumnConstraint)
+        else self.sql(expression, "where")
+    )
+    include = self.expressions(expression, key="include", flat=True)
+    if include:
+        include = f" INCLUDE ({include})"
+    with_storage = self.expressions(expression, key="with_storage", flat=True)
+    with_storage = f" PROPERTIES ({with_storage})" if with_storage else ""
+    tablespace = self.sql(expression, "tablespace")
+    tablespace = f" USING INDEX TABLESPACE {tablespace}" if tablespace else ""
+    on = self.sql(expression, "on")
+    on = f" ON {on}" if on else ""
+
+    return f"{columns}{using}{include}{with_storage}{tablespace}{partition_by}{where}{on}"
+
+
+_doris_indexparameters_sql.__name__ = "indexparameters_sql"
+
+
+def _doris_parse_build(self: Parser) -> t.Optional[exp.Expr]:
+    start = self._prev
+    if self._match(TokenType.INDEX):
+        index_name = self._parse_id_var(any_token=False)
+        if self._match(TokenType.ON):
+            table = self._parse_table_parts()
+            partitions = self._parse_wrapped_id_vars() if self._match_text_seq("PARTITIONS") else []
+            return self.expression(
+                exp.Alter(
+                    this=table,
+                    kind="BUILD_INDEX",
+                    actions=[index_name, *partitions],
+                )
+            )
+    return self._parse_as_command(start)
+
+
+def _doris_parse_alter_add(self: Parser) -> t.Union[exp.Expr, t.List[exp.Expr], None]:
+    if self._match(TokenType.INDEX):
+        return _doris_parse_index_constraint(self)
+    return self._parse_alter_table_add()
+
+
+def _doris_parse_alter_drop(self: Parser) -> t.Optional[exp.Expr]:
+    if self._match_texts(("BRANCH", "TAG"), advance=False):
+        return self._parse_as_command(self._prev)
+    return self._parse_drop()
+
+
+def _doris_alter_sql(self: Generator, expression: exp.Alter) -> str:
+    actions = expression.args.get("actions") or []
+    if expression.text("kind") == "BUILD_INDEX":
+        idx_sql = self.sql(actions[0]) if actions else ""
+        tbl_sql = self.sql(expression, "this")
+        parts_sql = (
+            f" PARTITIONS ({', '.join(self.sql(p) for p in actions[1:])})"
+            if len(actions) > 1
+            else ""
+        )
+        return f"BUILD INDEX {idx_sql} ON {tbl_sql}{parts_sql}"
+    if actions and isinstance(actions[0], exp.IndexColumnConstraint):
+        return f"ALTER TABLE {self.sql(expression, 'this')} ADD {self.expressions(expression, key='actions', flat=True)}"
+    return self._alter_sql(expression)  # type: ignore
+
+
+_doris_alter_sql.__name__ = "alter_sql"
 
 
 def _doris_map_sql(self: Generator, expression: exp.Map | exp.VarMap) -> str:
@@ -1437,6 +1728,7 @@ def extend_sqlglot() -> None:
                 "DATEV2": TokenType.DATE,
                 "DECIMALV2": TokenType.DECIMAL,
                 "DECIMALV3": TokenType.DECIMAL,
+                "FOR TIME": TokenType.TIMESTAMP_SNAPSHOT,
                 "HLL": TokenType.HLLSKETCH,
                 "IPV4": TokenType.IPV4,
                 "IPV6": TokenType.IPV6,
@@ -1456,8 +1748,20 @@ def extend_sqlglot() -> None:
     }
     Doris.Parser.FUNCTIONS.update(
         {
+            "INNER_PRODUCT": exp.DotProduct.from_arg_list,
+            "L1_DISTANCE": exp.ManhattanDistance.from_arg_list,
             "MAP": build_var_map,
             "NAMED_STRUCT": _build_named_struct,
+            "SEARCH": lambda args: exp.Anonymous(this="SEARCH", expressions=args),
+        }
+    )
+    Doris.Parser.ALTER_PARSERS.update(
+        {
+            "ADD": _doris_parse_alter_add,
+            "CREATE": lambda self: self._parse_as_command(self._prev),
+            "DROP": _doris_parse_alter_drop,
+            "EXECUTE": lambda self: self._parse_as_command(self._prev),
+            "REPLACE": lambda self: self._parse_as_command(self._prev),
         }
     )
     Doris.Generator.TYPE_MAPPING.update(
@@ -1472,7 +1776,10 @@ def extend_sqlglot() -> None:
     )
     Doris.Generator.TRANSFORMS.update(
         {
+            exp.Anonymous: _doris_anonymous_sql,
             exp.Array: rename_func("ARRAY"),
+            exp.DotProduct: rename_func("INNER_PRODUCT"),
+            exp.ManhattanDistance: rename_func("L1_DISTANCE"),
             exp.Map: _doris_map_sql,
             exp.ParseJSON: lambda self, e: f"CAST({self.sql(e, 'this')} AS JSON)",
             exp.Select: transforms.preprocess(
@@ -1483,6 +1790,7 @@ def extend_sqlglot() -> None:
             ),
             exp.Struct: _doris_struct_sql,
             exp.VarMap: _doris_map_sql,
+            exp.Version: _doris_version_sql,
         }
     )
 
@@ -1575,7 +1883,16 @@ def extend_sqlglot() -> None:
     _override(Snowflake.Parser, _parse_table_parts)
     _override(TSQL.Parser, _parse_alter_table_alter)
     _override(TSQL.Generator, altercolumn_sql)
+    _override(Doris.Parser, _doris_parse_range)
+    _override(Doris.Parser, _doris_parse_table_parts)
+    _override(Doris.Parser, _doris_parse_version)
+    _override(Doris.Parser, _doris_parse_table)
+    _override(Doris.Parser, _doris_parse_index_constraint)
+    _override(Doris.Parser, _doris_parse_index_params)
     _override(Doris.Generator, columndef_sql)
+    _override(Doris.Generator, _doris_indexconstraintoption_sql)
+    _override(Doris.Generator, _doris_indexparameters_sql)
+    _override(Doris.Generator, _doris_alter_sql)
 
     # DuckDB's prefix absolute power operator `@` clashes with the macro syntax
     DuckDB.Parser.NO_PAREN_FUNCTION_PARSERS.pop("@", None)

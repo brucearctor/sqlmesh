@@ -159,17 +159,23 @@ class DorisEngineAdapter(
                 exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT),
                 exp.DataType.build("TEXT", dialect=DIALECT),
             },
-            exp.DataType.build("DATETIME(6)", dialect=DIALECT): {
-                exp.DataType.build("TIMESTAMPTZ(6)", dialect=DIALECT),
-                exp.DataType.build("TEXT", dialect=DIALECT),
-            },
             exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT): {
                 exp.DataType.build("DATETIME", dialect=DIALECT),
                 exp.DataType.build("TEXT", dialect=DIALECT),
             },
-            exp.DataType.build("TIMESTAMPTZ(6)", dialect=DIALECT): {
-                exp.DataType.build("DATETIME(6)", dialect=DIALECT),
-                exp.DataType.build("TEXT", dialect=DIALECT),
+            **{
+                exp.DataType.build(f"DATETIME({p})", dialect="doris"): {
+                    exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris"),
+                    exp.DataType.build("TEXT", dialect="doris"),
+                }
+                for p in range(1, 7)
+            },
+            **{
+                exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris"): {
+                    exp.DataType.build(f"DATETIME({p})", dialect="doris"),
+                    exp.DataType.build("TEXT", dialect="doris"),
+                }
+                for p in range(1, 7)
             },
         },
     }
@@ -345,12 +351,38 @@ class DorisEngineAdapter(
             self.cursor.execute(f"USE {db_sql}")
         self._needs_catalog_restore = False
 
+    def _is_lance_table(
+        self,
+        table_format: t.Optional[str] = None,
+        table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> bool:
+        if table_format and str(table_format).strip().lower() == "lance":
+            return True
+        if table_properties:
+            engine_val = self._extract_str_value(table_properties.get("engine"))
+            if engine_val and engine_val.strip().lower() == "lance":
+                return True
+        return False
+
+    def _ensure_not_lance_table(
+        self,
+        table_format: t.Optional[str] = None,
+        table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> None:
+        if self._is_lance_table(table_format=table_format, table_properties=table_properties):
+            raise SQLMeshError(
+                "Doris Lance tables are read-only; reference Lance tables as upstream sources or EXTERNAL models "
+                "using a Doris Lance catalog ('type' = 'lance') or file table-valued function ('format' = 'lance')."
+            )
+
     def _is_iceberg_table(
         self,
         table_format: t.Optional[str] = None,
         catalog_name: t.Optional[str] = None,
         table_properties: t.Optional[t.Dict[str, t.Any]] = None,
     ) -> bool:
+        if self._is_lance_table(table_format=table_format, table_properties=table_properties):
+            return False
         if table_format and str(table_format).strip().lower() == "iceberg":
             return True
         if table_properties:
@@ -426,6 +458,8 @@ class DorisEngineAdapter(
             return cls._split_cleaned_column_names(key_expr.name)
         if isinstance(key_expr, (exp.Identifier, exp.Literal, exp.Var)):
             return cls._split_cleaned_column_names(str(key_expr.this))
+        if isinstance(key_expr, exp.Expr):
+            return []
         if isinstance(key_expr, str):
             return cls._split_cleaned_column_names(key_expr)
         return cls._split_cleaned_column_names(str(key_expr))
@@ -774,7 +808,7 @@ class DorisEngineAdapter(
                 col_def.set("constraints", constraints or None)
             cols[col_name_str] = dtype
         self._last_described_has_explicit_keys: bool = has_explicit_keys
-        if cols and not key_cols:
+        if cols and not key_cols and not has_explicit_keys:
             first_col = next(iter(cols))
             key_cols.add(first_col.lower())
         return cols, key_cols
@@ -818,7 +852,7 @@ class DorisEngineAdapter(
         current_cols = self.columns(current_table_name)
         current_key_cols = set(getattr(self, "_last_described_key_cols", set()))
         current_has_explicit_keys = bool(getattr(self, "_last_described_has_explicit_keys", False))
-        if current_cols and not current_key_cols:
+        if current_cols and not current_key_cols and not current_has_explicit_keys:
             current_key_cols = {next(iter(current_cols)).lower()}
 
         self._last_described_key_cols = set()
@@ -826,7 +860,7 @@ class DorisEngineAdapter(
         target_cols = self.columns(target_table_name)
         target_key_cols = set(getattr(self, "_last_described_key_cols", set()))
         target_has_explicit_keys = bool(getattr(self, "_last_described_has_explicit_keys", False))
-        if target_cols and not target_key_cols:
+        if target_cols and not target_key_cols and not target_has_explicit_keys:
             target_key_cols = {next(iter(target_cols)).lower()}
 
         current_by_lower = {c.lower(): c_dtype for c, c_dtype in current_cols.items()}
@@ -1221,43 +1255,57 @@ class DorisEngineAdapter(
                 table_kind="MATERIALIZED_VIEW",
             )
 
-            if is_sync_mv and isinstance(query, exp.Select):
+            if is_sync_mv:
                 query = query.copy()
-                base_col_names = {
-                    col_node.name.lower()
-                    for col_node in query.find_all(exp.Column)
-                    if col_node.name
-                }
-                aliased_selects: t.List[exp.Expr] = []
-                for sel_expr in query.expressions:
-                    if isinstance(sel_expr, exp.Column):
-                        aliased_selects.append(
-                            exp.alias_(sel_expr.copy(), f"mv_{sel_expr.name}", quoted=True)
-                        )
-                    elif isinstance(sel_expr, exp.Alias) and (
-                        (
-                            isinstance(sel_expr.this, exp.Column)
-                            and sel_expr.alias == sel_expr.this.name
-                        )
-                        or (
-                            sel_expr.alias
-                            and sel_expr.alias.lower() in base_col_names
-                            and not sel_expr.alias.lower().startswith("mv_")
-                        )
-                    ):
-                        aliased_selects.append(
-                            exp.alias_(sel_expr.this.copy(), f"mv_{sel_expr.alias}", quoted=True)
-                        )
-                    else:
-                        aliased_selects.append(sel_expr)
-                query.set("expressions", aliased_selects)
+                for tbl_node in query.find_all(exp.Table):
+                    if tbl_node.catalog and tbl_node.catalog.lower() == "internal":
+                        tbl_node.set("catalog", None)
+                if isinstance(query, exp.Select):
+                    base_col_names = {
+                        col_node.name.lower()
+                        for col_node in query.find_all(exp.Column)
+                        if col_node.name
+                    }
+                    aliased_selects: t.List[exp.Expr] = []
+                    for sel_expr in query.expressions:
+                        if isinstance(sel_expr, exp.Column):
+                            aliased_selects.append(
+                                exp.alias_(sel_expr.copy(), f"mv_{sel_expr.name}", quoted=True)
+                            )
+                        elif isinstance(sel_expr, exp.Alias) and (
+                            (
+                                isinstance(sel_expr.this, exp.Column)
+                                and sel_expr.alias == sel_expr.this.name
+                            )
+                            or (
+                                sel_expr.alias
+                                and sel_expr.alias.lower() in base_col_names
+                                and not sel_expr.alias.lower().startswith("mv_")
+                            )
+                        ):
+                            aliased_selects.append(
+                                exp.alias_(
+                                    sel_expr.this.copy(), f"mv_{sel_expr.alias}", quoted=True
+                                )
+                            )
+                        else:
+                            aliased_selects.append(sel_expr)
+                    query.set("expressions", aliased_selects)
 
             sync_source_tbl: t.Optional[exp.Table] = None
             if is_sync_mv:
                 if view_properties and view_properties.get("source_table"):
                     sync_source_tbl = self._to_source_table(view_properties["source_table"])
                 else:
-                    first_tbl = query.find(exp.Table)
+                    cte_names = {cte.alias.lower() for cte in query.find_all(exp.CTE) if cte.alias}
+                    first_tbl = next(
+                        (
+                            t_node
+                            for t_node in query.find_all(exp.Table)
+                            if t_node.name and t_node.name.lower() not in cte_names
+                        ),
+                        None,
+                    )
                     if first_tbl:
                         sync_source_tbl = self._to_source_table(first_tbl)
 
@@ -1338,11 +1386,12 @@ class DorisEngineAdapter(
                         )
             elif not is_sync_mv:
                 self._pop_sync_mv_source_table(target_table)
-            build_mode = (
-                self._to_upper_str(view_properties["build"])
+            raw_build = (
+                view_properties.get("build")
                 if view_properties and view_properties.get("build") is not None
-                else None
+                else (view_properties.get("build_mode") if view_properties else None)
             )
+            build_mode = self._to_upper_str(raw_build) if raw_build is not None else None
             if (
                 not is_sync_mv
                 and build_mode == "DEFERRED"
@@ -1447,8 +1496,11 @@ class DorisEngineAdapter(
         self,
         table_name: TableName,
         index_name: str,
-        columns: t.Tuple[str, ...],
+        columns: t.Sequence[str | exp.Expr] | t.Tuple[str, ...],
         exists: bool = True,
+        index_type: t.Optional[str] = None,
+        index_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        comment: t.Optional[str] = None,
     ) -> None:
         if len(columns) != 1:
             logger.warning(
@@ -1456,7 +1508,50 @@ class DorisEngineAdapter(
                 f"Doris only supports single-column indexes, got columns {columns}."
             )
             return
-        super().create_index(table_name, index_name, columns, exists=exists)
+        if index_type or index_properties or comment:
+            if not self.SUPPORTS_INDEXES:
+                return
+            using_var = exp.var(index_type.strip().upper()) if index_type else None
+            with_storage = (
+                [
+                    exp.Property(
+                        this=exp.Literal.string(str(k)),
+                        value=exp.Literal.string(str(self._extract_str_value(v) or v)),
+                    )
+                    for k, v in index_properties.items()
+                ]
+                if index_properties
+                else None
+            )
+            comment_node = (
+                exp.CommentColumnConstraint(
+                    this=exp.Literal.string(self._truncate_column_comment(comment.strip()))
+                )
+                if comment
+                else None
+            )
+            self.execute(
+                exp.Create(
+                    this=exp.Index(
+                        this=exp.to_identifier(index_name),
+                        table=exp.to_table(table_name),
+                        params=exp.IndexParameters(
+                            columns=[
+                                exp.to_column(c.name if isinstance(c, exp.Expr) else str(c))
+                                for c in columns
+                            ],
+                            using=using_var,
+                            with_storage=with_storage,
+                            where=comment_node,
+                        ),
+                    ),
+                    kind="INDEX",
+                    exists=exists,
+                )
+            )
+            return
+        col_names = tuple(c.name if isinstance(c, exp.Expr) else str(c) for c in columns)
+        super().create_index(table_name, index_name, col_names, exists=exists)
 
     def _create_table_like(
         self,
@@ -1603,6 +1698,10 @@ class DorisEngineAdapter(
         insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
         **kwargs: t.Any,
     ) -> None:
+        self._ensure_not_lance_table(
+            table_format=kwargs.get("table_format"),
+            table_properties=self._get_table_properties(kwargs),
+        )
         table = exp.to_table(table_name)
         if (
             insert_overwrite_strategy_override is None
@@ -3466,6 +3565,10 @@ class DorisEngineAdapter(
         **kwargs: t.Any,
     ) -> None:
         table_properties = dict(self._get_table_properties(kwargs) or {})
+        self._ensure_not_lance_table(
+            table_format=kwargs.get("table_format"),
+            table_properties=table_properties,
+        )
         unique_key_prop, duplicate_key_prop, aggregate_key_prop = self._resolve_table_type_and_keys(
             table_properties
         )
@@ -3554,6 +3657,11 @@ class DorisEngineAdapter(
             )
             return
 
+        self._last_described_key_cols = set()
+        table_props = self._get_table_properties(kwargs)
+        resolved_uk, duplicate_key_prop, aggregate_key_prop = (
+            self._resolve_table_type_and_keys(table_props) if table_props else (None, None, None)
+        )
         if not target_columns_to_types or not columns_to_types_all_known(target_columns_to_types):
             target_columns_to_types = self.columns(target_table)
         else:
@@ -3561,13 +3669,25 @@ class DorisEngineAdapter(
             is_iceberg = self._is_iceberg_table(
                 table_format=kwargs.get("table_format"),
                 catalog_name=table.catalog,
-                table_properties=self._get_table_properties(kwargs),
+                table_properties=table_props,
             )
             if not is_iceberg:
+                reorder_kwargs = dict(kwargs)
+                if (
+                    not duplicate_key_prop
+                    and not aggregate_key_prop
+                    and all(isinstance(k, (exp.Column, exp.Identifier)) for k in unique_key)
+                ):
+                    reorder_kwargs["unique_key"] = unique_key
                 target_columns_to_types = self._reorder_olap_columns(
                     target_columns_to_types,
-                    {**kwargs, "unique_key": unique_key},
+                    reorder_kwargs,
                 )
+                if source_columns:
+                    source_col_set = set(source_columns)
+                    source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                        c for c in source_columns if c not in target_columns_to_types
+                    ]
 
         normalized_unique_key: t.List[exp.Expr] = [
             exp.column(k) if isinstance(k, exp.Identifier) else k for k in unique_key
@@ -3576,6 +3696,8 @@ class DorisEngineAdapter(
             c.name.lower() for k in normalized_unique_key for c in k.find_all(exp.Column) if c.name
         }
         key_col_names_lower.update(k.lower() for k in self._last_described_key_cols)
+        if resolved_uk:
+            key_col_names_lower.update(k.lower() for k in self._extract_column_names(resolved_uk))
 
         if not when_matched:
             non_key_cols = [
@@ -3614,6 +3736,22 @@ class DorisEngineAdapter(
                     ]
                     if filtered_eqs:
                         then_expr.set("expressions", filtered_eqs)
+                    elif then_expr.expressions:
+                        non_key_cols = [
+                            col
+                            for col in target_columns_to_types
+                            if col.lower() not in key_col_names_lower
+                        ]
+                        if non_key_cols:
+                            fallback_col = non_key_cols[0]
+                            then_expr.set(
+                                "expressions",
+                                [
+                                    exp.column(fallback_col, MERGE_TARGET_ALIAS).eq(
+                                        exp.column(fallback_col, MERGE_TARGET_ALIAS)
+                                    )
+                                ],
+                            )
 
         super().merge(
             target_table,
@@ -3640,10 +3778,11 @@ class DorisEngineAdapter(
             target_columns_to_types = self.columns(target_table)
 
         table = exp.to_table(target_table)
+        table_props = self._get_table_properties(kwargs)
         is_iceberg = self._is_iceberg_table(
             table_format=kwargs.get("table_format"),
             catalog_name=table.catalog,
-            table_properties=self._get_table_properties(kwargs),
+            table_properties=table_props,
         )
         normalized_key: t.List[exp.Expr] = [
             exp.column(k.name, quoted=bool(k.quoted)) if isinstance(k, exp.Identifier) else k
@@ -3652,6 +3791,16 @@ class DorisEngineAdapter(
         key_cols: t.List[exp.Column] = []
         if is_unique_key and all(isinstance(k, exp.Column) for k in normalized_key):
             key_cols = [exp.column(k.name) for k in normalized_key]
+
+        has_sequence_col = bool(
+            not is_iceberg
+            and is_unique_key
+            and table_props
+            and (
+                table_props.get("function_column.sequence_col") is not None
+                or table_props.get("function_column.sequence_type") is not None
+            )
+        )
 
         temp_table_props: t.Optional[t.Dict[str, t.Any]] = None
         if not is_iceberg:
@@ -3682,6 +3831,10 @@ class DorisEngineAdapter(
                         key_cols[0] if len(key_cols) == 1 else exp.Tuple(expressions=key_cols)
                     )
                 }
+                if table_props:
+                    for seq_k in ("function_column.sequence_col", "function_column.sequence_type"):
+                        if table_props.get(seq_k) is not None:
+                            temp_table_props[seq_k] = table_props[seq_k]
             if target_columns_to_types and columns_to_types_all_known(target_columns_to_types):
                 if avoid_key_coercion:
                     reorder_kwargs: t.Dict[str, t.Any] = {}
@@ -3735,12 +3888,13 @@ class DorisEngineAdapter(
                 delete_filter = key_exp.isin(query=delete_query)
 
                 if not self.INSERT_OVERWRITE_STRATEGY.is_replace_where:
-                    prev_iceberg_ctx = getattr(self, "_in_iceberg_replace_by_key", False)
-                    self._in_iceberg_replace_by_key = is_iceberg
-                    try:
-                        self.delete_from(target_table, delete_filter)
-                    finally:
-                        self._in_iceberg_replace_by_key = prev_iceberg_ctx
+                    if not has_sequence_col:
+                        prev_iceberg_ctx = getattr(self, "_in_iceberg_replace_by_key", False)
+                        self._in_iceberg_replace_by_key = is_iceberg
+                        try:
+                            self.delete_from(target_table, delete_filter)
+                        finally:
+                            self._in_iceberg_replace_by_key = prev_iceberg_ctx
                 else:
                     insert_statement.set("where", delete_filter)
                     insert_statement.set("this", exp.to_table(target_table))
@@ -3826,6 +3980,10 @@ class DorisEngineAdapter(
         track_rows_processed: bool = True,
         **kwargs: t.Any,
     ) -> None:
+        self._ensure_not_lance_table(
+            table_format=kwargs.get("table_format"),
+            table_properties=self._get_table_properties(kwargs),
+        )
         table = exp.to_table(table_name)
         effective_catalog = table.catalog or self.default_catalog
         is_iceberg = self._is_iceberg_table(
@@ -3966,6 +4124,10 @@ class DorisEngineAdapter(
             kwargs["table_properties"] = kwargs["physical_properties"]
         else:
             kwargs.setdefault("table_properties", None)
+        self._ensure_not_lance_table(
+            table_format=kwargs.get("table_format"),
+            table_properties=kwargs.get("table_properties"),
+        )
         kwargs["is_schema_ddl"] = isinstance(table_name_or_schema, exp.Schema)
 
         catalog_name = None
@@ -4353,6 +4515,10 @@ class DorisEngineAdapter(
                 exp.StddevSamp,
                 exp.Variance,
                 exp.VariancePop,
+                exp.EuclideanDistance,
+                exp.CosineDistance,
+                exp.ManhattanDistance,
+                exp.DotProduct,
             ),
         ):
             return exp.DataType.build("DOUBLE", dialect=self.dialect)
@@ -4362,8 +4528,17 @@ class DorisEngineAdapter(
             return exp.DataType.build("MAP<VARCHAR(255), VARCHAR(255)>", dialect=self.dialect)
         if isinstance(inner, exp.Struct):
             return exp.DataType.build("STRUCT<a: INT>", dialect=self.dialect, udt=True)
-        if isinstance(inner, (exp.JSONObject, exp.JSONArray, exp.ParseJSON)):
+        if isinstance(inner, (exp.JSONObject, exp.JSONArray, exp.ParseJSON, exp.JSONExtract)):
             return exp.DataType.build("JSON", dialect=self.dialect)
+        if isinstance(inner, exp.Bracket) and isinstance(inner.this, exp.Expr):
+            base_t = self._infer_projection_type(inner.this, cte_types)
+            base_type_name = (
+                base_t.this.value.upper()
+                if isinstance(base_t.this, exp.DataType.Type)
+                else str(base_t.this).upper()
+            )
+            if base_type_name in ("VARIANT", "JSON", "JSONB"):
+                return base_t
         if isinstance(inner, exp.GroupConcat):
             return exp.DataType.build("TEXT", dialect=self.dialect)
         if isinstance(inner, (exp.Count, exp.RowNumber, exp.Rank, exp.DenseRank, exp.Ntile)):
@@ -4397,11 +4572,18 @@ class DorisEngineAdapter(
                 "VARIANCE",
                 "VAR_POP",
                 "VAR_SAMP",
+                "L2_DISTANCE",
+                "L2_DISTANCE_APPROXIMATE",
+                "COSINE_DISTANCE",
+                "COSINE_DISTANCE_APPROXIMATE",
+                "INNER_PRODUCT",
+                "INNER_PRODUCT_APPROXIMATE",
+                "L1_DISTANCE",
             ):
                 return exp.DataType.build("DOUBLE", dialect=self.dialect)
             if fn_upper in ("ARRAY", "ARRAY_AGG", "COLLECT_LIST", "COLLECT_SET"):
                 return exp.DataType.build("ARRAY<INT>", dialect=self.dialect)
-            if fn_upper in ("MAP", "MAP_AGG"):
+            if fn_upper in ("MAP", "MAP_AGG", "VARIANT_TYPE", "JSON_OBJECT_FLATTEN"):
                 return exp.DataType.build("MAP<VARCHAR(255), VARCHAR(255)>", dialect=self.dialect)
             if fn_upper in ("STRUCT", "NAMED_STRUCT"):
                 return exp.DataType.build("STRUCT<a: INT>", dialect=self.dialect, udt=True)
@@ -4435,6 +4617,8 @@ class DorisEngineAdapter(
                 return exp.DataType.build("DATETIME", dialect=self.dialect)
             if fn_upper == "TO_DATE":
                 return exp.DataType.build("DATE", dialect=self.dialect)
+            if fn_upper == "IS_VALID_UTF8":
+                return exp.DataType.build("BOOLEAN", dialect=self.dialect)
         return exp.DataType.build("UNKNOWN")
 
     @staticmethod
@@ -4768,6 +4952,26 @@ class DorisEngineAdapter(
             )
 
         explicit_key = unique_key or duplicate_key or aggregate_key
+        order_by = table_props.get("order_by") or table_props.get("cluster_by")
+        order_by_cols = self._extract_column_names(order_by)
+        if order_by_cols and not unique_key:
+            raise SQLMeshError(
+                "Doris table property 'order_by' is only supported on UNIQUE KEY tables. "
+                "For DUPLICATE KEY or AGGREGATE KEY tables, sort order is determined by the key columns."
+            )
+        mow_raw = self._extract_str_value(table_props.get("enable_unique_key_merge_on_write"))
+        if order_by_cols and mow_raw is not None and mow_raw.strip().lower() in ("false", "0"):
+            raise SQLMeshError(
+                "Doris table property 'order_by' on UNIQUE KEY tables requires Merge-on-Write "
+                "('enable_unique_key_merge_on_write' = 'true')."
+            )
+        seq_col_raw = self._extract_str_value(table_props.get("function_column.sequence_col"))
+        seq_type_raw = self._extract_str_value(table_props.get("function_column.sequence_type"))
+        if (seq_col_raw or seq_type_raw) and not unique_key:
+            raise SQLMeshError(
+                "Doris 'function_column.sequence_col' / 'function_column.sequence_type' is only supported on UNIQUE KEY tables."
+            )
+
         col_names = list(target_columns_to_types)
         if not col_names:
             return target_columns_to_types
@@ -4779,6 +4983,10 @@ class DorisEngineAdapter(
             if missing_cols:
                 raise SQLMeshError(
                     f"Doris key columns {missing_cols} not found in table schema columns {col_names}."
+                )
+            if seq_col_raw and seq_col_raw.strip("`").lower() not in col_by_lower:
+                raise SQLMeshError(
+                    f"Doris function_column.sequence_col '{seq_col_raw}' not found in table schema columns {col_names}."
                 )
             key_cols = [col_by_lower[k.lower()] for k in raw_key_cols if k.lower() in col_by_lower]
             if duplicate_key and not unique_key and not aggregate_key:
@@ -4828,6 +5036,25 @@ class DorisEngineAdapter(
                             f"Doris key column '{k}' has type '{k_dtype.sql(dialect=self.dialect)}' which is not supported as an OLAP key column. "
                             "Use an integer, DATE/DATETIME, DECIMAL, CHAR, or VARCHAR(n) column instead."
                         )
+            if order_by_cols:
+                missing_order_cols = [k for k in order_by_cols if k.lower() not in col_by_lower]
+                if missing_order_cols:
+                    raise SQLMeshError(
+                        f"Doris order_by columns {missing_order_cols} not found in table schema columns {col_names}."
+                    )
+                for ob_raw in order_by_cols:
+                    ob_col = col_by_lower[ob_raw.lower()]
+                    ob_dtype = updated_types[ob_col]
+                    if not self._is_valid_olap_key_type(ob_dtype):
+                        if self._is_coercible_string_key_type(ob_dtype):
+                            updated_types[ob_col] = exp.DataType.build(
+                                "VARCHAR(255)", dialect=self.dialect
+                            )
+                        else:
+                            raise SQLMeshError(
+                                f"Doris order_by column '{ob_col}' has type '{ob_dtype.sql(dialect=self.dialect)}' which is not supported as an OLAP sort key column. "
+                                "Use an integer, DATE/DATETIME, DECIMAL, CHAR, or VARCHAR(n) column instead."
+                            )
             key_cols_set = set(key_cols)
             new_order = (
                 key_cols + [c for c in col_names if c not in key_cols_set]
@@ -4998,6 +5225,23 @@ class DorisEngineAdapter(
                     for col in inner_cols:
                         parsed_partitioned_by.append(exp.to_column(col))
                     continue
+
+                if ";" in text or "--" in text or "/*" in text:
+                    raise SQLMeshError(f"Invalid partition expression: {text}")
+                try:
+                    parsed_stmts = parse(f"SELECT {text}", read=self.dialect)
+                    if (
+                        len(parsed_stmts) == 1
+                        and isinstance(parsed_stmts[0], exp.Select)
+                        and set(parsed_stmts[0].args.keys()) <= {"expressions"}
+                    ):
+                        for sel_expr in parsed_stmts[0].expressions:
+                            parsed_partitioned_by.append(sel_expr)
+                        continue
+                except Exception:
+                    pass
+                parsed_partitioned_by.append(exp.to_column(text.strip().strip("`")))
+                continue
 
             parsed_partitioned_by.append(expr)
 
@@ -5186,8 +5430,23 @@ class DorisEngineAdapter(
         if is_iceberg and is_schema_ddl:
             properties.append(exp.EngineProperty(this=exp.var("iceberg")))
 
+        if storage_format and not is_materialized_view:
+            sf_str = str(storage_format).strip().strip("'").strip('"')
+            if sf_str:
+                if is_iceberg:
+                    if (
+                        "write-format" not in table_properties_copy
+                        and "write.format.default" not in table_properties_copy
+                    ):
+                        table_properties_copy["write-format"] = exp.Literal.string(sf_str.lower())
+                elif "storage_format" not in table_properties_copy:
+                    table_properties_copy["storage_format"] = exp.Literal.string(sf_str.upper())
+
         if is_materialized_view:
             build_val = table_properties_copy.pop("build", None)
+            build_mode_val = table_properties_copy.pop("build_mode", None)
+            if build_val is None and build_mode_val is not None:
+                build_val = build_mode_val
             if build_val is not None:
                 build_upper = self._to_upper_str(build_val)
                 if build_upper not in ("IMMEDIATE", "DEFERRED"):
@@ -5197,6 +5456,10 @@ class DorisEngineAdapter(
                 properties.append(exp.BuildProperty(this=exp.Var(this=build_upper)))
 
             refresh_val = table_properties_copy.pop("refresh", None)
+            for refresh_alias in ("refresh_mode", "refresh_method"):
+                alias_val = table_properties_copy.pop(refresh_alias, None)
+                if refresh_val is None and alias_val is not None:
+                    refresh_val = alias_val
             refresh_trigger_val = table_properties_copy.pop("refresh_trigger", None)
             if refresh_val is not None or refresh_trigger_val is not None:
                 method_var: exp.Var = exp.Var(this="AUTO")
@@ -5393,6 +5656,14 @@ class DorisEngineAdapter(
                         "Doris table property 'order_by' is only supported on UNIQUE KEY tables. "
                         "For DUPLICATE KEY or AGGREGATE KEY tables, sort order is determined by the key columns."
                     )
+                mow_val = self._extract_str_value(
+                    table_properties_copy.get("enable_unique_key_merge_on_write")
+                )
+                if mow_val is not None and mow_val.strip().lower() in ("false", "0"):
+                    raise SQLMeshError(
+                        "Doris table property 'order_by' on UNIQUE KEY tables requires Merge-on-Write "
+                        "('enable_unique_key_merge_on_write' = 'true')."
+                    )
                 if col_by_lower:
                     missing_order_cols = [k for k in order_by_cols if k.lower() not in col_by_lower]
                     if missing_order_cols:
@@ -5404,6 +5675,37 @@ class DorisEngineAdapter(
                 properties.append(
                     exp.SetConfigProperty(this=exp.var(f"ORDER BY ({order_cols_sql})"))
                 )
+
+            if not is_materialized_view:
+                seq_col_val = self._extract_str_value(
+                    table_properties_copy.get("function_column.sequence_col")
+                )
+                seq_type_val = self._extract_str_value(
+                    table_properties_copy.get("function_column.sequence_type")
+                )
+                if (seq_col_val or seq_type_val) and not unique_key_cols:
+                    raise SQLMeshError(
+                        "Doris 'function_column.sequence_col' / 'function_column.sequence_type' is only supported on UNIQUE KEY tables."
+                    )
+                if seq_col_val and col_by_lower:
+                    seq_col_clean = seq_col_val.strip("`")
+                    if seq_col_clean.lower() not in col_by_lower:
+                        raise SQLMeshError(
+                            f"Doris function_column.sequence_col '{seq_col_clean}' not found in table schema columns {list(target_columns_to_types or ())}."
+                        )
+                    table_properties_copy["function_column.sequence_col"] = exp.Literal.string(
+                        col_by_lower[seq_col_clean.lower()]
+                    )
+                compaction_policy_val = self._extract_str_value(
+                    table_properties_copy.get("compaction_policy")
+                )
+                if compaction_policy_val is not None:
+                    cp_lower = compaction_policy_val.strip().lower()
+                    if cp_lower not in ("size_based", "time_series"):
+                        raise SQLMeshError(
+                            f"Invalid Doris compaction_policy '{compaction_policy_val}'. Expected 'size_based' or 'time_series'."
+                        )
+                    table_properties_copy["compaction_policy"] = exp.Literal.string(cp_lower)
 
         if table_description:
             properties.append(

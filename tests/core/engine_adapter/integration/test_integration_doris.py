@@ -86,6 +86,25 @@ def test_doris_iceberg_local_catalog(ctx: TestContext):
 
         updated_cols = adapter.columns(table_fqn)
         assert "region" in updated_cols
+
+        # Test Iceberg table maintenance actions & branch DDL parsed via Doris dialect
+        create_branch_expr = parse_one(
+            f"ALTER TABLE {table_fqn} CREATE BRANCH IF NOT EXISTS audit_branch",
+            read="doris",
+        )
+        adapter.execute(create_branch_expr, quote_identifiers=False)
+
+        branch_read_expr = parse_one(
+            f"SELECT id FROM {table_fqn}@branch(audit_branch)",
+            read="doris",
+        )
+        assert list(adapter.fetchall(branch_read_expr, quote_identifiers=False)) == []
+
+        compact_expr = parse_one(
+            f"ALTER TABLE {table_fqn} EXECUTE rewrite_data_files()",
+            read="doris",
+        )
+        adapter.execute(compact_expr, quote_identifiers=False)
     finally:
         try:
             adapter.drop_schema(
@@ -719,3 +738,84 @@ def test_doris_4_1_native_merge_segment_v3_and_ann_index(ctx: TestContext):
     create_ann_ddl = ann_row[1]
     assert "USING ANN" in create_ann_ddl
     assert '"index_type" = "ivf"' in create_ann_ddl
+
+    # 4. Vector distance functions (L2_DISTANCE, COSINE_DISTANCE, INNER_PRODUCT, L1_DISTANCE)
+    ctx.engine_adapter.execute(
+        f"INSERT INTO {ann_tbl_sql} (`id`, `vec`) VALUES (1, [1.0, 0.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0, 0.0])"
+    )
+    vec_query = parse_one(
+        f"SELECT id, L2_DISTANCE(vec, [1.0, 0.0, 0.0, 0.0]) AS l2, "
+        f"COSINE_DISTANCE(vec, [1.0, 0.0, 0.0, 0.0]) AS cos_d, "
+        f"INNER_PRODUCT(vec, [1.0, 0.0, 0.0, 0.0]) AS ip, "
+        f"L1_DISTANCE(vec, [1.0, 0.0, 0.0, 0.0]) AS l1 "
+        f"FROM {ann_tbl_sql} ORDER BY l2 ASC LIMIT 1",
+        read="doris",
+    )
+    vec_row = ctx.engine_adapter.fetchone(vec_query)
+    assert vec_row is not None
+    assert vec_row[0] == 1
+    assert float(vec_row[1]) == 0.0
+    assert float(vec_row[3]) == 1.0
+
+    # 5. Inverted index creation via create_index, BUILD INDEX, MATCH_ANY, and SEARCH()
+    doris_adapter = t.cast(DorisEngineAdapter, ctx.engine_adapter)
+    fts_tbl = ctx.table("test_doris_41_fts")
+    fts_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "msg": exp.DataType.build("STRING", dialect="doris"),
+    }
+    doris_adapter.create_table(
+        fts_tbl,
+        fts_cols,
+        table_properties={"compaction_policy": exp.Literal.string("time_series")},
+    )
+    doris_adapter.create_index(
+        fts_tbl,
+        "idx_msg",
+        [exp.to_column("msg")],
+        index_type="INVERTED",
+        index_properties={"parser": "english"},
+        comment="fts index",
+    )
+    doris_adapter.execute(
+        f"INSERT INTO {doris_adapter._to_sql(fts_tbl)} (`id`, `msg`) VALUES "
+        f"(1, 'apache doris vector search'), (2, 'iceberg table compaction')"
+    )
+    fts_query = parse_one(
+        f"SELECT id FROM {doris_adapter._to_sql(fts_tbl)} WHERE msg MATCH_ANY 'doris vector' ORDER BY id",
+        read="doris",
+    )
+    assert [r[0] for r in doris_adapter.fetchall(fts_query)] == [1]
+
+    # 6. UNIQUE KEY table with function_column.sequence_col and _replace_by_key sequence protection
+    seq_tbl = ctx.table("test_doris_41_seq")
+    seq_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "val": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+        "ver": exp.DataType.build("BIGINT", dialect="doris"),
+    }
+    doris_adapter.create_table(
+        seq_tbl,
+        seq_cols,
+        unique_key=[exp.to_column("id")],
+        table_properties={"function_column.sequence_col": exp.Literal.string("ver")},
+    )
+    doris_adapter._replace_by_key(
+        seq_tbl,
+        parse_one("SELECT 1 AS id, 'v10' AS val, 10 AS ver", read="doris"),
+        seq_cols,
+        [exp.to_column("id")],
+        is_unique_key=True,
+        table_properties={"function_column.sequence_col": exp.Literal.string("ver")},
+    )
+    # Stale update with lower sequence number (ver = 5 < 10) must not overwrite 'v10'
+    doris_adapter._replace_by_key(
+        seq_tbl,
+        parse_one("SELECT 1 AS id, 'v5_stale' AS val, 5 AS ver", read="doris"),
+        seq_cols,
+        [exp.to_column("id")],
+        is_unique_key=True,
+        table_properties={"function_column.sequence_col": exp.Literal.string("ver")},
+    )
+    seq_rows = doris_adapter.fetchall(exp.select("id", "val", "ver").from_(seq_tbl))
+    assert list(seq_rows) == [(1, "v10", 10)]

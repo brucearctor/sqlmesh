@@ -395,6 +395,86 @@ SELECT
 FROM iceberg_catalog.bronze.raw_events;
 ```
 
+### Pattern 3: Iceberg Time Travel, Branches/Tags (`@branch` / `@tag`), & Compaction
+
+SQLMesh's Doris dialect natively parses and transpiles Apache Iceberg snapshot time travel, branch/tag reads, branch/tag DDL, and table maintenance/compaction actions while preserving upstream table lineage:
+
+- **Time Travel (`FOR TIME AS OF` / `FOR VERSION AS OF`)**:
+  ```sql
+  SELECT user_id, event_ts
+  FROM iceberg_catalog.bronze.clickstream FOR TIME AS OF '2026-01-15 00:00:00';
+
+  SELECT user_id, event_ts
+  FROM iceberg_catalog.bronze.clickstream FOR VERSION AS OF 8493021948102;
+  ```
+- **Branch & Tag Reads (`@branch(...)` / `@tag(...)`)**:
+  ```sql
+  SELECT user_id, event_ts
+  FROM iceberg_catalog.bronze.clickstream@branch(audit_branch) AS c;
+
+  SELECT user_id, event_ts
+  FROM iceberg_catalog.bronze.clickstream@tag(v1_release) AS c;
+  ```
+- **Iceberg Compaction (`rewrite_data_files`) & Branch Management via Post-Statements**:
+  You can run Iceberg file compaction, snapshot expiration, orphan file cleanup, or branch/tag management in model post-statements:
+  ```sql
+  MODEL (
+    name iceberg_catalog.silver.curated_events,
+    kind INCREMENTAL_BY_TIME_RANGE (
+      time_column event_ts
+    ),
+    table_format iceberg,
+    partitioned_by (day(event_ts))
+  );
+
+  SELECT
+    user_id::BIGINT AS user_id,
+    event_ts::DATETIME AS event_ts,
+    payload::STRING AS payload
+  FROM iceberg_catalog.bronze.raw_events
+  WHERE event_ts BETWEEN @start_ts AND @end_ts;
+
+  @IF(
+    @runtime_stage = 'evaluating',
+    ALTER TABLE @this_model EXECUTE rewrite_data_files("target-file-size-bytes" = "134217728")
+  );
+  ```
+
+### Pattern 4: Reading External Lance Tables & Catalogs (Doris 4.1+)
+
+Apache Doris 4.1+ supports reading multimodal and vector datasets stored in **Lance** format via external Lance catalogs (`'type' = 'lance'`) or table-valued functions (`'format' = 'lance'`).
+
+```yaml
+# config.yaml
+before_all:
+  - >
+    CREATE CATALOG IF NOT EXISTS lance_catalog PROPERTIES (
+      'type' = 'lance',
+      'lance.catalog.type' = 'filesystem',
+      'warehouse' = 's3://ai-lakehouse/lance_warehouse'
+    )
+```
+
+```sql
+MODEL (
+  name analytics.image_embeddings_olap,
+  kind FULL,
+  physical_properties (
+    storage_format = 'V3'
+  )
+);
+
+SELECT
+  doc_id::BIGINT AS doc_id,
+  caption::STRING AS caption,
+  embedding::ARRAY<FLOAT> AS embedding,
+  L2_DISTANCE(embedding, [0.1, 0.2, 0.3, 0.4]) AS ref_dist
+FROM lance_catalog.multimodal.clip_embeddings;
+```
+
+!!! warning "Lance Tables are Read-Only in Doris 4.1"
+    Doris 4.1 supports Lance catalogs and `format = 'lance'` table-valued functions for reading only (`CREATE TABLE`, `INSERT`, and `CTAS` are not supported by Doris on Lance catalogs). If a SQLMesh model is configured to materialize into a Lance catalog or sets `table_format = 'lance'`, `DorisEngineAdapter` raises a descriptive `SQLMeshError` directing you to materialize into the `internal` OLAP catalog or an `iceberg` catalog instead.
+
 ---
 
 ## DDL-Only / Schema Contract Management for Streaming Tables (`doris_ddl_only`)
@@ -580,30 +660,61 @@ FROM analytics.user_events
 GROUP BY user_id;
 ```
 
-### Inverted & Vector Indexes (Doris 2.1–5.0)
+### Inverted & Vector Indexes, Full-Text Search & Compaction (Doris 2.1–5.0)
 
-You can attach Doris inverted indexes (`USING INVERTED`) for full-text search or Doris 4.x+ ANN vector indexes (`USING ANN` with `hnsw` or `ivf` index types) using post-statements gated on `@runtime_stage = 'creating'`:
+You can attach Doris inverted indexes (`USING INVERTED` with tokenizer `PROPERTIES`), bloom filter indexes (`USING NGRAM_BF`), or Doris 4.x+ ANN vector indexes (`USING ANN` with `hnsw` or `ivf` index types) and trigger `BUILD INDEX` using post-statements. You can also configure OLAP `compaction_policy` (`'time_series'` or `'size_based'`) and `function_column.sequence_col` in `physical_properties`:
 
 ```sql
 MODEL (
   name analytics.searchable_logs,
-  kind FULL,
+  kind INCREMENTAL_BY_UNIQUE_KEY (
+    unique_key log_id
+  ),
   physical_properties (
     -- Optional Doris 4.1+ Segment V3 format for wide tables
-    storage_format = 'V3'
+    storage_format = 'V3',
+    -- Use 'time_series' compaction policy to reduce write amplification on append/log workloads
+    compaction_policy = 'time_series',
+    -- Sequence column prevents out-of-order updates with lower sequence values from overwriting newer rows
+    'function_column.sequence_col' = 'updated_at'
   )
 );
 
 SELECT
   log_id::BIGINT AS log_id,
   message::STRING AS message,
+  embedding::ARRAY<FLOAT> AS embedding,
+  updated_at::DATETIME AS updated_at,
   created_at::TIMESTAMPTZ(6) AS created_at
 FROM raw.logs;
 
 @IF(
   @runtime_stage = 'creating',
-  ALTER TABLE @this_model ADD INDEX idx_message (message) USING INVERTED COMMENT 'Full-text inverted index'
+  ALTER TABLE @this_model ADD INDEX idx_message (message) USING INVERTED PROPERTIES ("parser" = "english", "support_phrase" = "true") COMMENT 'Full-text inverted index'
 );
+
+@IF(
+  @runtime_stage = 'creating',
+  ALTER TABLE @this_model ADD INDEX idx_embedding (embedding) USING ANN PROPERTIES ("index_type" = "hnsw", "metric_type" = "l2_distance", "dim" = "768") COMMENT 'ANN vector index'
+);
+
+@IF(
+  @runtime_stage = 'evaluating',
+  BUILD INDEX idx_message ON @this_model
+);
+```
+
+Downstream SQLMesh models can query full-text and vector indexes using Doris's native search operators (`MATCH`, `MATCH_ANY`, `MATCH_ALL`, `MATCH_PHRASE`, `MATCH_PHRASE_PREFIX`, `MATCH_REGEXP`, `MATCH_PHRASE_EDGE`, `SEARCH(...)`) and vector distance functions (`L2_DISTANCE`, `COSINE_DISTANCE`, `INNER_PRODUCT`, `L1_DISTANCE`, and their `_APPROXIMATE` counterparts):
+
+```sql
+SELECT
+  log_id,
+  L2_DISTANCE_APPROXIMATE(embedding, [0.12, -0.04, 0.88]) AS dist
+FROM analytics.searchable_logs
+WHERE message MATCH_PHRASE 'connection timeout'
+  AND SEARCH('message:timeout')
+ORDER BY dist ASC
+LIMIT 20;
 ```
 
 ---
@@ -635,17 +746,18 @@ MODEL (
 
 ## Supported Model Kinds & Catalog Matrix
 
-| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal`) | External Apache Iceberg Catalog (`table_format iceberg`) |
-| --- | :---: | :---: |
-| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) |
-| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`) |
-| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`) |
-| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` / partition `DELETE` + `INSERT`) |
-| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported |
-| `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) |
-| `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs |
-| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported |
-| `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported |
+| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal`) | External Apache Iceberg Catalog (`table_format iceberg`) | External Lance Catalog (`type = 'lance'`) |
+| --- | :---: | :---: | :---: |
+| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported (Read-Only via Catalog or TVF) |
+| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris 4.1 (Write Guarded) |
+| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`) | Read-Only in Doris 4.1 (Write Guarded) |
+| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`) | Read-Only in Doris 4.1 (Write Guarded) |
+| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` / partition `DELETE` + `INSERT`) | Read-Only in Doris 4.1 (Write Guarded) |
+| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported | Read-Only in Doris 4.1 (Write Guarded) |
+| `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) | Requires `internal` catalog (`environment_catalog_mapping`) |
+| `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs | Not supported by Doris inside external catalogs |
+| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported | Read-Only in Doris 4.1 (Write Guarded) |
+| `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported | Not supported (Read-Only) |
 
 ---
 
