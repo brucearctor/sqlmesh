@@ -4,7 +4,7 @@ import typing as t
 
 import pytest
 from pytest import FixtureRequest
-from sqlglot import exp
+from sqlglot import exp, parse_one
 
 from sqlmesh.core.engine_adapter import DorisEngineAdapter
 from tests.core.engine_adapter.integration import (
@@ -634,3 +634,88 @@ def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
     )
     app_rows = ctx.engine_adapter.fetchall(exp.select("id", "score").from_(app_tbl))
     assert list(app_rows) == [(7, 9.5)]
+
+
+def test_doris_4_1_native_merge_segment_v3_and_ann_index(ctx: TestContext):
+    # 1. Native MERGE INTO with merge_filter and when_matched on a Merge-on-Write UNIQUE KEY table
+    merge_tbl = ctx.table("test_doris_41_merge")
+    merge_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "name": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+        "val": exp.DataType.build("INT", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(
+        merge_tbl,
+        merge_cols,
+        unique_key=[exp.to_column("id")],
+    )
+    ctx.engine_adapter.execute(
+        f"INSERT INTO {ctx.engine_adapter._to_sql(merge_tbl)} (`id`, `name`, `val`) VALUES (1, 'orig_a', 10), (2, 'orig_b', 20)"
+    )
+    src_query = parse_one(
+        "SELECT 1 AS id, 'new_a' AS name, 15 AS val UNION ALL "
+        "SELECT 2 AS id, 'new_b' AS name, 5 AS val UNION ALL "
+        "SELECT 3 AS id, 'new_c' AS name, 30 AS val",
+        read="doris",
+    )
+    ctx.engine_adapter.merge(
+        target_table=merge_tbl,
+        source_table=src_query,
+        target_columns_to_types=merge_cols,
+        unique_key=[exp.to_column("id")],
+        merge_filter=parse_one("__MERGE_SOURCE__.id > 0", read="doris"),
+        when_matched=parse_one(
+            "WHEN MATCHED AND __MERGE_SOURCE__.val > __MERGE_TARGET__.val THEN UPDATE SET __MERGE_TARGET__.val = __MERGE_SOURCE__.val",
+            into=exp.Whens,
+        ),
+    )
+    merged_rows = ctx.engine_adapter.fetchall(
+        exp.select("id", "name", "val").from_(merge_tbl).order_by("id")
+    )
+    # Row 1 updated val (15 > 10) while keeping name='orig_a'; Row 2 unchanged (5 < 20); Row 3 inserted
+    assert list(merged_rows) == [
+        (1, "orig_a", 15),
+        (2, "orig_b", 20),
+        (3, "new_c", 30),
+    ]
+
+    # 2. Doris 4.1 Segment V3 storage_format = 'V3' via physical_properties
+    v3_tbl = ctx.table("test_doris_41_segment_v3")
+    v3_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "payload": exp.DataType.build("VARCHAR(128)", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(
+        v3_tbl,
+        v3_cols,
+        table_properties={"storage_format": exp.Literal.string("V3")},
+    )
+    v3_row = ctx.engine_adapter.fetchone(f"SHOW CREATE TABLE {ctx.engine_adapter._to_sql(v3_tbl)}")
+    assert v3_row is not None
+    create_v3_ddl = v3_row[1]
+    assert '"storage_format" = "V3"' in create_v3_ddl
+
+    # 3. Doris 4.1 USING ANN IVF vector index creation
+    ann_tbl = ctx.table("test_doris_41_ann")
+    ann_tbl_sql = ctx.engine_adapter._to_sql(ann_tbl)
+    ctx.engine_adapter.execute(
+        f"""
+        CREATE TABLE {ann_tbl_sql} (
+            `id` INT NOT NULL,
+            `vec` ARRAY<FLOAT> NOT NULL,
+            INDEX idx_vec (`vec`) USING ANN PROPERTIES (
+                'index_type' = 'ivf',
+                'metric_type' = 'l2_distance',
+                'dim' = '4',
+                'nlist' = '2'
+            )
+        ) DUPLICATE KEY(`id`)
+        DISTRIBUTED BY HASH(`id`) BUCKETS 1
+        PROPERTIES ('replication_num' = '1')
+        """
+    )
+    ann_row = ctx.engine_adapter.fetchone(f"SHOW CREATE TABLE {ann_tbl_sql}")
+    assert ann_row is not None
+    create_ann_ddl = ann_row[1]
+    assert "USING ANN" in create_ann_ddl
+    assert '"index_type" = "ivf"' in create_ann_ddl

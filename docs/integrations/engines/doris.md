@@ -181,7 +181,22 @@ FROM raw.orders
 WHERE updated_at BETWEEN @start_ds AND @end_ds;
 ```
 
-You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` or `cluster_by` (emitting `CLUSTER BY (col1, col2)` on Doris 2.1+ Merge-on-Write tables).
+You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` or `cluster_by` (emitting `ORDER BY (col1, col2)` on Doris Merge-on-Write tables).
+
+On Doris 4.x+, `INCREMENTAL_BY_UNIQUE_KEY` models also support `when_matched` and `merge_filter` via Doris's native `MERGE INTO` syntax (automatically excluding `unique_key` columns from `WHEN MATCHED THEN UPDATE SET` to satisfy Doris Merge-on-Write value-column constraints):
+
+```sql
+MODEL (
+  name analytics.orders_upsert,
+  kind INCREMENTAL_BY_UNIQUE_KEY (
+    unique_key order_id,
+    merge_filter source.updated_at > target.updated_at,
+    when_matched WHEN MATCHED THEN UPDATE SET
+      target.status = source.status,
+      target.updated_at = source.updated_at
+  )
+);
+```
 
 ### AGGREGATE KEY model
 
@@ -565,19 +580,24 @@ FROM analytics.user_events
 GROUP BY user_id;
 ```
 
-### Inverted Indexes (Doris 2.1–5.0)
+### Inverted & Vector Indexes (Doris 2.1–5.0)
 
-You can attach Doris inverted indexes (`USING INVERTED`) for full-text search and fast point filtering using post-statements gated on `@runtime_stage = 'creating'`:
+You can attach Doris inverted indexes (`USING INVERTED`) for full-text search or Doris 4.x+ ANN vector indexes (`USING ANN` with `hnsw` or `ivf` index types) using post-statements gated on `@runtime_stage = 'creating'`:
 
 ```sql
 MODEL (
   name analytics.searchable_logs,
-  kind FULL
+  kind FULL,
+  physical_properties (
+    -- Optional Doris 4.1+ Segment V3 format for wide tables
+    storage_format = 'V3'
+  )
 );
 
 SELECT
   log_id::BIGINT AS log_id,
-  message::STRING AS message
+  message::STRING AS message,
+  created_at::TIMESTAMPTZ(6) AS created_at
 FROM raw.logs;
 
 @IF(
@@ -619,7 +639,7 @@ MODEL (
 | --- | :---: | :---: |
 | `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) |
 | `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`) |
-| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT`) | Supported (Batched key `DELETE` + `INSERT`) |
+| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`) |
 | `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` / partition `DELETE` + `INSERT`) |
 | `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported |
 | `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) |

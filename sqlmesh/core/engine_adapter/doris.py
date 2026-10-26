@@ -19,11 +19,12 @@ from sqlmesh.core.dialect import to_schema
 from sqlmesh.core.engine_adapter.base import (
     EngineAdapterWithIndexSupport,
     InsertOverwriteStrategy,
+    MERGE_SOURCE_ALIAS,
+    MERGE_TARGET_ALIAS,
     _decoded_str,
 )
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
-    LogicalMergeMixin,
     PandasNativeFetchDFSupportMixin,
     RowDiffMixin,
 )
@@ -53,7 +54,6 @@ logger = logging.getLogger(__name__)
 @set_catalog()
 class DorisEngineAdapter(
     EngineAdapterWithIndexSupport,
-    LogicalMergeMixin,
     GetCurrentCatalogFromFunctionMixin,
     PandasNativeFetchDFSupportMixin,
     RowDiffMixin,
@@ -85,6 +85,7 @@ class DorisEngineAdapter(
             exp.DataType.build("CHAR", dialect=DIALECT).this: [(1,), (255,)],
             exp.DataType.build("VARCHAR", dialect=DIALECT).this: [(65533,)],
             exp.DataType.build("DATETIME", dialect=DIALECT).this: [(0,)],
+            exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT).this: [(0,)],
             exp.DataType.build("INT", dialect=DIALECT).this: [(11,)],
             exp.DataType.build("BIGINT", dialect=DIALECT).this: [(20,)],
             exp.DataType.build("SMALLINT", dialect=DIALECT).this: [(6,)],
@@ -155,6 +156,19 @@ class DorisEngineAdapter(
                 exp.DataType.build("TEXT", dialect=DIALECT),
             },
             exp.DataType.build("DATETIME", dialect=DIALECT): {
+                exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("DATETIME(6)", dialect=DIALECT): {
+                exp.DataType.build("TIMESTAMPTZ(6)", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT): {
+                exp.DataType.build("DATETIME", dialect=DIALECT),
+                exp.DataType.build("TEXT", dialect=DIALECT),
+            },
+            exp.DataType.build("TIMESTAMPTZ(6)", dialect=DIALECT): {
+                exp.DataType.build("DATETIME(6)", dialect=DIALECT),
                 exp.DataType.build("TEXT", dialect=DIALECT),
             },
         },
@@ -3528,17 +3542,86 @@ class DorisEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
         **kwargs: t.Any,
     ) -> None:
-        if when_matched or merge_filter:
-            prop = "when_matched" if when_matched else "merge_filter"
-            raise SQLMeshError(
-                f"This engine does not support MERGE expressions and therefore `{prop}` is not supported."
+        if when_matched is None and merge_filter is None:
+            self._replace_by_key(
+                target_table,
+                source_table,
+                target_columns_to_types,
+                unique_key,
+                is_unique_key=True,
+                source_columns=source_columns,
+                **kwargs,
             )
-        self._replace_by_key(
+            return
+
+        if not target_columns_to_types or not columns_to_types_all_known(target_columns_to_types):
+            target_columns_to_types = self.columns(target_table)
+        else:
+            table = exp.to_table(target_table)
+            is_iceberg = self._is_iceberg_table(
+                table_format=kwargs.get("table_format"),
+                catalog_name=table.catalog,
+                table_properties=self._get_table_properties(kwargs),
+            )
+            if not is_iceberg:
+                target_columns_to_types = self._reorder_olap_columns(
+                    target_columns_to_types,
+                    {**kwargs, "unique_key": unique_key},
+                )
+
+        normalized_unique_key: t.List[exp.Expr] = [
+            exp.column(k) if isinstance(k, exp.Identifier) else k for k in unique_key
+        ]
+        key_col_names_lower = {
+            c.name.lower() for k in normalized_unique_key for c in k.find_all(exp.Column) if c.name
+        }
+        key_col_names_lower.update(k.lower() for k in self._last_described_key_cols)
+
+        if not when_matched:
+            non_key_cols = [
+                col for col in target_columns_to_types if col.lower() not in key_col_names_lower
+            ]
+            update_cols = non_key_cols or list(target_columns_to_types)
+            when_matched = exp.Whens(
+                expressions=[
+                    exp.When(
+                        matched=True,
+                        source=False,
+                        then=exp.Update(
+                            expressions=[
+                                exp.column(col, MERGE_TARGET_ALIAS).eq(
+                                    exp.column(col, MERGE_SOURCE_ALIAS)
+                                )
+                                for col in update_cols
+                            ],
+                        ),
+                    )
+                ]
+            )
+        else:
+            when_matched = when_matched.copy()
+            for when_expr in when_matched.find_all(exp.When):
+                then_expr = when_expr.args.get("then")
+                if isinstance(then_expr, exp.Update):
+                    filtered_eqs = [
+                        eq_expr
+                        for eq_expr in then_expr.expressions
+                        if not (
+                            isinstance(eq_expr, exp.EQ)
+                            and isinstance(eq_expr.this, exp.Column)
+                            and eq_expr.this.name.lower() in key_col_names_lower
+                        )
+                    ]
+                    if filtered_eqs:
+                        then_expr.set("expressions", filtered_eqs)
+
+        super().merge(
             target_table,
             source_table,
             target_columns_to_types,
-            unique_key,
-            is_unique_key=True,
+            normalized_unique_key,
+            when_matched=when_matched,
+            merge_filter=merge_filter,
             source_columns=source_columns,
             **kwargs,
         )
@@ -5319,7 +5402,7 @@ class DorisEngineAdapter(
                     order_by_cols = [col_by_lower[k.lower()] for k in order_by_cols]
                 order_cols_sql = ", ".join(self._to_sql(exp.to_column(k)) for k in order_by_cols)
                 properties.append(
-                    exp.SetConfigProperty(this=exp.var(f"CLUSTER BY ({order_cols_sql})"))
+                    exp.SetConfigProperty(this=exp.var(f"ORDER BY ({order_cols_sql})"))
                 )
 
         if table_description:
@@ -5623,6 +5706,53 @@ class DorisEngineAdapter(
                         expression = eq_expr
                     else:
                         is_node.replace(eq_expr)
+        if expression.find(exp.AtTimeZone):
+            expression = expression.copy()
+            for at_tz in reversed(list(expression.find_all(exp.AtTimeZone))):
+                zone_expr = at_tz.args.get("zone")
+                if isinstance(zone_expr, exp.Literal) and zone_expr.is_string:
+                    zone_val = zone_expr.this.strip()
+                    to_tz: exp.Expr = (
+                        exp.Literal.string("+00:00")
+                        if zone_val.upper() == "UTC"
+                        else exp.Literal.string(zone_val)
+                    )
+                elif zone_expr is not None:
+                    to_tz = zone_expr.copy()
+                else:
+                    to_tz = exp.Literal.string("+00:00")
+                convert_tz = exp.Anonymous(
+                    this="CONVERT_TZ",
+                    expressions=[
+                        at_tz.this.copy(),
+                        exp.SessionParameter(this=exp.var("time_zone")),
+                        to_tz,
+                    ],
+                )
+                if at_tz is expression:
+                    expression = convert_tz
+                else:
+                    at_tz.replace(convert_tz)
+        if expression.find(exp.TimeStrToTime):
+            expression = expression.copy()
+            for ts_node in reversed(list(expression.find_all(exp.TimeStrToTime))):
+                if (
+                    ts_node.args.get("zone")
+                    and isinstance(ts_node.this, exp.Literal)
+                    and ts_node.this.is_string
+                    and "." in ts_node.this.this
+                ):
+                    cast_node = exp.cast(
+                        ts_node.this.copy(),
+                        exp.DataType.build(
+                            "TIMESTAMPTZ",
+                            expressions=[exp.DataTypeParam(this=exp.Literal.number(6))],
+                        ),
+                    )
+                    if ts_node is expression:
+                        expression = cast_node
+                    else:
+                        ts_node.replace(cast_node)
         if expression.find(exp.DataType):
             expression = expression.copy()
             for dtype in reversed(list(expression.find_all(exp.DataType))):
@@ -5632,6 +5762,15 @@ class DorisEngineAdapter(
                         expression = replacement
                     else:
                         dtype.replace(replacement)
+                elif (
+                    dtype.is_type("timestamptz")
+                    and not dtype.expressions
+                    and isinstance(dtype.parent, (exp.Cast, exp.TryCast))
+                    and isinstance(dtype.parent.this, exp.Literal)
+                    and dtype.parent.this.is_string
+                    and "." in dtype.parent.this.this
+                ):
+                    dtype.set("expressions", [exp.DataTypeParam(this=exp.Literal.number(6))])
                 elif dtype.is_type("struct"):
                     new_field_sqls: t.List[str] = []
                     for field in dtype.expressions:

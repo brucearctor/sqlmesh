@@ -1443,6 +1443,7 @@ def extend_sqlglot() -> None:
                 "JSONB": TokenType.JSONB,
                 "LARGEINT": TokenType.INT128,
                 "QUANTILE_STATE": TokenType.USERDEFINED,
+                "TIMESTAMPTZ": TokenType.TIMESTAMPTZ,
                 "VARIANT": TokenType.VARIANT,
             }
 

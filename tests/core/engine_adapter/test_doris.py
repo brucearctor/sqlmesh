@@ -686,7 +686,7 @@ def test_create_table_olap_key_prefix_reordering_and_order_by(
     )
 
     assert to_sql_calls(adapter) == [
-        "CREATE TABLE IF NOT EXISTS `events` (`id` BIGINT, `ds` DATE, `payload` VARCHAR(255), `updated_at` DATETIME) UNIQUE KEY (`id`, `ds`) CLUSTER BY (`updated_at`, `id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+        "CREATE TABLE IF NOT EXISTS `events` (`id` BIGINT, `ds` DATE, `payload` VARCHAR(255), `updated_at` DATETIME) UNIQUE KEY (`id`, `ds`) ORDER BY (`updated_at`, `id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
     ]
 
 
@@ -2380,7 +2380,7 @@ def test_unannotated_view_column_comments_and_starrocks_property_parity(
     assert to_sql_calls(adapter) == [
         "CREATE VIEW `db`.`unannotated_view` COMMENT 'Users view' AS SELECT `id`, `name` FROM `db`.`users`",
         "CREATE MATERIALIZED VIEW `db`.`unannotated_mv` (`id` COMMENT 'Primary user ID', `name`) COMMENT 'Users MV' AS SELECT `id`, `name` FROM `db`.`users`",
-        "CREATE TABLE IF NOT EXISTS `db`.`paren_keys_tbl` (`id` INT, `dt` DATE, `name` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) CLUSTER BY (`dt`, `id`) DISTRIBUTED BY HASH (`id`, `dt`) BUCKETS 12 PROPERTIES ('excluded_trigger_tables'='db.t1,db.t2')",
+        "CREATE TABLE IF NOT EXISTS `db`.`paren_keys_tbl` (`id` INT, `dt` DATE, `name` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) ORDER BY (`dt`, `id`) DISTRIBUTED BY HASH (`id`, `dt`) BUCKETS 12 PROPERTIES ('excluded_trigger_tables'='db.t1,db.t2')",
     ]
 
     # 3. Fail-fast validation for unsupported primary_key, typo `partition`, conflicting partition definitions,
@@ -4747,3 +4747,84 @@ def test_doris_not_pushdown_week_quarter_and_candidate_extraction(
     assert adapter._sanitize_key_value(b"abc") == "abc"
     assert adapter._sanitize_key_value(np.int64(42)) == 42
     assert type(adapter._sanitize_key_value(np.int64(42))) is int
+
+
+def test_doris_4_1_native_merge_into_and_timestamptz(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. Native MERGE INTO when merge_filter is provided (automatically excludes key columns from UPDATE SET)
+    adapter.merge(
+        target_table="db.target",
+        source_table=parse_one("SELECT id, name, val, ds FROM db.src", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "name": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+            "val": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+        unique_key=[exp.to_column("id")],
+        merge_filter=parse_one("__MERGE_SOURCE__.ds > __MERGE_TARGET__.ds", read="doris"),
+    )
+    assert to_sql_calls(adapter) == [
+        "MERGE INTO `db`.`target` `__MERGE_TARGET__` USING (SELECT `id`, `name`, `val`, `ds` FROM `db`.`src`) AS `__MERGE_SOURCE__` ON `__MERGE_SOURCE__`.`ds` > `__MERGE_TARGET__`.`ds` AND `__MERGE_TARGET__`.`id` = `__MERGE_SOURCE__`.`id` WHEN MATCHED THEN UPDATE SET `__MERGE_TARGET__`.`name` = `__MERGE_SOURCE__`.`name`, `__MERGE_TARGET__`.`val` = `__MERGE_SOURCE__`.`val`, `__MERGE_TARGET__`.`ds` = `__MERGE_SOURCE__`.`ds` WHEN NOT MATCHED THEN INSERT (`id`, `name`, `val`, `ds`) VALUES (`__MERGE_SOURCE__`.`id`, `__MERGE_SOURCE__`.`name`, `__MERGE_SOURCE__`.`val`, `__MERGE_SOURCE__`.`ds`)"
+    ]
+
+    # 2. Native MERGE INTO when when_matched is provided (strips any key column assignment in UPDATE SET)
+    adapter.cursor.execute.reset_mock()
+    when_matched = parse_one(
+        "WHEN MATCHED THEN UPDATE SET __MERGE_TARGET__.id = __MERGE_SOURCE__.id, __MERGE_TARGET__.val = __MERGE_SOURCE__.val",
+        into=exp.Whens,
+    )
+    adapter.merge(
+        target_table="db.target",
+        source_table=parse_one("SELECT id, name, val, ds FROM db.src", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "name": exp.DataType.build("VARCHAR(64)", dialect="doris"),
+            "val": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+        unique_key=[exp.to_column("id")],
+        when_matched=when_matched,
+    )
+    assert to_sql_calls(adapter) == [
+        "MERGE INTO `db`.`target` `__MERGE_TARGET__` USING (SELECT `id`, `name`, `val`, `ds` FROM `db`.`src`) AS `__MERGE_SOURCE__` ON `__MERGE_TARGET__`.`id` = `__MERGE_SOURCE__`.`id` WHEN MATCHED THEN UPDATE SET `__MERGE_TARGET__`.`val` = `__MERGE_SOURCE__`.`val` WHEN NOT MATCHED THEN INSERT (`id`, `name`, `val`, `ds`) VALUES (`__MERGE_SOURCE__`.`id`, `__MERGE_SOURCE__`.`name`, `__MERGE_SOURCE__`.`val`, `__MERGE_SOURCE__`.`ds`)"
+    ]
+
+    # 3. AtTimeZone rewrites to CONVERT_TZ(..., @@time_zone, '+00:00')
+    norm_expr = adapter.normalize_value(
+        exp.to_column("ts"),
+        exp.DataType.build("TIMESTAMPTZ"),
+        decimal_precision=3,
+        timestamp_precision=6,
+    )
+    assert (
+        adapter._to_sql(norm_expr)
+        == "CAST(DATE_FORMAT(CONVERT_TZ(`ts`, @@time_zone, '+00:00'), '%Y-%m-%d %T.%f') AS VARCHAR)"
+    )
+
+    # 4. TIMESTAMPTZ defaults to precision 0 and is non-destructively compatible with TIMESTAMPTZ(0), TIMESTAMPTZ(6), and DATETIME(6)
+    from sqlmesh.core.schema_diff import TableAlterChangeColumnTypeOperation
+
+    ops_default = adapter.schema_differ.compare_columns(
+        "t",
+        {"ts": exp.DataType.build("TIMESTAMPTZ", dialect="doris")},
+        {"ts": exp.DataType.build("TIMESTAMPTZ(0)", dialect="doris")},
+    )
+    assert (
+        len(ops_default) == 1
+        and isinstance(ops_default[0], TableAlterChangeColumnTypeOperation)
+        and ops_default[0].is_part_of_destructive_change is False
+    )
+    ops = adapter.schema_differ.compare_columns(
+        "t",
+        {"ts": exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris")},
+        {"ts": exp.DataType.build("DATETIME(6)", dialect="doris")},
+    )
+    assert (
+        len(ops) == 1
+        and isinstance(ops[0], TableAlterChangeColumnTypeOperation)
+        and ops[0].is_part_of_destructive_change is False
+    )

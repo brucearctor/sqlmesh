@@ -3257,7 +3257,7 @@ def test_value_normalization(
     if column_type == exp.DataType.Type.TIMESTAMPTZ:
         if ctx.dialect == "trino" and ctx.engine_adapter.current_catalog_type == "hive":
             pytest.skip("Trino on Hive doesn't support TIMESTAMP WITH TIME ZONE fields")
-        if ctx.dialect in ("fabric", "doris"):
+        if ctx.dialect == "fabric":
             pytest.skip(f"{ctx.dialect} doesn't support TIMESTAMP WITH TIME ZONE fields")
 
     if not isinstance(ctx.engine_adapter, RowDiffMixin):

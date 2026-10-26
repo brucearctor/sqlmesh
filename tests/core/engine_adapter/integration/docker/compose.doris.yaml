@@ -1,6 +1,6 @@
 services:
   doris-fe:
-    image: apache/doris:fe-4.0.8
+    image: apache/doris:fe-4.1.5
     container_name: doris-fe
     hostname: doris-fe
     entrypoint:
@@ -10,6 +10,7 @@ services:
       - |
         sed -i 's/-Xmx8192m -Xms8192m/-Xmx2048m -Xms512m/g' /opt/apache-doris/fe/conf/fe.conf
         echo "priority_networks = 172.30.80.0/24" >> /opt/apache-doris/fe/conf/fe.conf
+        echo "force_olap_table_replication_num = 1" >> /opt/apache-doris/fe/conf/fe.conf
         exec bash /opt/apache-doris/fe/bin/start_fe.sh --console
     ports:
       - "8030:8030"
@@ -21,7 +22,7 @@ services:
         ipv4_address: 172.30.80.2
 
   doris-be:
-    image: apache/doris:be-4.0.8
+    image: apache/doris:be-4.1.5
     container_name: doris-be
     hostname: doris-be
     depends_on:
