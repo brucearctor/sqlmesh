@@ -11,7 +11,7 @@ from enum import Enum, auto
 from functools import lru_cache
 
 from sqlglot import Dialect, Generator, ParseError, Parser, Tokenizer, TokenType, exp, transforms
-from sqlglot.dialects.dialect import DialectType, var_map_sql
+from sqlglot.dialects.dialect import DialectType, rename_func, var_map_sql
 from sqlglot.dialects import Doris, DuckDB, Snowflake, TSQL
 import sqlglot.dialects.athena as athena
 import sqlglot.generators.athena as athena_generators
@@ -1471,7 +1471,9 @@ def extend_sqlglot() -> None:
     )
     Doris.Generator.TRANSFORMS.update(
         {
+            exp.Array: rename_func("ARRAY"),
             exp.Map: _doris_map_sql,
+            exp.ParseJSON: lambda self, e: f"CAST({self.sql(e, 'this')} AS JSON)",
             exp.Select: transforms.preprocess(
                 [
                     transforms.eliminate_distinct_on,

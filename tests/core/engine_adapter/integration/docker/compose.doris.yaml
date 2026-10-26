@@ -34,7 +34,8 @@ services:
         export SKIP_CHECK_ULIMIT=true
         sed -i 's/-Xmx2048m/-Xmx1024m/g' /opt/apache-doris/be/conf/be.conf
         echo "priority_networks = 172.30.80.0/24" >> /opt/apache-doris/be/conf/be.conf
-        echo "mem_limit = 2G" >> /opt/apache-doris/be/conf/be.conf
+        echo "mem_limit = 80%" >> /opt/apache-doris/be/conf/be.conf
+        echo "disable_memory_gc = false" >> /opt/apache-doris/be/conf/be.conf
         echo "storage_flood_stage_usage_percent = 99" >> /opt/apache-doris/be/conf/be.conf
         echo "storage_flood_stage_left_capacity_bytes = 104857600" >> /opt/apache-doris/be/conf/be.conf
         exec bash /opt/apache-doris/be/bin/start_be.sh --console

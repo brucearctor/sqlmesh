@@ -181,7 +181,7 @@ FROM raw.orders
 WHERE updated_at BETWEEN @start_ds AND @end_ds;
 ```
 
-You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` (emitting `ORDER BY (col1, col2)` on Doris 2.1+ Merge-on-Write tables).
+You can also specify `unique_key` explicitly in `physical_properties` for `FULL` or `INCREMENTAL_BY_TIME_RANGE` models, and optionally decouple the sort key from the unique key using `order_by` or `cluster_by` (emitting `CLUSTER BY (col1, col2)` on Doris 2.1+ Merge-on-Write tables).
 
 ### AGGREGATE KEY model
 

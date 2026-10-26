@@ -686,7 +686,7 @@ def test_create_table_olap_key_prefix_reordering_and_order_by(
     )
 
     assert to_sql_calls(adapter) == [
-        "CREATE TABLE IF NOT EXISTS `events` (`id` BIGINT, `ds` DATE, `payload` VARCHAR(255), `updated_at` DATETIME) UNIQUE KEY (`id`, `ds`) ORDER BY (`updated_at`, `id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+        "CREATE TABLE IF NOT EXISTS `events` (`id` BIGINT, `ds` DATE, `payload` VARCHAR(255), `updated_at` DATETIME) UNIQUE KEY (`id`, `ds`) CLUSTER BY (`updated_at`, `id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
     ]
 
 
@@ -2376,9 +2376,9 @@ def test_unannotated_view_column_comments_and_starrocks_property_parity(
     )
 
     assert to_sql_calls(adapter) == [
-        "CREATE VIEW `db`.`unannotated_view` (`id` COMMENT 'Primary user ID', `name`) COMMENT 'Users view' AS SELECT `id`, `name` FROM `db`.`users`",
+        "CREATE VIEW `db`.`unannotated_view` COMMENT 'Users view' AS SELECT `id`, `name` FROM `db`.`users`",
         "CREATE MATERIALIZED VIEW `db`.`unannotated_mv` (`id` COMMENT 'Primary user ID', `name`) COMMENT 'Users MV' AS SELECT `id`, `name` FROM `db`.`users`",
-        "CREATE TABLE IF NOT EXISTS `db`.`paren_keys_tbl` (`id` INT, `dt` DATE, `name` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) ORDER BY (`dt`, `id`) DISTRIBUTED BY HASH (`id`, `dt`) BUCKETS 12 PROPERTIES ('excluded_trigger_tables'='db.t1,db.t2')",
+        "CREATE TABLE IF NOT EXISTS `db`.`paren_keys_tbl` (`id` INT, `dt` DATE, `name` VARCHAR(50)) UNIQUE KEY (`id`, `dt`) CLUSTER BY (`dt`, `id`) DISTRIBUTED BY HASH (`id`, `dt`) BUCKETS 12 PROPERTIES ('excluded_trigger_tables'='db.t1,db.t2')",
     ]
 
     # 3. Fail-fast validation for unsupported primary_key, typo `partition`, conflicting partition definitions,
@@ -4517,3 +4517,71 @@ def test_doris_physical_properties_kwarg_drop_schema_cascade_and_mv_df_source_co
         mock_read_sql.call_args[0][0]
         == f"SELECT `id` FROM `db`.`{short_tmp}` WHERE `is_active` = TRUE"
     )
+
+
+def test_doris_time_transform_inequalities_unaliased_ctas_and_sync_mv_db_restore(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter, database="analytics")
+
+    # 1. Direct time-transform inequalities (`>=`, `<=`, `!=`) in `delete_from` are rewritten into
+    #    bare-column predicates (and `!=` is split into two OR-free DELETE statements).
+    adapter.delete_from(
+        "db.events",
+        "DATE_TRUNC(ds, 'day') >= '2024-01-15' AND DATE_TRUNC(ds, 'day') <= '2024-01-20'",
+    )
+    adapter.delete_from("db.events", "DATE_TRUNC(ds, 'day') != '2024-01-15'")
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-21'",
+        "DELETE FROM `db`.`events` WHERE `ds` < '2024-01-15'",
+        "DELETE FROM `db`.`events` WHERE `ds` >= '2024-01-16'",
+    ]
+
+    # 2. `DELETE ... USING` with an extra `OR` condition (`id IN (SELECT id FROM db.src) AND (status = 'a' OR status IS NULL)`)
+    #    expands `extra_conditions` into separate OR-free `DELETE ... USING` statements.
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from(
+        "db.target",
+        where=parse_one(
+            "id IN (SELECT id FROM db.src) AND (status = 'a' OR status IS NULL)",
+            read="doris",
+        ),
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`src`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`status` = 'a'",
+        "DELETE FROM `db`.`target` AS `_t1` USING (SELECT `id` FROM `db`.`src`) AS `_t2` WHERE `_t1`.`id` = `_t2`.`id` AND `_t1`.`status` IS NULL",
+    ]
+
+    # 3. Unannotated CTAS with unaliased `AVG(score)` or division `a / b` at column 0 promotes `id` to column 0.
+    adapter.cursor.execute.reset_mock()
+    adapter.ctas(
+        "db.unaliased_ctas",
+        parse_one("SELECT AVG(score), id FROM db.src GROUP BY 2", read="doris"),
+    )
+    adapter.ctas(
+        "db.div_ctas",
+        parse_one("SELECT a / b AS ratio, id FROM db.src", read="doris"),
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `db`.`unaliased_ctas` AS SELECT `id`, AVG(`score`) FROM `db`.`src` GROUP BY 1",
+        "CREATE TABLE IF NOT EXISTS `db`.`div_ctas` AS SELECT `id`, `a` / `b` AS `ratio` FROM `db`.`src`",
+    ]
+
+    # 4. Sync MV creation and drop in another schema (`other_db`) restores the configured session database (`analytics`).
+    adapter.cursor.execute.reset_mock()
+    adapter.create_view(
+        "other_db.rollup_mv",
+        parse_one("SELECT id, SUM(val) AS s FROM other_db.fact GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+    )
+    adapter.drop_view("other_db.rollup_mv", materialized=True)
+    assert to_sql_calls(adapter) == [
+        "USE `other_db`",
+        "CREATE MATERIALIZED VIEW `rollup_mv` AS SELECT `id` AS `mv_id`, SUM(`val`) AS `s` FROM `other_db`.`fact` GROUP BY `id`",
+        "USE `analytics`",
+        "USE `other_db`",
+        "DROP MATERIALIZED VIEW IF EXISTS `rollup_mv` ON `other_db`.`fact`",
+        "USE `analytics`",
+    ]

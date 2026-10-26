@@ -530,3 +530,82 @@ def test_insert_overwrite_by_time_partition_and_scd_type_2(ctx: TestContext):
         (1, "alice_v2", 1),
         (2, "bob_v1", 1),
     ]
+
+
+def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
+    from sqlglot import parse_one
+
+    # 1. Create table with LARGEINT, ARRAY, MAP, STRUCT, and BITMAP, insert rows, and run row-diff normalization
+    rich_table = ctx.table("test_doris_complex_types")
+    rich_cols = {
+        "id": exp.DataType.build("INT128", dialect="doris"),
+        "tags": exp.DataType.build("ARRAY<VARCHAR(32)>", dialect="doris"),
+        "attrs": exp.DataType.build("MAP<VARCHAR(32), INT>", dialect="doris"),
+        "profile": exp.DataType.build(
+            "STRUCT<uid: BIGINT, label: VARCHAR(64)>", dialect="doris", udt=True
+        ),
+        "bm": exp.DataType.build("BITMAP", dialect="doris", udt=True),
+    }
+    ctx.engine_adapter.create_table(
+        rich_table,
+        rich_cols,
+        table_properties={"duplicate_key": exp.Tuple(expressions=[exp.to_column("id")])},
+    )
+    ctx.engine_adapter.execute(
+        f"INSERT INTO {ctx.engine_adapter._to_sql(rich_table)} (`id`, `tags`, `attrs`, `profile`, `bm`) "
+        f"VALUES (100, ARRAY('x', 'y'), MAP('k1', 10, 'k2', 20), STRUCT(7, 'neo'), TO_BITMAP(42))"
+    )
+    described_cols = ctx.engine_adapter.columns(rich_table)
+    assert described_cols["id"] == exp.DataType.build("INT128")
+    concat_expr = t.cast(DorisEngineAdapter, ctx.engine_adapter).concat_columns(described_cols)
+    diff_rows = ctx.engine_adapter.fetchall(exp.select(concat_expr).from_(rich_table))
+    assert len(diff_rows) == 1
+    assert "100" in str(diff_rows[0][0])
+    assert "42" in str(diff_rows[0][0])
+
+    # 2. Live schema evolution (ADD COLUMN + MODIFY COLUMN + suppressed key-column VARCHAR(255)->STRING no-op)
+    cur_tbl = ctx.table("test_alter_cur")
+    tgt_tbl = ctx.table("test_alter_tgt")
+    ctx.engine_adapter.create_table(
+        cur_tbl,
+        {
+            "code": exp.DataType.build("TEXT", dialect="doris"),
+            "notes": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+        },
+    )
+    ctx.engine_adapter.create_table(
+        tgt_tbl,
+        {
+            "code": exp.DataType.build("TEXT", dialect="doris"),
+            "notes": exp.DataType.build("TEXT", dialect="doris"),
+            "extra_cnt": exp.DataType.build("BIGINT", dialect="doris"),
+        },
+    )
+    alter_ops = ctx.engine_adapter.get_alter_operations(cur_tbl, tgt_tbl)
+    ctx.engine_adapter.alter_table(alter_ops)
+    evolved_cols = ctx.engine_adapter.columns(cur_tbl)
+    assert "extra_cnt" in evolved_cols
+    assert evolved_cols["code"] == exp.DataType.build("TEXT", dialect="doris")
+
+    # 3. Direct time-transform inequality delete on OLAP table
+    ev_tbl = ctx.table("test_time_ineq_del")
+    ev_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "ds": exp.DataType.build("DATE", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(ev_tbl, ev_cols)
+    ctx.engine_adapter.execute(
+        f"INSERT INTO {ctx.engine_adapter._to_sql(ev_tbl)} (`id`, `ds`) VALUES "
+        f"(1, '2024-01-14'), (2, '2024-01-15'), (3, '2024-01-16')"
+    )
+    ctx.engine_adapter.delete_from(
+        ev_tbl,
+        parse_one(
+            "DATE_TRUNC(ds, 'day') >= '2024-01-15' AND DATE_TRUNC(ds, 'day') <= '2024-01-15'",
+            read="doris",
+        ),
+    )
+    remaining_ids = [
+        r[0] for r in ctx.engine_adapter.fetchall(exp.select("id").from_(ev_tbl).order_by("id"))
+    ]
+    assert remaining_ids == [1, 3]
