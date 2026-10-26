@@ -902,6 +902,20 @@ def _doris_parse_build(self: Parser) -> t.Optional[exp.Expr]:
     return self._parse_as_command(start)
 
 
+def _doris_parse_alter_raw_action(self: Parser) -> exp.Var:
+    start = self._prev
+    depth = 0
+    while self._curr and self._curr.token_type != TokenType.SEMICOLON:
+        if self._curr.token_type == TokenType.L_PAREN:
+            depth += 1
+        elif self._curr.token_type == TokenType.R_PAREN:
+            if depth == 0:
+                break
+            depth -= 1
+        self._advance()
+    return exp.var(self._find_sql(start, self._prev))
+
+
 def _doris_parse_alter_add(self: Parser) -> t.Union[exp.Expr, t.List[exp.Expr], None]:
     if self._match(TokenType.INDEX):
         return _doris_parse_index_constraint(self)
@@ -910,7 +924,7 @@ def _doris_parse_alter_add(self: Parser) -> t.Union[exp.Expr, t.List[exp.Expr], 
 
 def _doris_parse_alter_drop(self: Parser) -> t.Optional[exp.Expr]:
     if self._match_texts(("BRANCH", "TAG"), advance=False):
-        return self._parse_as_command(self._prev)
+        return _doris_parse_alter_raw_action(self)
     return self._parse_drop()
 
 
@@ -1767,10 +1781,10 @@ def extend_sqlglot() -> None:
     Doris.Parser.ALTER_PARSERS = {
         **Doris.Parser.ALTER_PARSERS,
         "ADD": _doris_parse_alter_add,
-        "CREATE": lambda self: self._parse_as_command(self._prev),
+        "CREATE": _doris_parse_alter_raw_action,
         "DROP": _doris_parse_alter_drop,
-        "EXECUTE": lambda self: self._parse_as_command(self._prev),
-        "REPLACE": lambda self: self._parse_as_command(self._prev),
+        "EXECUTE": _doris_parse_alter_raw_action,
+        "REPLACE": _doris_parse_alter_raw_action,
     }
     Doris.Generator.TYPE_MAPPING.update(
         {

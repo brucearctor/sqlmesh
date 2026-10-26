@@ -4882,6 +4882,20 @@ def test_lance_table_reading_and_write_guard(
             table_format="paimon",
         )
 
+    # 4. External Hive catalog table creation emits ENGINE=hive and skips OLAP key reordering
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "hive_cat.raw_db.events",
+        target_columns_to_types={
+            "payload": exp.DataType.build("STRING", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+        },
+        table_format="hive",
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `hive_cat`.`raw_db`.`events` (`payload` STRING, `id` INT) ENGINE=hive"
+    ]
+
 
 def test_iceberg_reading_time_travel_branch_and_compaction_ddl(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
@@ -4931,6 +4945,55 @@ def test_iceberg_reading_time_travel_branch_and_compaction_ddl(
         assert isinstance(parsed_ddl, exp.Alter)
         assert parsed_ddl.this.sql("doris") == "ice_cat.db.tbl"
         assert parsed_ddl.sql("doris") == ddl
+
+    # 3. Full SQLMesh model loading & @IF post-statement rendering with @this_model resolution
+    from sqlmesh.core.dialect import parse
+    from sqlmesh.core.macros import RuntimeStage
+    from sqlmesh.core.model import load_sql_based_model
+
+    model_sql = """
+    MODEL (
+      name ice_cat.silver.curated_events,
+      kind FULL,
+      dialect doris,
+      table_format iceberg
+    );
+    SELECT
+      e.id,
+      e.msg
+    FROM ice_cat.bronze.events FOR VERSION AS OF 123456 AS e
+    JOIN ice_cat.bronze.tags@tag(v1) AS t ON e.id = t.id
+    WHERE e.msg MATCH_PHRASE 'hello world' AND SEARCH('msg:hello');
+
+    @IF(
+      @runtime_stage = 'evaluating',
+      ALTER TABLE @this_model EXECUTE rewrite_data_files('target-file-size-bytes' = '134217728')
+    );
+    @IF(
+      @runtime_stage = 'creating',
+      ALTER TABLE @this_model ADD INDEX idx_msg (msg) USING INVERTED PROPERTIES ('parser' = 'english')
+    );
+    @IF(
+      @runtime_stage = 'evaluating',
+      BUILD INDEX idx_msg ON @this_model PARTITION (p1)
+    );
+    """
+    model = load_sql_based_model(
+        parse(model_sql, default_dialect="doris"), default_catalog="internal", dialect="doris"
+    )
+    assert model.depends_on == {'"ice_cat"."bronze"."events"', '"ice_cat"."bronze"."tags"'}
+    assert [
+        ps.sql("doris") for ps in model.render_post_statements(runtime_stage=RuntimeStage.CREATING)
+    ] == [
+        "ALTER TABLE `ice_cat`.`silver`.`curated_events` ADD INDEX `idx_msg` (`msg`) USING INVERTED PROPERTIES ('parser'='english')"
+    ]
+    assert [
+        ps.sql("doris")
+        for ps in model.render_post_statements(runtime_stage=RuntimeStage.EVALUATING)
+    ] == [
+        "ALTER TABLE `ice_cat`.`silver`.`curated_events` EXECUTE rewrite_data_files('target-file-size-bytes' = '134217728')",
+        "BUILD INDEX `idx_msg` ON `ice_cat`.`silver`.`curated_events` PARTITION (`p1`)",
+    ]
 
 
 def test_doris_4_1_search_indexes_compaction_and_sequence_col(

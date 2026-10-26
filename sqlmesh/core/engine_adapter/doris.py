@@ -412,11 +412,11 @@ class DorisEngineAdapter(
     ) -> bool:
         if self._is_lance_table(table_format=table_format, table_properties=table_properties):
             return False
-        if table_format and str(table_format).strip().lower() == "iceberg":
+        if table_format and str(table_format).strip().lower() in ("iceberg", "hive"):
             return True
         if table_properties:
             engine_val = self._extract_str_value(table_properties.get("engine"))
-            if engine_val and engine_val.strip().lower() == "iceberg":
+            if engine_val and engine_val.strip().lower() in ("iceberg", "hive"):
                 return True
         effective_catalog = catalog_name or self.default_catalog
         if effective_catalog and str(effective_catalog).strip().lower() != "internal":
@@ -5454,10 +5454,17 @@ class DorisEngineAdapter(
             table_properties=table_properties_copy,
         )
 
-        # Pop Iceberg engine property if present so it is not duplicated in PROPERTIES (...)
-        table_properties_copy.pop("engine", None)
+        # Pop Iceberg/Hive engine property if present so it is not duplicated in PROPERTIES (...)
+        explicit_engine = self._extract_str_value(table_properties_copy.pop("engine", None)) or (
+            str(table_format).strip().lower() if table_format else None
+        )
         if is_iceberg and is_schema_ddl:
-            properties.append(exp.EngineProperty(this=exp.var("iceberg")))
+            engine_name = (
+                "hive"
+                if explicit_engine and explicit_engine.strip().lower() == "hive"
+                else "iceberg"
+            )
+            properties.append(exp.EngineProperty(this=exp.var(engine_name)))
 
         if storage_format and not is_materialized_view:
             sf_str = str(storage_format).strip().strip("'").strip('"')
