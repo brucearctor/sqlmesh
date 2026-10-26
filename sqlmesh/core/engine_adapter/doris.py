@@ -685,6 +685,7 @@ class DorisEngineAdapter(
         describe_output = self.cursor.fetchall()
         cols: t.Dict[str, exp.DataType] = {}
         key_cols: t.Set[str] = set()
+        has_explicit_keys = False
         for row in itertools.takewhile(
             lambda r: not str(r[0]).startswith("#"),
             describe_output,
@@ -696,15 +697,18 @@ class DorisEngineAdapter(
             raw_type = _decoded_str(column_type) if column_type else ""
             if not col_name_str.strip() or not raw_type.strip():
                 continue
-            if is_key is not None and _decoded_str(is_key).strip().lower() in (
-                "true",
-                "pri",
-                "uni",
-                "dup",
-                "agg",
-                "yes",
-            ):
-                key_cols.add(col_name_str.lower())
+            if is_key is not None:
+                has_explicit_keys = True
+                if _decoded_str(is_key).strip().lower() in (
+                    "true",
+                    "pri",
+                    "uni",
+                    "dup",
+                    "agg",
+                    "yes",
+                ):
+                    key_cols.add(col_name_str.lower())
+            is_agg_state = raw_type.strip().upper().startswith("AGG_STATE")
             normalized_type = re.sub(
                 r"\bDECIMALV[23]\b(?!\s*`?\s*:)", "DECIMAL", raw_type, flags=re.IGNORECASE
             )
@@ -714,12 +718,20 @@ class DorisEngineAdapter(
             normalized_type = re.sub(
                 r"\bDATEV2\b(?!\s*`?\s*:)", "DATE", normalized_type, flags=re.IGNORECASE
             )
-            normalized_type = re.sub(
-                r"\bLARGEINT(?:\(\d+\)|\b)(?!\s*`?\s*:)",
-                "INT128",
-                normalized_type,
-                flags=re.IGNORECASE,
-            )
+            if not is_agg_state:
+                normalized_type = re.sub(
+                    r"\bLARGEINT(?:\(\d+\)|\b)(?!\s*`?\s*:)",
+                    "INT128",
+                    normalized_type,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                normalized_type = re.sub(
+                    r"\s+(?:NOT\s+)?NULL\b",
+                    "",
+                    normalized_type,
+                    flags=re.IGNORECASE,
+                )
             normalized_type = re.sub(
                 r"\bTINYINT\(1\)", "BOOLEAN", normalized_type, flags=re.IGNORECASE
             )
@@ -729,7 +741,25 @@ class DorisEngineAdapter(
                 normalized_type,
                 flags=re.IGNORECASE,
             )
-            cols[col_name_str] = exp.DataType.build(normalized_type, dialect=self.dialect, udt=True)
+            dtype = exp.DataType.build(normalized_type, dialect=self.dialect, udt=True)
+            for col_def in dtype.find_all(exp.ColumnDef):
+                if isinstance(col_def.this, exp.Identifier) and col_def.this.quoted:
+                    col_def.this.set("quoted", False)
+                constraints = [
+                    c
+                    for c in (col_def.args.get("constraints") or [])
+                    if not (
+                        isinstance(c, exp.NotNullColumnConstraint)
+                        and bool(c.args.get("allow_null"))
+                    )
+                    and not (
+                        isinstance(getattr(c, "kind", None), exp.NotNullColumnConstraint)
+                        and bool(c.kind.args.get("allow_null"))
+                    )
+                ]
+                col_def.set("constraints", constraints or None)
+            cols[col_name_str] = dtype
+        self._last_described_has_explicit_keys: bool = has_explicit_keys
         if cols and not key_cols:
             first_col = next(iter(cols))
             key_cols.add(first_col.lower())
@@ -770,11 +800,36 @@ class DorisEngineAdapter(
             ]
 
         self._last_described_key_cols = set()
+        self._last_described_has_explicit_keys = False
         current_cols = self.columns(current_table_name)
         current_key_cols = set(getattr(self, "_last_described_key_cols", set()))
+        current_has_explicit_keys = bool(getattr(self, "_last_described_has_explicit_keys", False))
         if current_cols and not current_key_cols:
             current_key_cols = {next(iter(current_cols)).lower()}
+
+        self._last_described_key_cols = set()
+        self._last_described_has_explicit_keys = False
         target_cols = self.columns(target_table_name)
+        target_key_cols = set(getattr(self, "_last_described_key_cols", set()))
+        target_has_explicit_keys = bool(getattr(self, "_last_described_has_explicit_keys", False))
+        if target_cols and not target_key_cols:
+            target_key_cols = {next(iter(target_cols)).lower()}
+
+        current_by_lower = {c.lower(): c_dtype for c, c_dtype in current_cols.items()}
+        for t_col, t_dtype in list(target_cols.items()):
+            curr_dtype = current_by_lower.get(t_col.lower())
+            if (
+                curr_dtype is not None
+                and curr_dtype != t_dtype
+                and self._to_sql(curr_dtype).upper() == self._to_sql(t_dtype).upper()
+            ):
+                target_cols[t_col] = curr_dtype.copy()
+
+        key_role_changed_cols: t.Set[str] = set()
+        if current_has_explicit_keys and target_has_explicit_keys:
+            common_cols = {c.lower() for c in current_cols} & {c.lower() for c in target_cols}
+            key_role_changed_cols = (current_key_cols ^ target_key_cols) & common_cols
+
         invalid_target_key_cols = {
             c.lower()
             for c, dtype in target_cols.items()
@@ -796,7 +851,7 @@ class DorisEngineAdapter(
             if isinstance(op, TableAlterDropColumnOperation)
             and op.column.name.lower() in current_key_cols
         }
-        protected_key_cols = invalid_target_key_cols | dropped_key_cols
+        protected_key_cols = invalid_target_key_cols | dropped_key_cols | key_role_changed_cols
         return [
             op
             for op in operations
@@ -810,6 +865,7 @@ class DorisEngineAdapter(
                             op.column.name.lower() in current_key_cols
                             and not self._is_valid_olap_key_type(op.column_type)
                         )
+                        or op.column.name.lower() in key_role_changed_cols
                     )
                 )
                 or (
@@ -950,9 +1006,14 @@ class DorisEngineAdapter(
             obj.type.is_table for obj in result
         ):
             try:
+                resolved_db = (
+                    schema_exp.db
+                    or next((obj.schema_name for obj in result if obj.schema_name), "")
+                    or self._extra_config.get("database")
+                )
                 db_arg = (
-                    self._to_sql(exp.Literal.string(schema_exp.db), quote=False)
-                    if schema_exp.db
+                    self._to_sql(exp.Literal.string(str(resolved_db)), quote=False)
+                    if resolved_db
                     else "DATABASE()"
                 )
                 mv_rows = self.fetchall(
@@ -1112,16 +1173,18 @@ class DorisEngineAdapter(
                 )
 
             partitioned_by = None
-            if materialized_properties and materialized_properties.get("partitioned_by"):
-                partitioned_by = materialized_properties.get("partitioned_by")
-            elif create_kwargs.get("partitioned_by"):
-                partitioned_by = create_kwargs.get("partitioned_by")
+            if not is_sync_mv:
+                if materialized_properties and materialized_properties.get("partitioned_by"):
+                    partitioned_by = materialized_properties.get("partitioned_by")
+                elif create_kwargs.get("partitioned_by"):
+                    partitioned_by = create_kwargs.get("partitioned_by")
 
             clustered_by = None
-            if materialized_properties and materialized_properties.get("clustered_by"):
-                clustered_by = materialized_properties.get("clustered_by")
-            elif create_kwargs.get("clustered_by"):
-                clustered_by = create_kwargs.get("clustered_by")
+            if not is_sync_mv:
+                if materialized_properties and materialized_properties.get("clustered_by"):
+                    clustered_by = materialized_properties.get("clustered_by")
+                elif create_kwargs.get("clustered_by"):
+                    clustered_by = create_kwargs.get("clustered_by")
 
             properties_exp = self._build_table_properties_exp(
                 catalog_name=target_table.catalog,
@@ -1138,7 +1201,7 @@ class DorisEngineAdapter(
                 clustered_by=clustered_by,
                 partition_interval_unit=(
                     materialized_properties.get("partition_interval_unit")
-                    if materialized_properties
+                    if materialized_properties and not is_sync_mv
                     else None
                 ),
                 table_kind="MATERIALIZED_VIEW",
@@ -1146,16 +1209,27 @@ class DorisEngineAdapter(
 
             if is_sync_mv and isinstance(query, exp.Select):
                 query = query.copy()
+                base_col_names = {
+                    col_node.name.lower()
+                    for col_node in query.find_all(exp.Column)
+                    if col_node.name
+                }
                 aliased_selects: t.List[exp.Expr] = []
                 for sel_expr in query.expressions:
                     if isinstance(sel_expr, exp.Column):
                         aliased_selects.append(
                             exp.alias_(sel_expr.copy(), f"mv_{sel_expr.name}", quoted=True)
                         )
-                    elif (
-                        isinstance(sel_expr, exp.Alias)
-                        and isinstance(sel_expr.this, exp.Column)
-                        and sel_expr.alias == sel_expr.this.name
+                    elif isinstance(sel_expr, exp.Alias) and (
+                        (
+                            isinstance(sel_expr.this, exp.Column)
+                            and sel_expr.alias == sel_expr.this.name
+                        )
+                        or (
+                            sel_expr.alias
+                            and sel_expr.alias.lower() in base_col_names
+                            and not sel_expr.alias.lower().startswith("mv_")
+                        )
                     ):
                         aliased_selects.append(
                             exp.alias_(sel_expr.this.copy(), f"mv_{sel_expr.alias}", quoted=True)
@@ -1326,7 +1400,6 @@ class DorisEngineAdapter(
                 sync_source_table = registry.get(target_table.name.lower())
 
         if sync_source_table is not None:
-            self._pop_sync_mv_source_table(target_table)
             source_tbl_exp = self._to_source_table(sync_source_table)
             # Synchronous materialized views require the target/source table's database
             # to be active on the session and an unqualified `<mv_name>` in `DROP MATERIALIZED VIEW <mv> ON <tbl>`.
@@ -1351,6 +1424,7 @@ class DorisEngineAdapter(
                         exp.to_identifier(str(configured_db), quoted=True)
                     )
                     self.execute(f"USE {restore_db_sql}")
+            self._pop_sync_mv_source_table(target_table)
             self._clear_data_object_cache(view_name)
             return
         super().drop_view(view_name, ignore_if_not_exists, materialized, **kwargs)
@@ -1377,15 +1451,29 @@ class DorisEngineAdapter(
         exists: bool = True,
         **kwargs: t.Any,
     ) -> None:
+        target_table = exp.to_table(target_table_name)
+        source_table = exp.to_table(source_table_name)
+        if self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=target_table.catalog or source_table.catalog,
+            table_properties=self._get_table_properties(kwargs),
+        ):
+            self.create_table(
+                target_table_name,
+                self.columns(source_table_name),
+                exists=exists,
+                **kwargs,
+            )
+            return
         self.execute(
             exp.Create(
-                this=exp.to_table(target_table_name),
+                this=target_table,
                 kind="TABLE",
                 exists=exists,
                 properties=exp.Properties(
                     expressions=[
                         exp.LikeProperty(
-                            this=exp.to_table(source_table_name),
+                            this=source_table,
                         ),
                     ],
                 ),
@@ -1445,6 +1533,53 @@ class DorisEngineAdapter(
         if caught_err is not None:
             raise caught_err
 
+    def insert_append(
+        self,
+        table_name: TableName,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        track_rows_processed: bool = True,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        query_or_df = self._native_df_to_pandas_df(query_or_df)
+        target_table = exp.to_table(table_name)
+        is_iceberg = self._is_iceberg_table(
+            table_format=kwargs.get("table_format"),
+            catalog_name=target_table.catalog,
+            table_properties=self._get_table_properties(kwargs),
+        )
+        if isinstance(query_or_df, pd.DataFrame) and (
+            not target_columns_to_types or not columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types, source_columns = self._columns_to_types(
+                query_or_df, target_columns_to_types, source_columns
+            )
+        elif target_columns_to_types is not None and not columns_to_types_all_known(
+            target_columns_to_types
+        ):
+            target_columns_to_types = self.columns(table_name)
+
+        if (
+            not is_iceberg
+            and target_columns_to_types
+            and columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self._reorder_olap_columns(target_columns_to_types, kwargs)
+            if source_columns:
+                source_col_set = set(source_columns)
+                source_columns = [c for c in target_columns_to_types if c in source_col_set] + [
+                    c for c in source_columns if c not in target_columns_to_types
+                ]
+
+        super().insert_append(
+            table_name,
+            query_or_df,
+            target_columns_to_types=target_columns_to_types,
+            track_rows_processed=track_rows_processed,
+            source_columns=source_columns,
+        )
+
     def _insert_overwrite_by_condition(
         self,
         table_name: TableName,
@@ -1479,8 +1614,10 @@ class DorisEngineAdapter(
         "minute": 1,
         "hour": 2,
         "day": 3,
-        "month": 4,
-        "year": 5,
+        "week": 4,
+        "month": 5,
+        "quarter": 6,
+        "year": 7,
     }
 
     @classmethod
@@ -1488,7 +1625,8 @@ class DorisEngineAdapter(
         cls, expr: exp.Expr
     ) -> t.Optional[t.Tuple[exp.Column, str]]:
         """Extract `(column, unit)` from time-truncation partition expressions (`DATE_TRUNC`,
-        `TO_DATE`, `DATE`, `YEAR`/`YEARS`, `MONTH`/`MONTHS`, `DAY`/`DAYS`, `HOUR`/`HOURS`).
+        `TO_DATE`, `DATE`, `YEAR`/`YEARS`, `QUARTER`/`QUARTERS`, `MONTH`/`MONTHS`, `WEEK`/`WEEKS`,
+        `DAY`/`DAYS`, `HOUR`/`HOURS`, `MINUTE`/`MINUTES`, `SECOND`/`SECONDS`).
         """
         curr = expr.unnest()
         col_node: t.Optional[exp.Column] = None
@@ -1506,7 +1644,20 @@ class DorisEngineAdapter(
             if isinstance(curr.this, exp.Column):
                 col_node = curr.this
                 raw_unit = "day"
-        elif isinstance(curr, (exp.Year, exp.Month, exp.Day, exp.Hour)):
+        elif isinstance(
+            curr,
+            (
+                exp.Year,
+                exp.Quarter,
+                exp.Month,
+                exp.Week,
+                exp.WeekOfYear,
+                exp.Day,
+                exp.Hour,
+                exp.Minute,
+                exp.Second,
+            ),
+        ):
             inner_arg = curr.this.unnest() if isinstance(curr.this, exp.Expr) else None
             if isinstance(inner_arg, (exp.TsOrDsToDate, exp.Date)) and isinstance(
                 inner_arg.this, exp.Expr
@@ -1516,12 +1667,27 @@ class DorisEngineAdapter(
                 col_node = inner_arg
                 if isinstance(curr, exp.Year):
                     raw_unit = "year"
+                elif isinstance(curr, exp.Quarter):
+                    raw_unit = "quarter"
                 elif isinstance(curr, exp.Month):
                     raw_unit = "month"
+                elif isinstance(curr, (exp.Week, exp.WeekOfYear)):
+                    raw_unit = "week"
                 elif isinstance(curr, exp.Day):
                     raw_unit = "day"
-                else:
+                elif isinstance(curr, exp.Hour):
                     raw_unit = "hour"
+                elif isinstance(curr, exp.Minute):
+                    raw_unit = "minute"
+                else:
+                    raw_unit = "second"
+        elif isinstance(curr, exp.Extract):
+            extract_expr = (
+                curr.expression.unnest() if isinstance(curr.expression, exp.Expr) else None
+            )
+            if isinstance(extract_expr, exp.Column):
+                col_node = extract_expr
+                raw_unit = cls._extract_str_value(curr.this)
         elif isinstance(curr, exp.Anonymous):
             fn_name = curr.name.upper()
             if fn_name == "DATE_TRUNC" and len(curr.expressions) == 2:
@@ -1544,8 +1710,13 @@ class DorisEngineAdapter(
                 in (
                     "YEAR",
                     "YEARS",
+                    "QUARTER",
+                    "QUARTERS",
                     "MONTH",
                     "MONTHS",
+                    "WEEK",
+                    "WEEKS",
+                    "WEEKOFYEAR",
                     "DAY",
                     "DAYS",
                     "HOUR",
@@ -1559,7 +1730,7 @@ class DorisEngineAdapter(
                 and isinstance(curr.expressions[0], exp.Column)
             ):
                 col_node = curr.expressions[0]
-                raw_unit = fn_name.lower()
+                raw_unit = "week" if fn_name == "WEEKOFYEAR" else fn_name.lower()
 
         if col_node is not None and raw_unit:
             unit_clean = str(raw_unit).strip().strip("'\"").lower()
@@ -1575,13 +1746,32 @@ class DorisEngineAdapter(
     @staticmethod
     def _is_date_part_extract_fn(expr: exp.Expr) -> bool:
         curr = expr.unnest()
-        if isinstance(curr, (exp.Year, exp.Month, exp.Day, exp.Hour)):
+        if isinstance(
+            curr,
+            (
+                exp.Year,
+                exp.Quarter,
+                exp.Month,
+                exp.Week,
+                exp.WeekOfYear,
+                exp.Day,
+                exp.Hour,
+                exp.Minute,
+                exp.Second,
+                exp.Extract,
+            ),
+        ):
             return True
         if isinstance(curr, exp.Anonymous) and curr.name.upper() in (
             "YEAR",
             "YEARS",
+            "QUARTER",
+            "QUARTERS",
             "MONTH",
             "MONTHS",
+            "WEEK",
+            "WEEKS",
+            "WEEKOFYEAR",
             "DAY",
             "DAYS",
             "HOUR",
@@ -1767,6 +1957,7 @@ class DorisEngineAdapter(
             return
 
         where = self._unwrap_literal_casts_in_where(where)
+        where = self._pushdown_not_in_where(where)
         where = self._rewrite_between_in_where(where)
         where = self._rewrite_direct_time_transforms_in_where(where)
         where = self._normalize_boolean_column_conjuncts(where)
@@ -1794,6 +1985,7 @@ class DorisEngineAdapter(
             return
 
         target_table = exp.to_table(table_name)
+        where = where.unnest()
         for col in where.find_all(exp.Column):
             if not col.find_ancestor(exp.Subquery, exp.Select) and (
                 col.table and col.table.lower() == target_table.name.lower()
@@ -1827,6 +2019,13 @@ class DorisEngineAdapter(
             and expr.this.is_number == expr.expression.is_number
         ):
             return exp.true() if expr.this == expr.expression else exp.false()
+        if (
+            isinstance(expr, exp.NEQ)
+            and isinstance(expr.this, exp.Literal)
+            and isinstance(expr.expression, exp.Literal)
+            and expr.this.is_number == expr.expression.is_number
+        ):
+            return exp.false() if expr.this == expr.expression else exp.true()
         if isinstance(expr, exp.Not) and isinstance(expr.this, exp.Boolean):
             return exp.false() if expr.this == exp.true() else exp.true()
         if isinstance(expr, exp.And):
@@ -1885,7 +2084,66 @@ class DorisEngineAdapter(
                 normalized.append(cond)
         return normalized
 
+    @classmethod
+    def _pushdown_not_in_where(cls, expr: exp.Expr) -> exp.Expr:
+        if isinstance(expr, (exp.Subquery, exp.Select)):
+            return expr
+        if isinstance(expr, exp.Not) and isinstance(expr.this, exp.Expr):
+            inner = expr.this.unnest()
+            if isinstance(inner, exp.Not) and isinstance(inner.this, exp.Expr):
+                return cls._pushdown_not_in_where(inner.this.unnest().copy())
+            if isinstance(inner, exp.And):
+                return exp.Paren(
+                    this=exp.or_(
+                        cls._pushdown_not_in_where(exp.not_(inner.this.copy(), copy=False)),
+                        cls._pushdown_not_in_where(exp.not_(inner.expression.copy(), copy=False)),
+                        copy=False,
+                    )
+                )
+            if isinstance(inner, exp.Or):
+                return exp.Paren(
+                    this=exp.and_(
+                        cls._pushdown_not_in_where(exp.not_(inner.this.copy(), copy=False)),
+                        cls._pushdown_not_in_where(exp.not_(inner.expression.copy(), copy=False)),
+                        copy=False,
+                    )
+                )
+            if isinstance(inner, exp.Between):
+                return exp.Paren(
+                    this=exp.or_(
+                        exp.LT(this=inner.this.copy(), expression=inner.args["low"].copy()),
+                        exp.GT(this=inner.this.copy(), expression=inner.args["high"].copy()),
+                        copy=False,
+                    )
+                )
+            if isinstance(inner, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                neg_map: t.Dict[t.Type[exp.Binary], t.Type[exp.Binary]] = {
+                    exp.EQ: exp.NEQ,
+                    exp.NEQ: exp.EQ,
+                    exp.GT: exp.LTE,
+                    exp.GTE: exp.LT,
+                    exp.LT: exp.GTE,
+                    exp.LTE: exp.GT,
+                }
+                neg_cls = neg_map[type(inner)]
+                return neg_cls(this=inner.this.copy(), expression=inner.expression.copy())
+            if isinstance(inner, (exp.In, exp.Is)) and expr.this is not inner:
+                return exp.Not(this=inner.copy())
+        for k, v in list(expr.args.items()):
+            if isinstance(v, exp.Expr):
+                expr.set(k, cls._pushdown_not_in_where(v))
+            elif isinstance(v, list):
+                expr.set(
+                    k,
+                    [
+                        cls._pushdown_not_in_where(item) if isinstance(item, exp.Expr) else item
+                        for item in v
+                    ],
+                )
+        return expr
+
     def _expand_or_to_conjunct_sets(self, expr: exp.Expr) -> t.List[t.List[exp.Expr]]:
+        expr = self._pushdown_not_in_where(expr.copy())
         conjuncts = self._flatten_and_conjuncts(expr)
         if len(conjuncts) > 1:
             sets: t.List[t.List[exp.Expr]] = [[]]
@@ -2012,9 +2270,15 @@ class DorisEngineAdapter(
                 exp.LTE,
                 exp.LT,
                 exp.In,
+                exp.Is,
             )
         ):
             if node.find_ancestor(exp.Subquery, exp.Select):
+                continue
+            if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
+                is_trans = self._extract_time_partition_transform(node.this)
+                if is_trans is not None:
+                    node.set("this", is_trans[0].copy())
                 continue
             parent_not = node.parent if isinstance(node.parent, exp.Not) else None
             if node.find_ancestor(exp.Not) and parent_not is None:
@@ -2189,70 +2453,64 @@ class DorisEngineAdapter(
     ) -> t.Optional[t.Tuple[t.List[exp.Expr], exp.Subquery, t.List[exp.Expr]]]:
         """Extract positive IN (SELECT ...) subquery and any sibling AND conditions."""
         conjuncts = self._flatten_and_conjuncts(where)
-        target_in: t.Optional[exp.In] = None
-        subquery: t.Optional[exp.Subquery] = None
-        extra_conditions: t.List[exp.Expr] = []
 
-        for cond in conjuncts:
+        for cand_idx, cond in enumerate(conjuncts):
             unwrapped_cond = cond.unnest()
-            if target_in is None and isinstance(unwrapped_cond, exp.In):
-                sq = self._get_in_subquery(unwrapped_cond)
-                if sq is not None:
-                    target_in = unwrapped_cond
-                    subquery = sq
+            if not isinstance(unwrapped_cond, exp.In):
+                continue
+            subquery = self._get_in_subquery(unwrapped_cond)
+            if subquery is None:
+                continue
+
+            lhs = unwrapped_cond.this
+            select_expr = subquery.this
+            key_exprs: t.List[exp.Expr] = []
+
+            lhs_concat = self._unwrap_concat_ws(lhs)
+            if lhs_concat is not None:
+                unwrapped_select_expr = self._unwrap_concat_ws_in_query(
+                    select_expr, len(lhs_concat.expressions)
+                )
+                if unwrapped_select_expr is None:
                     continue
-            extra_conditions.append(cond)
-
-        if target_in is None or subquery is None:
-            return None
-
-        lhs = target_in.this
-        select_expr = subquery.this
-        key_exprs: t.List[exp.Expr] = []
-
-        lhs_concat = self._unwrap_concat_ws(lhs)
-        if lhs_concat is not None:
-            unwrapped_select_expr = self._unwrap_concat_ws_in_query(
-                select_expr, len(lhs_concat.expressions)
-            )
-            if unwrapped_select_expr is None:
-                return None
-            key_exprs = [e.copy() for e in lhs_concat.expressions[1:]]
-            subquery = exp.Subquery(this=unwrapped_select_expr)
-        elif isinstance(lhs, exp.Tuple):
-            key_exprs = [e.copy() for e in lhs.expressions]
-        else:
-            key_exprs = [lhs.copy()]
-
-        normalized_keys: t.List[exp.Expr] = []
-        for k in key_exprs:
-            if isinstance(k, exp.Column):
-                normalized_keys.append(k)
-            elif isinstance(k, exp.Identifier):
-                normalized_keys.append(exp.Column(this=k.copy()))
-            elif self._extract_time_partition_transform(k) is not None:
-                normalized_keys.append(k.copy())
+                key_exprs = [e.copy() for e in lhs_concat.expressions[1:]]
+                subquery = exp.Subquery(this=unwrapped_select_expr)
+            elif isinstance(lhs, exp.Tuple):
+                key_exprs = [e.copy() for e in lhs.expressions]
             else:
-                return None
+                key_exprs = [lhs.copy()]
 
-        if not normalized_keys:
-            return None
+            normalized_keys: t.List[exp.Expr] = []
+            valid_keys = True
+            for k in key_exprs:
+                if isinstance(k, exp.Column):
+                    normalized_keys.append(k)
+                elif isinstance(k, exp.Identifier):
+                    normalized_keys.append(exp.Column(this=k.copy()))
+                elif self._extract_time_partition_transform(k) is not None:
+                    normalized_keys.append(k.copy())
+                else:
+                    valid_keys = False
+                    break
 
-        return normalized_keys, subquery, self._normalize_extra_conditions(extra_conditions)
+            if not valid_keys or not normalized_keys:
+                continue
+
+            extra_conditions = [c for i, c in enumerate(conjuncts) if i != cand_idx]
+            return normalized_keys, subquery, self._normalize_extra_conditions(extra_conditions)
+
+        return None
 
     def _extract_literal_tuple_in_from_where(
         self, where: exp.Expr
     ) -> t.Optional[t.Tuple[t.List[exp.Expr], t.List[t.Tuple[exp.Expr, ...]], t.List[exp.Expr]]]:
         """Extract positive literal tuple IN predicate `(a, b) IN ((1, 2), (3, 4))` and sibling AND conditions."""
         conjuncts = self._flatten_and_conjuncts(where)
-        target_in: t.Optional[exp.In] = None
-        extra_conditions: t.List[exp.Expr] = []
 
-        for cond in conjuncts:
+        for cand_idx, cond in enumerate(conjuncts):
             unwrapped_cond = cond.unnest()
-            if (
-                target_in is None
-                and isinstance(unwrapped_cond, exp.In)
+            if not (
+                isinstance(unwrapped_cond, exp.In)
                 and self._get_in_subquery(unwrapped_cond) is None
                 and isinstance(unwrapped_cond.this, exp.Tuple)
                 and len(unwrapped_cond.this.expressions) >= 2
@@ -2263,31 +2521,34 @@ class DorisEngineAdapter(
                     for item in unwrapped_cond.expressions
                 )
             ):
-                target_in = unwrapped_cond
                 continue
-            extra_conditions.append(cond)
 
-        if target_in is None:
-            return None
+            normalized_keys: t.List[exp.Expr] = []
+            valid_keys = True
+            for k in unwrapped_cond.this.expressions:
+                if isinstance(k, exp.Column):
+                    normalized_keys.append(k.copy())
+                elif isinstance(k, exp.Identifier):
+                    normalized_keys.append(exp.Column(this=k.copy()))
+                else:
+                    valid_keys = False
+                    break
 
-        normalized_keys: t.List[exp.Expr] = []
-        for k in target_in.this.expressions:
-            if isinstance(k, exp.Column):
-                normalized_keys.append(k.copy())
-            elif isinstance(k, exp.Identifier):
-                normalized_keys.append(exp.Column(this=k.copy()))
-            else:
-                return None
+            if not valid_keys or not normalized_keys:
+                continue
 
-        tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = [
-            tuple(e.copy() for e in item.expressions)
-            for item in target_in.expressions
-            if isinstance(item, exp.Tuple)
-        ]
-        if not tuple_rows:
-            return None
+            tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = [
+                tuple(e.copy() for e in item.expressions)
+                for item in unwrapped_cond.expressions
+                if isinstance(item, exp.Tuple)
+            ]
+            if not tuple_rows:
+                continue
 
-        return normalized_keys, tuple_rows, self._normalize_extra_conditions(extra_conditions)
+            extra_conditions = [c for i, c in enumerate(conjuncts) if i != cand_idx]
+            return normalized_keys, tuple_rows, self._normalize_extra_conditions(extra_conditions)
+
+        return None
 
     @staticmethod
     def _is_literal_key_value(expr: exp.Expr) -> bool:
@@ -2344,93 +2605,100 @@ class DorisEngineAdapter(
         when `SUPPORTS_TUPLE_IN = False`, or `delete_expired_environments`) and sibling AND conditions.
         """
         conjuncts = self._flatten_and_conjuncts(where)
-        target_or: t.Optional[exp.Or] = None
-        extra_conditions: t.List[exp.Expr] = []
 
-        for cond in conjuncts:
+        for cand_idx, cond in enumerate(conjuncts):
             unwrapped_cond = cond.unnest()
-            if target_or is None and isinstance(unwrapped_cond, exp.Or):
-                target_or = unwrapped_cond
+            if not isinstance(unwrapped_cond, exp.Or):
                 continue
-            extra_conditions.append(cond)
 
-        if target_or is None:
-            return None
+            disjuncts = self._flatten_or_disjuncts(unwrapped_cond)
+            if len(disjuncts) < 2:
+                continue
 
-        disjuncts = self._flatten_or_disjuncts(target_or)
-        if len(disjuncts) < 2:
-            return None
+            canonical_col_order: t.Optional[t.List[str]] = None
+            canonical_cols: t.List[exp.Expr] = []
+            tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = []
+            valid_or = True
 
-        canonical_col_order: t.Optional[t.List[str]] = None
-        canonical_cols: t.List[exp.Expr] = []
-        tuple_rows: t.List[t.Tuple[exp.Expr, ...]] = []
-
-        for branch in disjuncts:
-            branch_conjuncts = self._flatten_and_conjuncts(branch)
-            col_to_val: t.Dict[str, exp.Expr] = {}
-            col_to_expr: t.Dict[str, exp.Expr] = {}
-            for item in branch_conjuncts:
-                normalized_bool = self._normalize_single_boolean_conjunct(item)
-                item_unwrapped = normalized_bool if normalized_bool is not None else item.unnest()
-                if isinstance(item_unwrapped, exp.EQ):
-                    left, right = item_unwrapped.this, item_unwrapped.expression
-                    if isinstance(
-                        left, (exp.Column, exp.Identifier)
-                    ) and self._is_literal_key_value(right):
-                        col_expr = (
-                            left.copy()
-                            if isinstance(left, exp.Column)
-                            else exp.Column(this=left.copy())
-                        )
-                        val_expr = right.copy()
-                    elif isinstance(
-                        right, (exp.Column, exp.Identifier)
-                    ) and self._is_literal_key_value(left):
-                        col_expr = (
-                            right.copy()
-                            if isinstance(right, exp.Column)
-                            else exp.Column(this=right.copy())
-                        )
-                        val_expr = left.copy()
+            for branch in disjuncts:
+                branch_conjuncts = self._flatten_and_conjuncts(branch)
+                col_to_val: t.Dict[str, exp.Expr] = {}
+                col_to_expr: t.Dict[str, exp.Expr] = {}
+                for item in branch_conjuncts:
+                    normalized_bool = self._normalize_single_boolean_conjunct(item)
+                    item_unwrapped = (
+                        normalized_bool if normalized_bool is not None else item.unnest()
+                    )
+                    if isinstance(item_unwrapped, exp.EQ):
+                        left, right = item_unwrapped.this, item_unwrapped.expression
+                        if isinstance(
+                            left, (exp.Column, exp.Identifier)
+                        ) and self._is_literal_key_value(right):
+                            col_expr = (
+                                left.copy()
+                                if isinstance(left, exp.Column)
+                                else exp.Column(this=left.copy())
+                            )
+                            val_expr = right.copy()
+                        elif isinstance(
+                            right, (exp.Column, exp.Identifier)
+                        ) and self._is_literal_key_value(left):
+                            col_expr = (
+                                right.copy()
+                                if isinstance(right, exp.Column)
+                                else exp.Column(this=right.copy())
+                            )
+                            val_expr = left.copy()
+                        else:
+                            valid_or = False
+                            break
+                    elif isinstance(item_unwrapped, exp.Is) and isinstance(
+                        item_unwrapped.expression, exp.Null
+                    ):
+                        left = item_unwrapped.this
+                        if isinstance(left, (exp.Column, exp.Identifier)):
+                            col_expr = (
+                                left.copy()
+                                if isinstance(left, exp.Column)
+                                else exp.Column(this=left.copy())
+                            )
+                            val_expr = exp.null()
+                        else:
+                            valid_or = False
+                            break
                     else:
-                        return None
-                elif isinstance(item_unwrapped, exp.Is) and isinstance(
-                    item_unwrapped.expression, exp.Null
-                ):
-                    left = item_unwrapped.this
-                    if isinstance(left, (exp.Column, exp.Identifier)):
-                        col_expr = (
-                            left.copy()
-                            if isinstance(left, exp.Column)
-                            else exp.Column(this=left.copy())
-                        )
-                        val_expr = exp.null()
-                    else:
-                        return None
-                else:
-                    return None
+                        valid_or = False
+                        break
 
-                col_key = col_expr.name.lower()
-                if not col_key or col_key in col_to_val:
-                    return None
-                col_to_val[col_key] = val_expr
-                col_to_expr[col_key] = col_expr
+                    col_key = col_expr.name.lower()
+                    if not col_key or col_key in col_to_val:
+                        valid_or = False
+                        break
+                    col_to_val[col_key] = val_expr
+                    col_to_expr[col_key] = col_expr
 
-            if not col_to_val:
-                return None
+                if not valid_or or not col_to_val:
+                    valid_or = False
+                    break
 
-            if canonical_col_order is None:
-                canonical_col_order = list(col_to_val.keys())
-                canonical_cols = [col_to_expr[k] for k in canonical_col_order]
-            elif set(col_to_val.keys()) != set(canonical_col_order):
-                return None
+                if canonical_col_order is None:
+                    canonical_col_order = list(col_to_val.keys())
+                    canonical_cols = [col_to_expr[k] for k in canonical_col_order]
+                elif set(col_to_val.keys()) != set(canonical_col_order):
+                    valid_or = False
+                    break
 
-            tuple_rows.append(tuple(col_to_val[k] for k in canonical_col_order))
+                tuple_rows.append(tuple(col_to_val[k] for k in canonical_col_order))
 
-        if not canonical_cols or not tuple_rows:
-            return None
+            if valid_or and canonical_cols and tuple_rows:
+                extra_conditions = [c for i, c in enumerate(conjuncts) if i != cand_idx]
+                return (
+                    canonical_cols,
+                    tuple_rows,
+                    self._normalize_extra_conditions(extra_conditions),
+                )
 
-        return canonical_cols, tuple_rows, self._normalize_extra_conditions(extra_conditions)
+        return None
 
     @staticmethod
     def _unwrap_concat_ws(expr: exp.Expr) -> t.Optional[exp.Expr]:
@@ -2608,11 +2876,29 @@ class DorisEngineAdapter(
     def _sanitize_key_value(val: t.Any) -> t.Any:
         if val is None:
             return None
+        if isinstance(val, (bytes, bytearray)):
+            return _decoded_str(val)
         try:
             if pd.isna(val):
                 return None
         except (TypeError, ValueError):
             pass
+        if hasattr(val, "item") and not isinstance(
+            val,
+            (
+                str,
+                bytes,
+                bytearray,
+                datetime.date,
+                datetime.datetime,
+                datetime.time,
+                Decimal,
+            ),
+        ):
+            try:
+                return val.item()
+            except Exception:
+                pass
         return val
 
     @staticmethod
@@ -2810,6 +3096,12 @@ class DorisEngineAdapter(
                 inner_expr = sel_item.this if isinstance(sel_item, exp.Alias) else sel_item
                 new_first_exprs[idx] = exp.alias_(inner_expr.copy(), f"_col_{idx}", quoted=True)
             first_select.set("expressions", new_first_exprs)
+
+            if not select_query.args.get("limit") and not select_query.args.get("offset"):
+                select_query.set("order", None)
+            for branch in all_branches:
+                if not branch.args.get("limit") and not branch.args.get("offset"):
+                    branch.set("order", None)
 
             for idx, k in enumerate(key_exprs):
                 sq_col = exp.column(f"_col_{idx}", quoted=True)
@@ -3401,6 +3693,13 @@ class DorisEngineAdapter(
             table_properties=self._get_table_properties(kwargs),
         )
         if (
+            not target_columns_to_types
+            or valid_from_col.name not in target_columns_to_types
+            or valid_to_col.name not in target_columns_to_types
+            or not columns_to_types_all_known(target_columns_to_types)
+        ):
+            target_columns_to_types = self.columns(target_table)
+        if (
             not is_iceberg
             and target_columns_to_types
             and columns_to_types_all_known(target_columns_to_types)
@@ -3743,7 +4042,14 @@ class DorisEngineAdapter(
             if is_auto and raw_part_by:
                 part_list = raw_part_by if isinstance(raw_part_by, list) else [raw_part_by]
                 parsed_part_exprs, part_kind = self._parse_partition_expressions(part_list)
-                if (part_kind or "RANGE").upper() != "LIST":
+                raw_partitions_val = table_props.get("partitions")
+                inferred_list_part = (
+                    "VALUES IN"
+                    in str(
+                        self._extract_str_value(raw_partitions_val) or raw_partitions_val or ""
+                    ).upper()
+                )
+                if (part_kind or ("LIST" if inferred_list_part else "RANGE")).upper() != "LIST":
                     auto_range_cols = {
                         col.name.lower()
                         for expr in parsed_part_exprs
@@ -4664,23 +4970,45 @@ class DorisEngineAdapter(
             partitioned_by = normalized_exprs
 
         if is_iceberg:
-            iceberg_part_exprs = [
-                expr.copy().transform(
-                    lambda node: (
-                        exp.Anonymous(
-                            this="BUCKET",
-                            expressions=[node.expression.copy(), node.this.copy()],
-                        )
-                        if isinstance(node, exp.PartitionedByBucket)
-                        else exp.Anonymous(
-                            this="TRUNCATE",
-                            expressions=[node.expression.copy(), node.this.copy()],
-                        )
-                        if isinstance(node, exp.PartitionByTruncate)
-                        else node
+
+            def _normalize_iceberg_part_node(node: exp.Expr) -> exp.Expr:
+                if isinstance(node, exp.PartitionedByBucket):
+                    return exp.Anonymous(
+                        this="BUCKET",
+                        expressions=[node.expression.copy(), node.this.copy()],
                     )
-                )
-                for expr in partitioned_by
+                if isinstance(node, exp.PartitionByTruncate):
+                    return exp.Anonymous(
+                        this="TRUNCATE",
+                        expressions=[node.expression.copy(), node.this.copy()],
+                    )
+                if isinstance(node, exp.Trunc):
+                    dec = node.args.get("decimals")
+                    if isinstance(node.this, exp.Column) and isinstance(dec, exp.Literal):
+                        return exp.Anonymous(
+                            this="TRUNCATE",
+                            expressions=[dec.copy(), node.this.copy()],
+                        )
+                    if isinstance(node.this, exp.Literal) and isinstance(dec, exp.Column):
+                        return exp.Anonymous(
+                            this="TRUNCATE",
+                            expressions=[node.this.copy(), dec.copy()],
+                        )
+                if (
+                    isinstance(node, exp.Anonymous)
+                    and node.name.upper() in ("BUCKET", "TRUNCATE")
+                    and len(node.expressions) == 2
+                    and isinstance(node.expressions[0], exp.Column)
+                    and isinstance(node.expressions[1], exp.Literal)
+                ):
+                    return exp.Anonymous(
+                        this=node.name.upper(),
+                        expressions=[node.expressions[1].copy(), node.expressions[0].copy()],
+                    )
+                return node
+
+            iceberg_part_exprs = [
+                expr.copy().transform(_normalize_iceberg_part_node) for expr in partitioned_by
             ]
             return exp.PartitionByListProperty(
                 partition_expressions=iceberg_part_exprs,

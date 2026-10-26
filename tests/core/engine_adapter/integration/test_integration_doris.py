@@ -557,6 +557,7 @@ def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
     )
     described_cols = ctx.engine_adapter.columns(rich_table)
     assert described_cols["id"] == exp.DataType.build("INT128")
+    assert ctx.engine_adapter.get_alter_operations(rich_table, rich_table) == []
     concat_expr = t.cast(DorisEngineAdapter, ctx.engine_adapter).concat_columns(described_cols)
     diff_rows = ctx.engine_adapter.fetchall(exp.select(concat_expr).from_(rich_table))
     assert len(diff_rows) == 1
@@ -609,3 +610,27 @@ def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
         r[0] for r in ctx.engine_adapter.fetchall(exp.select("id").from_(ev_tbl).order_by("id"))
     ]
     assert remaining_ids == [1, 3]
+
+    # 4. De Morgan `NOT (id = 1 OR id = 99)` and `DATE_TRUNC(ds, 'week')` in `delete_from`, plus `insert_append` OLAP reordering
+    ctx.engine_adapter.delete_from(
+        ev_tbl,
+        parse_one("NOT (id = 3) AND DATE_TRUNC(ds, 'week') = '2024-01-10'", read="doris"),
+    )
+    remaining_after_week = [
+        r[0] for r in ctx.engine_adapter.fetchall(exp.select("id").from_(ev_tbl).order_by("id"))
+    ]
+    assert remaining_after_week == [3]
+
+    app_tbl = ctx.table("test_insert_append_reorder")
+    app_cols = {
+        "score": exp.DataType.build("DOUBLE", dialect="doris"),
+        "id": exp.DataType.build("INT", dialect="doris"),
+    }
+    ctx.engine_adapter.create_table(app_tbl, app_cols)
+    ctx.engine_adapter.insert_append(
+        app_tbl,
+        parse_one("SELECT 9.5 AS score, 7 AS id", read="doris"),
+        target_columns_to_types=app_cols,
+    )
+    app_rows = ctx.engine_adapter.fetchall(exp.select("id", "score").from_(app_tbl))
+    assert list(app_rows) == [(7, 9.5)]

@@ -1295,8 +1295,10 @@ def test_rewrite_between_in_where_preserves_not_between_and_wraps_or(
     )
 
     assert to_sql_calls(adapter) == [
-        "DELETE FROM `target_table` WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-07' AND NOT `id` BETWEEN 10 AND 20",
-        "DELETE FROM `target_table` WHERE `status` = 'expired' AND NOT `id` BETWEEN 10 AND 20",
+        "DELETE FROM `target_table` WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-07' AND `id` < 10",
+        "DELETE FROM `target_table` WHERE `ds` >= '2024-01-01' AND `ds` <= '2024-01-07' AND `id` > 20",
+        "DELETE FROM `target_table` WHERE `status` = 'expired' AND `id` < 10",
+        "DELETE FROM `target_table` WHERE `status` = 'expired' AND `id` > 20",
     ]
 
 
@@ -2048,7 +2050,7 @@ def test_sync_mv_inferred_source_table_on_replace_and_unqualified_get_data_objec
     first_query_sql = fetchall_spy.call_args_list[0].args[0].sql("doris")
     assert "table_schema = DATABASE()" in first_query_sql
     second_query_sql = fetchall_spy.call_args_list[1].args[0]
-    assert "mv_infos('database' = DATABASE())" in second_query_sql
+    assert "mv_infos('database' = 'active_db')" in second_query_sql
 
 
 def test_ctas_string_key_coercion_and_internal_iceberg_ctas(
@@ -4585,3 +4587,163 @@ def test_doris_time_transform_inequalities_unaliased_ctas_and_sync_mv_db_restore
         "DROP MATERIALIZED VIEW IF EXISTS `rollup_mv` ON `other_db`.`fact`",
         "USE `analytics`",
     ]
+
+
+def test_doris_insert_append_scd2_create_table_like_and_alter_ops(
+    make_mocked_engine_adapter: t.Callable,
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. `insert_append` reorders OLAP columns (moving valid key `id` ahead of `score DOUBLE`)
+    #    and resolves table columns when `target_columns_to_types` contains `UNKNOWN`.
+    adapter.insert_append(
+        "db.metrics",
+        parse_one("SELECT score, id FROM db.src", read="doris"),
+        target_columns_to_types={
+            "score": exp.DataType.build("DOUBLE"),
+            "id": exp.DataType.build("INT"),
+        },
+    )
+    mocker.patch.object(
+        adapter,
+        "columns",
+        return_value={
+            "id": exp.DataType.build("INT"),
+            "score": exp.DataType.build("DOUBLE"),
+        },
+    )
+    adapter.insert_append(
+        "db.metrics",
+        parse_one("SELECT score, id FROM db.src", read="doris"),
+        target_columns_to_types={
+            "score": exp.DataType.build("UNKNOWN"),
+            "id": exp.DataType.build("UNKNOWN"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "INSERT INTO `db`.`metrics` (`id`, `score`) SELECT `id`, `score` FROM (SELECT `score`, `id` FROM `db`.`src`) AS `_subquery`",
+        "INSERT INTO `db`.`metrics` (`id`, `score`) SELECT `id`, `score` FROM (SELECT `score`, `id` FROM `db`.`src`) AS `_subquery`",
+    ]
+
+    # 2. `_create_table_like` on an Iceberg catalog table falls back to `create_table` with `self.columns(source_table_name)`
+    #    because Doris rejects `CREATE TABLE ... LIKE` on external catalog tables.
+    adapter.cursor.execute.reset_mock()
+    adapter._create_table_like("iceberg_cat.db.target_tbl", "iceberg_cat.db.source_tbl")
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `iceberg_cat`.`db`.`target_tbl` (`id` INT, `score` DOUBLE) ENGINE=iceberg"
+    ]
+
+    # 3. `_describe_columns_with_keys` and `get_alter_operations` normalize `STRUCT` (unquoting field names
+    #    and stripping `NULL`) and `AGG_STATE<sum(LARGEINT NULL)>`, and suppress key-role-change type modifications.
+    mocker.stopall()
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    adapter.cursor.fetchall.side_effect = [
+        [
+            ("id", "INT(11)", "No", "true", None, "NONE"),
+            ("k2", "INT(11)", "No", "true", None, "NONE"),
+            (
+                "info",
+                "STRUCT<`uid`:BIGINT(20) NULL, `tag`:VARCHAR(32) NULL>",
+                "Yes",
+                "false",
+                None,
+                "NONE",
+            ),
+            ("st", "AGG_STATE<sum(LARGEINT NULL)>", "No", "false", None, "GENERIC"),
+        ],
+        [
+            ("id", "INT(11)", "No", "true", None, "NONE"),
+            ("k2", "BIGINT(20)", "Yes", "false", None, "NONE"),
+            ("info", "STRUCT<uid: BIGINT, tag: VARCHAR(32)>", "Yes", "false", None, "NONE"),
+            ("st", "AGG_STATE<sum(LARGEINT)>", "No", "false", None, "GENERIC"),
+        ],
+    ]
+    ops = adapter.get_alter_operations("db.curr_tbl", "db.targ_tbl")
+    assert ops == []
+
+    # 4. `_build_partitioned_by_exp` normalizes `TRUNCATE(col, 10)` and `BUCKET(col, 8)` into Doris Iceberg syntax,
+    #    and `_build_create_table_exp` does not force `NOT NULL` when `auto_partition = true` is paired with `VALUES IN`.
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "iceberg_cat.db.part_ice",
+        {"id": exp.DataType.build("INT"), "name": exp.DataType.build("STRING")},
+        partitioned_by=[
+            parse_one("TRUNCATE(name, 10)", read="doris"),
+            parse_one("BUCKET(id, 8)", read="doris"),
+        ],
+    )
+    adapter.create_table(
+        "db.auto_list_olap",
+        {"region": exp.DataType.build("VARCHAR(32)"), "id": exp.DataType.build("INT")},
+        partitioned_by=[exp.to_column("region")],
+        table_properties={
+            "auto_partition": exp.Literal.string("true"),
+            "partitions": exp.Literal.string("PARTITION p_us VALUES IN ('US')"),
+        },
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `iceberg_cat`.`db`.`part_ice` (`id` INT, `name` STRING) ENGINE=iceberg PARTITION BY LIST (TRUNCATE(10, `name`), BUCKET(8, `id`)) ()",
+        "CREATE TABLE IF NOT EXISTS `db`.`auto_list_olap` (`region` VARCHAR(32), `id` INT) AUTO PARTITION BY LIST (`region`) (PARTITION p_us VALUES IN ('US'))",
+    ]
+
+
+def test_doris_not_pushdown_week_quarter_and_candidate_extraction(
+    make_mocked_engine_adapter: t.Callable,
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    # 1. De Morgan `NOT (a = 1 AND b = 2)` and `NOT (a = 1 OR b = 2)`, `1 != 1`, `DATE_TRUNC(ds, 'week')`,
+    #    `DATE_TRUNC(ds, 'quarter')`, and `DATE_TRUNC(ds, 'day') IS [NOT] NULL` in `delete_from`.
+    adapter.delete_from("db.t", "1 != 1 AND a = 1")
+    adapter.delete_from("db.t", "NOT (a = 1 OR b = 2)")
+    adapter.delete_from("db.t", "NOT (a = 1 AND b = 2)")
+    adapter.delete_from(
+        "db.t",
+        "DATE_TRUNC(ds, 'week') = '2024-01-17' AND DATE_TRUNC(ts, 'quarter') = '2024-05-10' AND DATE_TRUNC(ds, 'day') IS NOT NULL",
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`t` WHERE `a` <> 1 AND `b` <> 2",
+        "DELETE FROM `db`.`t` WHERE `a` <> 1",
+        "DELETE FROM `db`.`t` WHERE `b` <> 2",
+        "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-22' AND `ts` >= '2024-04-01' AND `ts` < '2024-07-01' AND NOT `ds` IS NULL",
+    ]
+
+    # 2. Candidate loops in `_extract_or_key_rows_from_where` and `_extract_subquery_from_where`
+    #    find the valid key-row OR / subquery IN conjunct even when preceded by another OR / IN conjunct.
+    adapter.cursor.execute.reset_mock()
+    adapter.delete_from(
+        "db.t",
+        "(ds < '2024-01-01' OR ds >= '2024-01-02') AND ((id = 1 AND k = 'a') OR (id = 2 AND k = 'b'))",
+    )
+    assert to_sql_calls(adapter) == [
+        "DELETE FROM `db`.`t` WHERE `id` = 1 AND `k` IN ('a') AND `ds` < '2024-01-01'",
+        "DELETE FROM `db`.`t` WHERE `id` = 1 AND `k` IN ('a') AND `ds` >= '2024-01-02'",
+        "DELETE FROM `db`.`t` WHERE `id` = 2 AND `k` IN ('b') AND `ds` < '2024-01-01'",
+        "DELETE FROM `db`.`t` WHERE `id` = 2 AND `k` IN ('b') AND `ds` >= '2024-01-02'",
+    ]
+
+    # 3. Sync MV aliases that collide with base table column names (`SUM(amount) AS amount`) are prefixed with `mv_`,
+    #    and `partitioned_by` / `clustered_by` kwargs are ignored for `SYNC` MVs.
+    adapter.cursor.execute.reset_mock()
+    adapter.create_view(
+        "db.sync_agg_mv",
+        parse_one("SELECT id, SUM(amount) AS amount FROM db.sales GROUP BY id", read="doris"),
+        replace=False,
+        materialized=True,
+        view_properties={"materialized_type": exp.Literal.string("SYNC")},
+        partitioned_by=[exp.to_column("id")],
+        clustered_by=[exp.to_column("id")],
+    )
+    assert to_sql_calls(adapter) == [
+        "USE `db`",
+        "CREATE MATERIALIZED VIEW `sync_agg_mv` AS SELECT `id` AS `mv_id`, SUM(`amount`) AS `mv_amount` FROM `db`.`sales` GROUP BY `id`",
+    ]
+
+    # 4. `_sanitize_key_value` decodes bytes and unwraps NumPy scalars.
+    import numpy as np
+
+    assert adapter._sanitize_key_value(b"abc") == "abc"
+    assert adapter._sanitize_key_value(np.int64(42)) == 42
+    assert type(adapter._sanitize_key_value(np.int64(42))) is int
