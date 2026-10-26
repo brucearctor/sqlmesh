@@ -526,20 +526,23 @@ class EngineAdapter:
             target_columns_to_types = self.columns(target_table)
         query = source_queries[0].query_factory()
 
+        default_catalog = self.default_catalog
+
+        def _qualified(table: exp.Table) -> exp.Table:
+            table = table.copy()
+            if default_catalog and not table.catalog and table.db:
+                table.set("catalog", exp.parse_identifier(default_catalog))
+            return quote_identifiers(table)
+
+        quoted_target = quote_identifiers(target_table.copy())
+        qualified_target = _qualified(target_table)
+
         def _is_target_table(node: exp.Expr) -> bool:
             if not isinstance(node, exp.Table):
                 return False
-            if quote_identifiers(node.copy()) == quote_identifiers(target_table.copy()):
+            if quote_identifiers(node.copy()) == quoted_target:
                 return True
-            if self.default_catalog:
-                norm_node = node.copy()
-                if not norm_node.catalog and norm_node.db:
-                    norm_node.set("catalog", exp.parse_identifier(self.default_catalog))
-                norm_target = target_table.copy()
-                if not norm_target.catalog and norm_target.db:
-                    norm_target.set("catalog", exp.parse_identifier(self.default_catalog))
-                return quote_identifiers(norm_node) == quote_identifiers(norm_target)
-            return False
+            return bool(default_catalog) and _qualified(node) == qualified_target
 
         self_referencing = any(_is_target_table(table) for table in query.find_all(exp.Table))
         # If a query references itself then it must have a table created regardless of approach used.

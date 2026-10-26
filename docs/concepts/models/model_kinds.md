@@ -763,7 +763,7 @@ Depending on the target engine, models of the `FULL` kind are materialized using
 | Redshift   | DROP TABLE, CREATE TABLE, INSERT |
 | Postgres   | DROP TABLE, CREATE TABLE, INSERT |
 | DuckDB     | CREATE OR REPLACE TABLE          |
-| Doris      | TRUNCATE TABLE, INSERT (OLAP) / INSERT OVERWRITE (Iceberg) |
+| Doris      | CREATE TABLE ... AS SELECT (new OLAP), DELETE + INSERT (existing OLAP) / INSERT OVERWRITE (Iceberg) |
 
 ## VIEW
 The model kinds described so far cause the output of a model query to be materialized and stored in a physical table.

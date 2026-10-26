@@ -883,14 +883,22 @@ def _doris_parse_build(self: Parser) -> t.Optional[exp.Expr]:
         index_name = self._parse_id_var(any_token=False)
         if self._match(TokenType.ON):
             table = self._parse_table_parts()
-            partitions = self._parse_wrapped_id_vars() if self._match_text_seq("PARTITIONS") else []
-            return self.expression(
+            partition_kw: t.Optional[str] = None
+            if self._match_text_seq("PARTITIONS"):
+                partition_kw = "PARTITIONS"
+            elif self._match(TokenType.PARTITION) or self._match_text_seq("PARTITION"):
+                partition_kw = "PARTITION"
+            partitions = self._parse_wrapped_id_vars() if partition_kw else []
+            alter_expr = self.expression(
                 exp.Alter(
                     this=table,
                     kind="BUILD_INDEX",
                     actions=[index_name, *partitions],
                 )
             )
+            if partition_kw:
+                alter_expr.meta["partition_keyword"] = partition_kw
+            return alter_expr
     return self._parse_as_command(start)
 
 
@@ -911,8 +919,9 @@ def _doris_alter_sql(self: Generator, expression: exp.Alter) -> str:
     if expression.text("kind") == "BUILD_INDEX":
         idx_sql = self.sql(actions[0]) if actions else ""
         tbl_sql = self.sql(expression, "this")
+        partition_kw = expression.meta.get("partition_keyword") or "PARTITIONS"
         parts_sql = (
-            f" PARTITIONS ({', '.join(self.sql(p) for p in actions[1:])})"
+            f" {partition_kw} ({', '.join(self.sql(p) for p in actions[1:])})"
             if len(actions) > 1
             else ""
         )
@@ -1755,15 +1764,14 @@ def extend_sqlglot() -> None:
             "SEARCH": lambda args: exp.Anonymous(this="SEARCH", expressions=args),
         }
     )
-    Doris.Parser.ALTER_PARSERS.update(
-        {
-            "ADD": _doris_parse_alter_add,
-            "CREATE": lambda self: self._parse_as_command(self._prev),
-            "DROP": _doris_parse_alter_drop,
-            "EXECUTE": lambda self: self._parse_as_command(self._prev),
-            "REPLACE": lambda self: self._parse_as_command(self._prev),
-        }
-    )
+    Doris.Parser.ALTER_PARSERS = {
+        **Doris.Parser.ALTER_PARSERS,
+        "ADD": _doris_parse_alter_add,
+        "CREATE": lambda self: self._parse_as_command(self._prev),
+        "DROP": _doris_parse_alter_drop,
+        "EXECUTE": lambda self: self._parse_as_command(self._prev),
+        "REPLACE": lambda self: self._parse_as_command(self._prev),
+    }
     Doris.Generator.TYPE_MAPPING.update(
         {
             exp.DataType.Type.HLLSKETCH: "HLL",

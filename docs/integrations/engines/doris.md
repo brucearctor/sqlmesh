@@ -746,17 +746,17 @@ MODEL (
 
 ## Supported Model Kinds & Catalog Matrix
 
-| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal`) | External Apache Iceberg Catalog (`table_format iceberg`) | External Lance Catalog (`type = 'lance'`) |
+| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal` on Local Disk or S3/GCS Storage Vault) | External Apache Iceberg Catalog (`table_format iceberg` on S3/GCS/HDFS) | External Read-Only Lakehouse Catalogs (`lance`, `paimon`, `hudi`, `deltalake`) |
 | --- | :---: | :---: | :---: |
-| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported (Read-Only via Catalog or TVF) |
-| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris 4.1 (Write Guarded) |
-| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`) | Read-Only in Doris 4.1 (Write Guarded) |
-| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`) | Read-Only in Doris 4.1 (Write Guarded) |
-| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` / partition `DELETE` + `INSERT`) | Read-Only in Doris 4.1 (Write Guarded) |
-| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported | Read-Only in Doris 4.1 (Write Guarded) |
+| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported (Read-Only via Catalog or S3/GCS TVF) |
+| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`; requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`; requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` on Doris 2.1+; partition `DELETE` + `INSERT` requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
+| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported (Requires Doris 4.1.0+ & Iceberg v2 for row-level `DELETE`) | Read-Only in Doris (Write Guarded) |
 | `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) | Requires `internal` catalog (`environment_catalog_mapping`) |
 | `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs | Not supported by Doris inside external catalogs |
-| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported | Read-Only in Doris 4.1 (Write Guarded) |
+| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported | Read-Only in Doris (Write Guarded) |
 | `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported | Not supported (Read-Only) |
 
 ---

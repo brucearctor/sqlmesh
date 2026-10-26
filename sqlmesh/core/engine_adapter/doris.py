@@ -351,28 +351,57 @@ class DorisEngineAdapter(
             self.cursor.execute(f"USE {db_sql}")
         self._needs_catalog_restore = False
 
+    _READ_ONLY_EXTERNAL_FORMATS: t.ClassVar[t.Dict[str, str]] = {
+        "lance": "Lance",
+        "paimon": "Paimon",
+        "hudi": "Hudi",
+        "deltalake": "Delta Lake",
+        "delta": "Delta Lake",
+        "lakesoul": "LakeSoul",
+    }
+
+    def _get_read_only_external_format(
+        self,
+        table_format: t.Optional[str] = None,
+        table_properties: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> t.Optional[str]:
+        if table_format:
+            fmt_lower = str(table_format).strip().lower()
+            if fmt_lower in self._READ_ONLY_EXTERNAL_FORMATS:
+                return fmt_lower
+        if table_properties:
+            engine_val = self._extract_str_value(table_properties.get("engine"))
+            if engine_val:
+                eng_lower = engine_val.strip().lower()
+                if eng_lower in self._READ_ONLY_EXTERNAL_FORMATS:
+                    return eng_lower
+        return None
+
     def _is_lance_table(
         self,
         table_format: t.Optional[str] = None,
         table_properties: t.Optional[t.Dict[str, t.Any]] = None,
     ) -> bool:
-        if table_format and str(table_format).strip().lower() == "lance":
-            return True
-        if table_properties:
-            engine_val = self._extract_str_value(table_properties.get("engine"))
-            if engine_val and engine_val.strip().lower() == "lance":
-                return True
-        return False
+        return (
+            self._get_read_only_external_format(
+                table_format=table_format, table_properties=table_properties
+            )
+            is not None
+        )
 
     def _ensure_not_lance_table(
         self,
         table_format: t.Optional[str] = None,
         table_properties: t.Optional[t.Dict[str, t.Any]] = None,
     ) -> None:
-        if self._is_lance_table(table_format=table_format, table_properties=table_properties):
+        ro_fmt = self._get_read_only_external_format(
+            table_format=table_format, table_properties=table_properties
+        )
+        if ro_fmt is not None:
+            fmt_label = self._READ_ONLY_EXTERNAL_FORMATS[ro_fmt]
             raise SQLMeshError(
-                "Doris Lance tables are read-only; reference Lance tables as upstream sources or EXTERNAL models "
-                "using a Doris Lance catalog ('type' = 'lance') or file table-valued function ('format' = 'lance')."
+                f"Doris {fmt_label} tables are read-only; reference {fmt_label} tables as upstream sources or EXTERNAL models "
+                f"using a Doris {fmt_label} catalog ('type' = '{ro_fmt}') or file table-valued function ('format' = '{ro_fmt}')."
             )
 
     def _is_iceberg_table(

@@ -4875,6 +4875,13 @@ def test_lance_table_reading_and_write_guard(
             table_properties={"engine": exp.Literal.string("lance")},
         )
 
+    with pytest.raises(SQLMeshError, match="Doris Paimon tables are read-only"):
+        adapter.create_table(
+            "paimon_cat.ml_db.out_tbl",
+            target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
+            table_format="paimon",
+        )
+
 
 def test_iceberg_reading_time_travel_branch_and_compaction_ddl(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
@@ -4968,6 +4975,15 @@ def test_doris_4_1_search_indexes_compaction_and_sequence_col(
     assert isinstance(build_idx, exp.Alter)
     assert build_idx.this.sql("doris") == "db.docs"
     assert build_idx.sql("doris") == "BUILD INDEX idx_title_ft ON db.docs PARTITIONS (p1, p2)"
+
+    build_idx_singular = parse_one(
+        "BUILD INDEX idx_title_ft ON db.docs PARTITION (p1, p2)", read="doris"
+    )
+    assert isinstance(build_idx_singular, exp.Alter)
+    assert build_idx_singular.this.sql("doris") == "db.docs"
+    assert (
+        build_idx_singular.sql("doris") == "BUILD INDEX idx_title_ft ON db.docs PARTITION (p1, p2)"
+    )
 
     alter_add_idx = parse_one(
         "ALTER TABLE db.docs ADD INDEX idx_title (title) USING INVERTED PROPERTIES ('parser' = 'english') COMMENT 'ft'",
