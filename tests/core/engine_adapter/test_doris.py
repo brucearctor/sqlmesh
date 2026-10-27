@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import typing as t
 
 import pandas as pd  # noqa: TID253
@@ -951,23 +952,27 @@ def test_execute_operational_error_reconnect(
     conn_mock.ping.assert_not_called()
     close_spy.assert_called_once()
 
-    # Write statements (e.g. INSERT) must NOT be retried after OperationalError(2013) to avoid duplicating rows
-    conn_mock.reset_mock()
-    close_spy.reset_mock()
-    write_calls = 0
+    # Write statements (e.g. INSERT or CTE-prefixed INSERT) must NOT be retried after OperationalError(2013) to avoid duplicating rows
+    for unsafe_write_sql in (
+        "INSERT INTO `tbl` VALUES (1)",
+        "WITH `cte` AS (SELECT 1) INSERT INTO `tbl` SELECT * FROM `cte`",
+    ):
+        conn_mock.reset_mock()
+        close_spy.reset_mock()
+        write_calls = 0
 
-    def write_side_effect(*args, **kwargs):
-        nonlocal write_calls
-        write_calls += 1
-        raise OperationalError(2013, "Lost connection to MySQL server during query")
+        def write_side_effect(*args, **kwargs):
+            nonlocal write_calls
+            write_calls += 1
+            raise OperationalError(2013, "Lost connection to MySQL server during query")
 
-    adapter.cursor.execute.side_effect = write_side_effect
-    with pytest.raises(OperationalError):
-        adapter._execute("INSERT INTO `tbl` VALUES (1)")
+        adapter.cursor.execute.side_effect = write_side_effect
+        with pytest.raises(OperationalError):
+            adapter._execute(unsafe_write_sql)
 
-    assert write_calls == 1
-    conn_mock.ping.assert_not_called()
-    close_spy.assert_called_once()
+        assert write_calls == 1
+        conn_mock.ping.assert_not_called()
+        close_spy.assert_called_once()
 
 
 def test_external_catalog_view_error_and_drop_noop(
@@ -2201,6 +2206,14 @@ def test_to_sql_root_int128_and_nested_struct_pretty_sql_and_fetchdf_reconnect(
     df = adapter.fetchdf("SELECT 1 AS id")
     assert len(df) == 1
     assert fetch_calls == 2
+    assert close_spy.call_count == 1
+
+    # 4. _fetch_native_df does NOT retry non-read-only queries on disconnect
+    fetch_calls = 0
+    close_spy.reset_mock()
+    with pytest.raises(OperationalError):
+        adapter.fetchdf("WITH `cte` AS (SELECT 1) INSERT INTO `tbl` SELECT * FROM `cte`")
+    assert fetch_calls == 1
     assert close_spy.call_count == 1
 
 

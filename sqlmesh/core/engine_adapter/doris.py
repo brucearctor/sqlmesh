@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 from collections import defaultdict
@@ -595,7 +596,16 @@ class DorisEngineAdapter(
                 isinstance(getattr(e, "__context__", None), TimeoutError)
                 or "timed out" in str(e).lower()
             )
-            if is_disconnect and not is_timeout and not self._connection_pool.is_transaction_active:
+            if (
+                is_disconnect
+                and not is_timeout
+                and not self._connection_pool.is_transaction_active
+                and self._is_safe_to_retry_sql(
+                    self._to_sql(query, quote=quote_identifiers)
+                    if isinstance(query, exp.Expr)
+                    else query
+                )
+            ):
                 logger.warning(
                     "Doris connection lost (%s: %s) during fetchdf, reconnecting and retrying once...",
                     err_name,
@@ -616,14 +626,23 @@ class DorisEngineAdapter(
             raise
 
     _SAFE_RETRY_SQL_PREFIX_RE = re.compile(
-        r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH)\b",
+        r"\A(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|\Z))*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|USE|SWITCH)\b",
         re.IGNORECASE | re.DOTALL,
     )
 
     @classmethod
     def _is_safe_to_retry_sql(cls, sql: str) -> bool:
         """Returns True only for read-only or idempotent catalog/database switch statements that cannot duplicate writes."""
-        return bool(cls._SAFE_RETRY_SQL_PREFIX_RE.match(sql))
+        match = cls._SAFE_RETRY_SQL_PREFIX_RE.match(sql)
+        if not match:
+            return False
+        if match.group(1).upper() == "WITH":
+            try:
+                parsed = parse_one(sql, read=cls.DIALECT)
+            except Exception:
+                return False
+            return isinstance(parsed, (exp.Select, exp.SetOperation))
+        return True
 
     def ping(self) -> None:
         self._connection_pool.get().ping(reconnect=False)

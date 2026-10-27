@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 services:
   doris-fe:
     image: apache/doris:fe-4.1.5
