@@ -1808,6 +1808,7 @@ def extend_sqlglot() -> None:
             exp.Select: transforms.preprocess(
                 [
                     transforms.eliminate_distinct_on,
+                    transforms.eliminate_qualify,
                     transforms.unnest_generate_date_array_using_recursive_cte,
                 ]
             ),

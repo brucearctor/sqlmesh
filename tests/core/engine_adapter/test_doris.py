@@ -4707,20 +4707,31 @@ def test_doris_not_pushdown_week_quarter_and_candidate_extraction(
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
-    # 1. De Morgan `NOT (a = 1 AND b = 2)` and `NOT (a = 1 OR b = 2)`, `1 != 1`, `DATE_TRUNC(ds, 'week')`,
-    #    `DATE_TRUNC(ds, 'quarter')`, and `DATE_TRUNC(ds, 'day') IS [NOT] NULL` in `delete_from`.
+    # 1. De Morgan `NOT (a = 1 AND b = 2)` and `NOT (a = 1 OR b = 2)`, `1 != 1`, aligned & non-aligned `DATE_TRUNC(ds, 'week')` /
+    #    `DATE_TRUNC(ts, 'quarter')`, and `DATE_TRUNC(ds, 'day') IS [NOT] NULL` in `delete_from`.
     adapter.delete_from("db.t", "1 != 1 AND a = 1")
     adapter.delete_from("db.t", "NOT (a = 1 OR b = 2)")
     adapter.delete_from("db.t", "NOT (a = 1 AND b = 2)")
     adapter.delete_from(
         "db.t",
-        "DATE_TRUNC(ds, 'week') = '2024-01-17' AND DATE_TRUNC(ts, 'quarter') = '2024-05-10' AND DATE_TRUNC(ds, 'day') IS NOT NULL",
+        "DATE_TRUNC(ds, 'week') = '2024-01-15' AND DATE_TRUNC(ts, 'quarter') = '2024-04-01' AND DATE_TRUNC(ds, 'day') IS NOT NULL",
     )
+    adapter.delete_from("db.t", "DATE_TRUNC(ds, 'week') = '2024-01-17' AND a = 1")
+    adapter.delete_from("db.t", "DATE_TRUNC(ds, 'week') IN ('2024-01-16', '2024-01-17')")
+    adapter.delete_from("db.t", "DATE_TRUNC(ds, 'week') IN ('2024-01-15', '2024-01-17')")
+    adapter.delete_from(
+        "db.t",
+        "DATE_TRUNC(ds, 'week') >= '2024-01-17' AND DATE_TRUNC(ds, 'week') <= '2024-01-24'",
+    )
+    adapter.delete_from("db.t", "DATE_TRUNC(ds, 'week') != '2024-01-17' AND a = 1")
     assert to_sql_calls(adapter) == [
         "DELETE FROM `db`.`t` WHERE `a` <> 1 AND `b` <> 2",
         "DELETE FROM `db`.`t` WHERE `a` <> 1",
         "DELETE FROM `db`.`t` WHERE `b` <> 2",
         "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-22' AND `ts` >= '2024-04-01' AND `ts` < '2024-07-01' AND NOT `ds` IS NULL",
+        "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-22'",
+        "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-22' AND `ds` < '2024-01-29'",
+        "DELETE FROM `db`.`t` WHERE `a` = 1",
     ]
 
     # 2. Candidate loops in `_extract_or_key_rows_from_where` and `_extract_subquery_from_where`

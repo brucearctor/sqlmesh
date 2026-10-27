@@ -684,10 +684,10 @@ def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
     ]
     assert remaining_ids == [1, 3]
 
-    # 4. De Morgan `NOT (id = 1 OR id = 99)` and `DATE_TRUNC(ds, 'week')` in `delete_from`, plus `insert_append` OLAP reordering
+    # 4. De Morgan `NOT (id = 3)` and aligned `DATE_TRUNC(ds, 'week')` in `delete_from`, plus `insert_append` OLAP reordering
     ctx.engine_adapter.delete_from(
         ev_tbl,
-        parse_one("NOT (id = 3) AND DATE_TRUNC(ds, 'week') = '2024-01-10'", read="doris"),
+        parse_one("NOT (id = 3) AND DATE_TRUNC(ds, 'week') = '2024-01-08'", read="doris"),
     )
     remaining_after_week = [
         r[0] for r in ctx.engine_adapter.fetchall(exp.select("id").from_(ev_tbl).order_by("id"))

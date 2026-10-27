@@ -2189,6 +2189,12 @@ class DorisEngineAdapter(
         where = self._pushdown_not_in_where(where)
         where = self._rewrite_between_in_where(where)
         where = self._rewrite_direct_time_transforms_in_where(where)
+        where = self._simplify_boolean_where(where)
+        if where == exp.true():
+            self._truncate_table(table_name)
+            return
+        if where == exp.false():
+            return
         where = self._normalize_boolean_column_conjuncts(where)
 
         subquery_info = self._extract_subquery_from_where(where)
@@ -2400,13 +2406,12 @@ class DorisEngineAdapter(
             condition_sets = [[*cset, *branch] for cset in condition_sets for branch in sub_sets]
         return condition_sets
 
-    def _build_time_transform_range(
+    def _compute_time_transform_bounds(
         self,
         t_expr: exp.Expr,
-        col_expr: exp.Column,
         unit: str,
         val_expr: exp.Expr,
-    ) -> t.Optional[exp.Expr]:
+    ) -> t.Optional[t.Tuple[exp.Literal, exp.Literal, bool]]:
         if self._is_date_part_extract_fn(t_expr) and unit != "year":
             raise SQLMeshError(
                 f"Doris delete_from cannot rewrite non-year date-part predicate '{t_expr.sql(dialect=self.dialect)}' "
@@ -2425,16 +2430,10 @@ class DorisEngineAdapter(
                 )
             except ValueError:
                 return None
-            return exp.and_(
-                exp.GTE(
-                    this=col_expr.copy(),
-                    expression=exp.Literal.string(f"{yr_int:04d}-01-01"),
-                ),
-                exp.LT(
-                    this=col_expr.copy(),
-                    expression=exp.Literal.string(f"{yr_int + 1:04d}-01-01"),
-                ),
-                copy=False,
+            return (
+                exp.Literal.string(f"{yr_int:04d}-01-01"),
+                exp.Literal.string(f"{yr_int + 1:04d}-01-01"),
+                True,
             )
         try:
             dt = datetime.datetime.fromisoformat(raw_str)
@@ -2477,14 +2476,31 @@ class DorisEngineAdapter(
         else:
             return None
         fmt = "%Y-%m-%d %H:%M:%S" if has_time else "%Y-%m-%d"
+        return (
+            exp.Literal.string(low_dt.strftime(fmt)),
+            exp.Literal.string(high_dt.strftime(fmt)),
+            dt == low_dt,
+        )
+
+    def _build_time_transform_range(
+        self,
+        t_expr: exp.Expr,
+        col_expr: exp.Column,
+        unit: str,
+        val_expr: exp.Expr,
+    ) -> t.Optional[exp.Expr]:
+        bounds = self._compute_time_transform_bounds(t_expr, unit, val_expr)
+        if bounds is None:
+            return None
+        low_lit, high_lit, _ = bounds
         return exp.and_(
             exp.GTE(
                 this=col_expr.copy(),
-                expression=exp.Literal.string(low_dt.strftime(fmt)),
+                expression=low_lit,
             ),
             exp.LT(
                 this=col_expr.copy(),
-                expression=exp.Literal.string(high_dt.strftime(fmt)),
+                expression=high_lit,
             ),
             copy=False,
         )
@@ -2537,10 +2553,9 @@ class DorisEngineAdapter(
                     and unit is not None
                     and val_expr is not None
                 ):
-                    range_expr = self._build_time_transform_range(t_expr, col_expr, unit, val_expr)
-                    if range_expr is not None and isinstance(range_expr, exp.And):
-                        low_lit = range_expr.this.expression
-                        high_lit = range_expr.expression.expression
+                    bounds = self._compute_time_transform_bounds(t_expr, unit, val_expr)
+                    if bounds is not None:
+                        low_lit, high_lit, is_aligned = bounds
                         effective_op: t.Type[exp.Binary] = type(node)
                         if not transform_on_left:
                             flip_map: t.Dict[t.Type[exp.Binary], t.Type[exp.Binary]] = {
@@ -2562,21 +2577,33 @@ class DorisEngineAdapter(
                             effective_op = neg_map.get(effective_op, effective_op)
                         replacement: t.Optional[exp.Expr] = None
                         if effective_op is exp.EQ:
-                            replacement = range_expr
+                            if is_aligned:
+                                replacement = exp.and_(
+                                    exp.GTE(this=col_expr.copy(), expression=low_lit.copy()),
+                                    exp.LT(this=col_expr.copy(), expression=high_lit.copy()),
+                                    copy=False,
+                                )
+                            else:
+                                replacement = exp.false()
                         elif effective_op is exp.NEQ:
-                            replacement = exp.or_(
-                                exp.LT(this=col_expr.copy(), expression=low_lit.copy()),
-                                exp.GTE(this=col_expr.copy(), expression=high_lit.copy()),
-                                copy=False,
-                            )
+                            if is_aligned:
+                                replacement = exp.or_(
+                                    exp.LT(this=col_expr.copy(), expression=low_lit.copy()),
+                                    exp.GTE(this=col_expr.copy(), expression=high_lit.copy()),
+                                    copy=False,
+                                )
+                            else:
+                                replacement = exp.true()
                         elif effective_op is exp.GTE:
-                            replacement = exp.GTE(this=col_expr.copy(), expression=low_lit.copy())
+                            bound_lit = low_lit if is_aligned else high_lit
+                            replacement = exp.GTE(this=col_expr.copy(), expression=bound_lit.copy())
                         elif effective_op is exp.GT:
                             replacement = exp.GTE(this=col_expr.copy(), expression=high_lit.copy())
                         elif effective_op is exp.LTE:
                             replacement = exp.LT(this=col_expr.copy(), expression=high_lit.copy())
                         elif effective_op is exp.LT:
-                            replacement = exp.LT(this=col_expr.copy(), expression=low_lit.copy())
+                            bound_lit = low_lit if is_aligned else high_lit
+                            replacement = exp.LT(this=col_expr.copy(), expression=bound_lit.copy())
                         if replacement is not None:
                             if target_node is where:
                                 where = replacement
@@ -2596,16 +2623,25 @@ class DorisEngineAdapter(
                     self._is_literal_key_value(v) for v in node.expressions
                 ):
                     col_expr, unit = in_trans
-                    ranges = [
-                        self._build_time_transform_range(node.this, col_expr, unit, v)
+                    bounds_list = [
+                        self._compute_time_transform_bounds(node.this, unit, v)
                         for v in node.expressions
                     ]
-                    if ranges and all(isinstance(r, exp.And) for r in ranges):
+                    if bounds_list and all(b is not None for b in bounds_list):
+                        aligned_ranges = [
+                            exp.and_(
+                                exp.GTE(this=col_expr.copy(), expression=b[0].copy()),
+                                exp.LT(this=col_expr.copy(), expression=b[1].copy()),
+                                copy=False,
+                            )
+                            for b in bounds_list
+                            if b is not None and b[2]
+                        ]
                         if parent_not is not None:
-                            not_in_parts: t.List[exp.Expr] = []
-                            for r in ranges:
-                                assert isinstance(r, exp.And)
-                                not_in_parts.append(
+                            if not aligned_ranges:
+                                replacement_in: exp.Expr = exp.true()
+                            else:
+                                not_in_parts: t.List[exp.Expr] = [
                                     exp.Paren(
                                         this=exp.or_(
                                             exp.LT(
@@ -2619,25 +2655,27 @@ class DorisEngineAdapter(
                                             copy=False,
                                         )
                                     )
-                                )
-                            and_expr: exp.Expr = exp.and_(*not_in_parts, copy=False)
-                            if target_node is where:
-                                where = and_expr
-                            else:
-                                if not isinstance(target_node.parent, (exp.Where, exp.Paren)):
-                                    and_expr = exp.Paren(this=and_expr)
-                                target_node.replace(and_expr)
+                                    for r in aligned_ranges
+                                ]
+                                replacement_in = exp.and_(*not_in_parts, copy=False)
                         else:
-                            or_expr: exp.Expr = exp.or_(
-                                *[exp.Paren(this=r) for r in ranges if r is not None],
-                                copy=False,
-                            )
-                            if target_node is where:
-                                where = or_expr
+                            if not aligned_ranges:
+                                replacement_in = exp.false()
+                            elif len(aligned_ranges) == 1:
+                                replacement_in = aligned_ranges[0]
                             else:
-                                if not isinstance(target_node.parent, (exp.Where, exp.Paren)):
-                                    or_expr = exp.Paren(this=or_expr)
-                                target_node.replace(or_expr)
+                                replacement_in = exp.or_(
+                                    *[exp.Paren(this=r) for r in aligned_ranges],
+                                    copy=False,
+                                )
+                        if target_node is where:
+                            where = replacement_in
+                        else:
+                            if isinstance(replacement_in, (exp.And, exp.Or)) and not isinstance(
+                                target_node.parent, (exp.Where, exp.Paren)
+                            ):
+                                replacement_in = exp.Paren(this=replacement_in)
+                            target_node.replace(replacement_in)
         return where
 
     @classmethod
