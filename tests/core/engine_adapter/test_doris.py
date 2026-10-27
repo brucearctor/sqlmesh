@@ -4731,7 +4731,7 @@ def test_doris_not_pushdown_week_quarter_and_candidate_extraction(
         "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-22' AND `ts` >= '2024-04-01' AND `ts` < '2024-07-01' AND NOT `ds` IS NULL",
         "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-15' AND `ds` < '2024-01-22'",
         "DELETE FROM `db`.`t` WHERE `ds` >= '2024-01-22' AND `ds` < '2024-01-29'",
-        "DELETE FROM `db`.`t` WHERE `a` = 1",
+        "DELETE FROM `db`.`t` WHERE NOT `ds` IS NULL AND `a` = 1",
     ]
 
     # 2. Candidate loops in `_extract_or_key_rows_from_where` and `_extract_subquery_from_where`

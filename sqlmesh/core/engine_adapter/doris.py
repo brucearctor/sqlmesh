@@ -2593,7 +2593,9 @@ class DorisEngineAdapter(
                                     copy=False,
                                 )
                             else:
-                                replacement = exp.true()
+                                replacement = exp.not_(
+                                    exp.Is(this=col_expr.copy(), expression=exp.Null())
+                                )
                         elif effective_op is exp.GTE:
                             bound_lit = low_lit if is_aligned else high_lit
                             replacement = exp.GTE(this=col_expr.copy(), expression=bound_lit.copy())
@@ -2639,7 +2641,9 @@ class DorisEngineAdapter(
                         ]
                         if parent_not is not None:
                             if not aligned_ranges:
-                                replacement_in: exp.Expr = exp.true()
+                                replacement_in: exp.Expr = exp.not_(
+                                    exp.Is(this=col_expr.copy(), expression=exp.Null())
+                                )
                             else:
                                 not_in_parts: t.List[exp.Expr] = [
                                     exp.Paren(
