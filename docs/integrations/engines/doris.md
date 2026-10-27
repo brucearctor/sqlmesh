@@ -467,7 +467,7 @@ FROM hive_catalog.raw.orders;
 
 ### Pattern 5: Reading External Lance, Hudi & Delta Lake Tables (Doris 4.1+)
 
-Apache Doris 4.1+ supports reading multimodal and vector datasets stored in **Lance** format (`'type' = 'lance'` catalog or `s3(...)` / `gcs(...)` / `hdfs(...)` / `local(...)` table-valued functions with `'format' = 'lance'`), as well as external **Apache Hudi** (`'type' = 'hudi'`) and **Delta Lake** (`'type' = 'deltalake'`) catalogs.
+Apache Doris 4.1.4+ supports reading multimodal and vector datasets stored in **Lance** format (`'type' = 'lance'` catalog or `s3(...)` / `local(...)` table-valued functions with `'format' = 'lance'`), as well as external **Apache Hudi** (`'type' = 'hudi'`) and **Delta Lake** (`'type' = 'deltalake'`) catalogs.
 
 ```yaml
 # config.yaml
@@ -773,7 +773,7 @@ MODEL (
 
 | SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal` on Local Disk or S3/GCS Storage Vault) | External Iceberg & Paimon Catalogs (`table_format iceberg \| paimon` on S3/GCS/HDFS) | External Hive Catalog (`table_format hive` on S3/GCS/HDFS) | External Read-Only Lakehouse Catalogs (`lance`, `hudi`, `deltalake`, `lakesoul`) |
 | --- | :---: | :---: | :---: | :---: |
-| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported | Supported (Read-Only via Catalog or S3/GCS TVF) |
+| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported | Supported (Read-Only via corresponding External Catalog; Lance also supports `s3()` / `local()` TVFs) |
 | `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg\|paimon` / `INSERT OVERWRITE TABLE`) | Supported (`CREATE TABLE ... ENGINE=hive` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris (Write Guarded) |
 | `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`; requires Doris 4.1.0+ & Iceberg v2 / Paimon PK) | Not supported by Hive in Doris (No row-level `DELETE`) | Read-Only in Doris (Write Guarded) |
 | `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`; requires Doris 4.1.0+ & Iceberg v2 / Paimon PK) | Not supported by Hive in Doris (No `DELETE` / `MERGE INTO`) | Read-Only in Doris (Write Guarded) |

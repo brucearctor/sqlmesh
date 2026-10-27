@@ -531,6 +531,11 @@ class EngineAdapter:
         default_catalog_loaded = False
         qualified_target: t.Optional[exp.Table] = None
 
+        def _table_parts(
+            table: exp.Table,
+        ) -> t.Tuple[t.Optional[exp.Expr], t.Optional[exp.Expr], t.Optional[exp.Expr]]:
+            return (table.args.get("catalog"), table.args.get("db"), table.this)
+
         def _qualified(table: exp.Table, catalog: str) -> exp.Table:
             table = table.copy()
             if not table.catalog and table.db:
@@ -542,7 +547,7 @@ class EngineAdapter:
             if not isinstance(node, exp.Table):
                 return False
             quoted_node = quote_identifiers(node.copy())
-            if quoted_node == quoted_target:
+            if _table_parts(quoted_node) == _table_parts(quoted_target):
                 return True
             if quoted_node.this != quoted_target.this or quoted_node.args.get(
                 "db"
@@ -555,8 +560,18 @@ class EngineAdapter:
                     qualified_target = _qualified(target_table, default_catalog)
             return (
                 default_catalog is not None
-                and _qualified(node, default_catalog) == qualified_target
+                and qualified_target is not None
+                and _table_parts(_qualified(node, default_catalog))
+                == _table_parts(qualified_target)
             )
+
+        def _replace_target_table(node: exp.Expr, replacement_table: exp.Table) -> exp.Expr:
+            if not _is_target_table(node):
+                return node
+            replacement = replacement_table.copy()
+            if isinstance(node, exp.Table) and node.args.get("alias") is not None:
+                replacement.set("alias", node.args["alias"].copy())
+            return replacement
 
         self_referencing = any(_is_target_table(table) for table in query.find_all(exp.Table))
         # If a query references itself then it must have a table created regardless of approach used.
@@ -601,9 +616,7 @@ class EngineAdapter:
             ) as temp_table:
                 for source_query in source_queries:
                     source_query.add_transform(
-                        lambda node: (  # type: ignore
-                            temp_table if _is_target_table(node) else node  # type: ignore
-                        )
+                        lambda node: _replace_target_table(node, temp_table)  # type: ignore
                     )
                 return self._insert_overwrite_by_condition(
                     target_table,

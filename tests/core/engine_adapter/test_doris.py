@@ -4865,11 +4865,12 @@ def test_doris_4_1_native_merge_into_and_timestamptz(
     adapter.cursor.execute.side_effect = _flaky_execute
     adapter.alter_table(
         [
-            parse_one(
-                "ALTER TABLE `db`.`t` MODIFY COLUMN `a` BIGINT", into=exp.Alter, read="doris"
+            t.cast(
+                exp.Alter, parse_one("ALTER TABLE `db`.`t` MODIFY COLUMN `a` BIGINT", read="doris")
             ),
-            parse_one(
-                "ALTER TABLE `db`.`t` MODIFY COLUMN `b` DATETIME(6)", into=exp.Alter, read="doris"
+            t.cast(
+                exp.Alter,
+                parse_one("ALTER TABLE `db`.`t` MODIFY COLUMN `b` DATETIME(6)", read="doris"),
             ),
         ]
     )
@@ -5064,6 +5065,7 @@ def test_iceberg_reading_time_travel_branch_and_compaction_ddl(
 
 def test_doris_4_1_search_indexes_compaction_and_sequence_col(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
@@ -5172,3 +5174,29 @@ def test_doris_4_1_search_indexes_compaction_and_sequence_col(
     assert any(
         "PROPERTIES ('function_column.sequence_col'='updated_at')" in call for call in sql_calls
     )
+
+    # 5. Self-referencing replace_query with aliased, default-catalog-qualified table reference preserves alias
+    adapter._default_catalog = "internal"
+    adapter.cursor.execute.reset_mock()
+    mocker.patch("sqlmesh.core.engine_adapter.doris.random_id", return_value="abcd1234")
+    mocker.patch.object(
+        adapter,
+        "get_data_object",
+        return_value=DataObject(
+            catalog="internal", schema="db", name="tbl", type=DataObjectType.TABLE
+        ),
+    )
+    adapter.replace_query(
+        "db.tbl",
+        parse_one("SELECT t.id, t.val FROM internal.db.tbl AS t", read="doris"),
+        target_columns_to_types={
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "val": exp.DataType.build("INT", dialect="doris"),
+        },
+    )
+    self_ref_calls = to_sql_calls(adapter)
+    assert any(
+        "CREATE TABLE IF NOT EXISTS `internal`.`db`.`__temp_tbl_abcd1234`" in c
+        for c in self_ref_calls
+    )
+    assert any("FROM `internal`.`db`.`__temp_tbl_abcd1234` AS `t`" in c for c in self_ref_calls)

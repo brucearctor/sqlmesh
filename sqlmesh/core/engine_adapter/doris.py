@@ -1644,9 +1644,11 @@ class DorisEngineAdapter(
                     exists=exists,
                 )
             )
+            self._wait_for_schema_change(table_name)
             return
         col_names = tuple(c.name if isinstance(c, exp.Expr) else str(c) for c in columns)
         super().create_index(table_name, index_name, col_names, exists=exists)
+        self._wait_for_schema_change(table_name)
 
     def _create_table_like(
         self,
@@ -4098,17 +4100,32 @@ class DorisEngineAdapter(
         first_query = source_queries[0].query_factory() if source_queries else None
 
         def _matches_target_table(t_node: exp.Table) -> bool:
-            if quote_identifiers(t_node.copy()) == quote_identifiers(table.copy()):
+            q_node = quote_identifiers(t_node.copy())
+            q_target = quote_identifiers(table.copy())
+            if (q_node.args.get("catalog"), q_node.args.get("db"), q_node.this) == (
+                q_target.args.get("catalog"),
+                q_target.args.get("db"),
+                q_target.this,
+            ):
                 return True
-            if self.default_catalog:
-                norm_node = t_node.copy()
-                if not norm_node.catalog and norm_node.db:
-                    norm_node.set("catalog", exp.parse_identifier(self.default_catalog))
-                norm_target = table.copy()
-                if not norm_target.catalog and norm_target.db:
-                    norm_target.set("catalog", exp.parse_identifier(self.default_catalog))
-                return quote_identifiers(norm_node) == quote_identifiers(norm_target)
-            return False
+            default_cat = self.default_catalog or "internal"
+            norm_node = t_node.copy()
+            if not norm_node.catalog and norm_node.db:
+                norm_node.set("catalog", exp.parse_identifier(default_cat))
+            norm_target = table.copy()
+            if not norm_target.catalog and norm_target.db:
+                norm_target.set("catalog", exp.parse_identifier(default_cat))
+            q_norm_node = quote_identifiers(norm_node)
+            q_norm_target = quote_identifiers(norm_target)
+            return (
+                q_norm_node.args.get("catalog"),
+                q_norm_node.args.get("db"),
+                q_norm_node.this,
+            ) == (
+                q_norm_target.args.get("catalog"),
+                q_norm_target.args.get("db"),
+                q_norm_target.this,
+            )
 
         self_referencing = bool(
             first_query

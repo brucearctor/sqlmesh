@@ -872,3 +872,63 @@ def test_doris_4_1_native_merge_segment_v3_and_ann_index(ctx: TestContext):
     )
     seq_rows = doris_adapter.fetchall(exp.select("id", "val", "ver").from_(seq_tbl))
     assert list(seq_rows) == [(1, "v10", 10)]
+
+    # 7. Self-referencing replace_query with aliased, catalog-qualified `internal.<db>.<tbl> AS t`
+    self_ref_tbl = ctx.table("test_doris_self_ref")
+    self_ref_cols = {
+        "id": exp.DataType.build("INT", dialect="doris"),
+        "val": exp.DataType.build("INT", dialect="doris"),
+    }
+    doris_adapter.create_table(self_ref_tbl, self_ref_cols)
+    doris_adapter.execute(
+        f"INSERT INTO {doris_adapter._to_sql(self_ref_tbl)} (`id`, `val`) VALUES (1, 10), (2, 20)"
+    )
+    prev_default_cat = doris_adapter._default_catalog
+    try:
+        doris_adapter._default_catalog = "internal"
+        doris_adapter.replace_query(
+            self_ref_tbl,
+            parse_one(
+                f"SELECT t.id, t.val + 5 AS val FROM `internal`.`{self_ref_tbl.db}`.`{self_ref_tbl.name}` AS t",
+                read="doris",
+            ),
+            target_columns_to_types=self_ref_cols,
+        )
+    finally:
+        doris_adapter._default_catalog = prev_default_cat
+    self_ref_rows = doris_adapter.fetchall(
+        exp.select("id", "val").from_(self_ref_tbl).order_by("id")
+    )
+    assert list(self_ref_rows) == [(1, 15), (2, 25)]
+
+    # 8. NGRAM_BF index creation + BUILD INDEX on INVERTED index + TIMESTAMPTZ cross-timezone normalize_value equivalence
+    doris_adapter.create_index(
+        fts_tbl,
+        "idx_msg_ngram",
+        [exp.to_column("msg")],
+        index_type="NGRAM_BF",
+        index_properties={"gram_size": "3", "bf_size": "256"},
+    )
+    doris_adapter.execute(
+        parse_one(
+            f"BUILD INDEX idx_msg ON {doris_adapter._to_sql(fts_tbl)}",
+            read="doris",
+        )
+    )
+    norm_tz = doris_adapter.normalize_value(
+        exp.to_column("ts"),
+        exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris"),
+        timestamp_precision=6,
+    )
+    tz_check_rows = doris_adapter.fetchall(
+        exp.select(norm_tz.as_("utc_str")).from_(
+            parse_one(
+                "(SELECT CAST('2024-06-01 12:00:00.123456+08:00' AS TIMESTAMPTZ(6)) AS ts "
+                "UNION ALL "
+                "SELECT CAST('2024-06-01 04:00:00.123456+00:00' AS TIMESTAMPTZ(6)) AS ts) t",
+                read="doris",
+            )
+        )
+    )
+    assert len(tz_check_rows) == 2
+    assert tz_check_rows[0][0] == tz_check_rows[1][0] == "2024-06-01 04:00:00.123456"
