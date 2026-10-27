@@ -1793,6 +1793,7 @@ def extend_sqlglot() -> None:
             exp.DataType.Type.IPV4: "IPV4",
             exp.DataType.Type.IPV6: "IPV6",
             exp.DataType.Type.JSONB: "JSONB",
+            exp.DataType.Type.TIMESTAMPTZ: "TIMESTAMPTZ",
             exp.DataType.Type.VARIANT: "VARIANT",
         }
     )

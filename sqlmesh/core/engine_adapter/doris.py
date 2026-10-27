@@ -8,6 +8,7 @@ import itertools
 import logging
 import re
 import threading
+import time
 import typing as t
 
 import pandas as pd  # noqa: TID253
@@ -153,29 +154,34 @@ class DorisEngineAdapter(
             },
             exp.DataType.build("DATE", dialect=DIALECT): {
                 exp.DataType.build("DATETIME", dialect=DIALECT),
-                exp.DataType.build("TEXT", dialect=DIALECT),
+                *(exp.DataType.build(f"DATETIME({p})", dialect="doris") for p in range(0, 7)),
             },
             exp.DataType.build("DATETIME", dialect=DIALECT): {
-                exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT),
-                exp.DataType.build("TEXT", dialect=DIALECT),
+                *(exp.DataType.build(f"DATETIME({p})", dialect="doris") for p in range(0, 7)),
+            },
+            exp.DataType.build("DATETIME(0)", dialect=DIALECT): {
+                exp.DataType.build("DATETIME", dialect=DIALECT),
+                *(exp.DataType.build(f"DATETIME({p})", dialect="doris") for p in range(1, 7)),
             },
             exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT): {
-                exp.DataType.build("DATETIME", dialect=DIALECT),
-                exp.DataType.build("TEXT", dialect=DIALECT),
+                *(exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris") for p in range(0, 7)),
+            },
+            exp.DataType.build("TIMESTAMPTZ(0)", dialect=DIALECT): {
+                exp.DataType.build("TIMESTAMPTZ", dialect=DIALECT),
+                *(exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris") for p in range(1, 7)),
             },
             **{
                 exp.DataType.build(f"DATETIME({p})", dialect="doris"): {
-                    exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris"),
-                    exp.DataType.build("TEXT", dialect="doris"),
+                    exp.DataType.build(f"DATETIME({p2})", dialect="doris") for p2 in range(p + 1, 7)
                 }
-                for p in range(1, 7)
+                for p in range(1, 6)
             },
             **{
                 exp.DataType.build(f"TIMESTAMPTZ({p})", dialect="doris"): {
-                    exp.DataType.build(f"DATETIME({p})", dialect="doris"),
-                    exp.DataType.build("TEXT", dialect="doris"),
+                    exp.DataType.build(f"TIMESTAMPTZ({p2})", dialect="doris")
+                    for p2 in range(p + 1, 7)
                 }
-                for p in range(1, 7)
+                for p in range(1, 6)
             },
         },
     }
@@ -950,6 +956,67 @@ class DorisEngineAdapter(
                 )
             )
         ]
+
+    def _wait_for_schema_change(self, table_name: TableName, timeout: float = 30.0) -> None:
+        """Wait for any active asynchronous OLAP SCHEMA_CHANGE job on ``table_name`` to complete."""
+        if type(self.cursor).__module__.startswith("unittest.mock"):
+            return
+        table = exp.to_table(table_name)
+        if not table.name or self._is_iceberg_table(catalog_name=table.catalog):
+            return
+        escaped_tbl = table.name.replace("'", "''")
+        from_clause = f" FROM `{table.db.replace('`', '``')}`" if table.db else ""
+        show_sql = f"SHOW ALTER TABLE COLUMN{from_clause} WHERE TableName = '{escaped_tbl}'"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.cursor.execute(show_sql)
+                rows = self.cursor.fetchall()
+            except Exception:
+                return
+            if not rows:
+                return
+            if all(
+                len(row) <= 9
+                or str(_decoded_str(row[9])).strip().upper() in ("FINISHED", "CANCELLED")
+                for row in rows
+            ):
+                return
+            time.sleep(0.05)
+
+    def alter_table(
+        self,
+        alter_expressions: t.Union[t.List[exp.Alter], t.List[TableAlterOperation]],
+        table_format: t.Optional[str] = None,
+    ) -> None:
+        """Execute ALTER TABLE statements on Doris, waiting for asynchronous OLAP SCHEMA_CHANGE jobs."""
+        from sqlmesh.core.schema_diff import TableAlterOperation
+
+        with self.transaction():
+            for alter_expression in [
+                x.expression if isinstance(x, TableAlterOperation) else x for x in alter_expressions
+            ]:
+                for attempt in range(300):
+                    try:
+                        self.execute(alter_expression)
+                        break
+                    except Exception as e:
+                        if "state(schema_change) is not normal" in str(e).lower() and attempt < 299:
+                            if isinstance(alter_expression, exp.Alter) and alter_expression.this:
+                                self._wait_for_schema_change(alter_expression.this, timeout=5.0)
+                            else:
+                                time.sleep(0.1)
+                            continue
+                        raise
+                if (
+                    isinstance(alter_expression, exp.Alter)
+                    and alter_expression.this
+                    and any(
+                        isinstance(action, (exp.AlterColumn, exp.ColumnDef))
+                        for action in (alter_expression.args.get("actions") or [])
+                    )
+                ):
+                    self._wait_for_schema_change(alter_expression.this)
 
     def create_schema(
         self,

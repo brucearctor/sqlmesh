@@ -624,29 +624,41 @@ def test_doris_complex_types_and_alter_table_schema_evolution(ctx: TestContext):
     assert "100" in str(diff_rows[0][0])
     assert "42" in str(diff_rows[0][0])
 
-    # 2. Live schema evolution (ADD COLUMN + MODIFY COLUMN + suppressed key-column VARCHAR(255)->STRING no-op)
+    # 2. Live schema evolution (ADD COLUMN + multiple MODIFY COLUMN widenings + suppressed key-column VARCHAR->STRING no-op)
     cur_tbl = ctx.table("test_alter_cur")
     tgt_tbl = ctx.table("test_alter_tgt")
     ctx.engine_adapter.create_table(
         cur_tbl,
         {
-            "code": exp.DataType.build("TEXT", dialect="doris"),
+            "key_code": exp.DataType.build("VARCHAR(32)", dialect="doris"),
             "notes": exp.DataType.build("VARCHAR(32)", dialect="doris"),
+            "cnt": exp.DataType.build("INT", dialect="doris"),
+            "dt": exp.DataType.build("DATETIME(0)", dialect="doris"),
+            "tz": exp.DataType.build("TIMESTAMPTZ(0)", dialect="doris"),
         },
+        table_properties={"duplicate_key": exp.Tuple(expressions=[exp.to_column("key_code")])},
     )
     ctx.engine_adapter.create_table(
         tgt_tbl,
         {
-            "code": exp.DataType.build("TEXT", dialect="doris"),
+            "key_code": exp.DataType.build("VARCHAR(32)", dialect="doris"),
             "notes": exp.DataType.build("TEXT", dialect="doris"),
+            "cnt": exp.DataType.build("BIGINT", dialect="doris"),
+            "dt": exp.DataType.build("DATETIME(6)", dialect="doris"),
+            "tz": exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris"),
             "extra_cnt": exp.DataType.build("BIGINT", dialect="doris"),
         },
+        table_properties={"duplicate_key": exp.Tuple(expressions=[exp.to_column("key_code")])},
     )
     alter_ops = ctx.engine_adapter.get_alter_operations(cur_tbl, tgt_tbl)
     ctx.engine_adapter.alter_table(alter_ops)
     evolved_cols = ctx.engine_adapter.columns(cur_tbl)
     assert "extra_cnt" in evolved_cols
-    assert evolved_cols["code"] == exp.DataType.build("TEXT", dialect="doris")
+    assert evolved_cols["key_code"] == exp.DataType.build("VARCHAR(32)", dialect="doris")
+    assert evolved_cols["notes"] == exp.DataType.build("TEXT", dialect="doris")
+    assert evolved_cols["cnt"] == exp.DataType.build("BIGINT", dialect="doris")
+    assert evolved_cols["dt"] == exp.DataType.build("DATETIME(6)", dialect="doris")
+    assert evolved_cols["tz"] == exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris")
 
     # 3. Direct time-transform inequality delete on OLAP table
     ev_tbl = ctx.table("test_time_ineq_del")

@@ -3235,8 +3235,8 @@ def test_schema_differ_text_widening_largeint_and_key_protection(
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
-    # 1. Widening non-key value columns to TEXT (`INT -> TEXT`, `DATE -> TEXT`) emits in-place
-    #    `MODIFY COLUMN ... TEXT` operations instead of destructive `DROP` + `ADD`.
+    # 1. Widening non-key value columns (`INT -> TEXT`, `DATE -> DATETIME(6)`) emits in-place
+    #    `MODIFY COLUMN` operations instead of destructive `DROP` + `ADD`.
     mocker.patch.object(
         adapter.cursor,
         "fetchall",
@@ -3249,7 +3249,7 @@ def test_schema_differ_text_widening_largeint_and_key_protection(
             [
                 ("id", "INT", "Yes", "true", None, ""),
                 ("val", "TEXT", "Yes", "false", None, ""),
-                ("dt", "TEXT", "Yes", "false", None, ""),
+                ("dt", "DATETIME(6)", "Yes", "false", None, ""),
             ],
         ],
     )
@@ -3261,7 +3261,7 @@ def test_schema_differ_text_widening_largeint_and_key_protection(
     adapter.alter_table(ops_widen)
     assert to_sql_calls(adapter) == [
         "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `val` STRING",
-        "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `dt` STRING",
+        "ALTER TABLE `db`.`current_tbl` MODIFY COLUMN `dt` DATETIME(6)",
     ]
 
     # 2. `LARGEINT` vs `INT128` is treated as mutually compatible and produces zero alter operations.
@@ -4805,7 +4805,11 @@ def test_doris_4_1_native_merge_into_and_timestamptz(
         == "CAST(DATE_FORMAT(CONVERT_TZ(`ts`, @@time_zone, '+00:00'), '%Y-%m-%d %T.%f') AS VARCHAR)"
     )
 
-    # 4. TIMESTAMPTZ defaults to precision 0 and is non-destructively compatible with TIMESTAMPTZ(0), TIMESTAMPTZ(6), and DATETIME(6)
+    # 4. TIMESTAMPTZ renders as TIMESTAMPTZ (not MySQL's TIMESTAMP), defaults to precision 0, and supports
+    #    same-type precision widening (TIMESTAMPTZ -> TIMESTAMPTZ(0) -> TIMESTAMPTZ(6), DATETIME(2) -> DATETIME(6)),
+    #    while cross-type TIMESTAMPTZ <-> DATETIME is treated as destructive.
+    assert exp.DataType.build("TIMESTAMPTZ", dialect="doris").sql("doris") == "TIMESTAMPTZ"
+    assert exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris").sql("doris") == "TIMESTAMPTZ(6)"
     from sqlmesh.core.schema_diff import TableAlterChangeColumnTypeOperation
 
     ops_default = adapter.schema_differ.compare_columns(
@@ -4820,14 +4824,57 @@ def test_doris_4_1_native_merge_into_and_timestamptz(
     )
     ops = adapter.schema_differ.compare_columns(
         "t",
+        {"ts": exp.DataType.build("TIMESTAMPTZ(2)", dialect="doris")},
         {"ts": exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris")},
-        {"ts": exp.DataType.build("DATETIME(6)", dialect="doris")},
     )
     assert (
         len(ops) == 1
         and isinstance(ops[0], TableAlterChangeColumnTypeOperation)
         and ops[0].is_part_of_destructive_change is False
     )
+    ops_dt = adapter.schema_differ.compare_columns(
+        "t",
+        {"dt": exp.DataType.build("DATETIME(2)", dialect="doris")},
+        {"dt": exp.DataType.build("DATETIME(6)", dialect="doris")},
+    )
+    assert (
+        len(ops_dt) == 1
+        and isinstance(ops_dt[0], TableAlterChangeColumnTypeOperation)
+        and ops_dt[0].is_part_of_destructive_change is False
+    )
+    ops_cross = adapter.schema_differ.compare_columns(
+        "t",
+        {"ts": exp.DataType.build("TIMESTAMPTZ(6)", dialect="doris")},
+        {"ts": exp.DataType.build("DATETIME(6)", dialect="doris")},
+        ignore_destructive=True,
+    )
+    assert ops_cross == []
+
+    # 5. alter_table retries when Doris raises `state(SCHEMA_CHANGE) is not NORMAL`
+    call_count = 0
+
+    def _flaky_execute(sql: str, **kwargs: t.Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError(
+                "errCode = 2, detailMessage = Table[t]'s state(SCHEMA_CHANGE) is not NORMAL. Do not allow doing ALTER ops"
+            )
+
+    adapter.cursor.execute.reset_mock()
+    adapter.cursor.execute.side_effect = _flaky_execute
+    adapter.alter_table(
+        [
+            parse_one(
+                "ALTER TABLE `db`.`t` MODIFY COLUMN `a` BIGINT", into=exp.Alter, read="doris"
+            ),
+            parse_one(
+                "ALTER TABLE `db`.`t` MODIFY COLUMN `b` DATETIME(6)", into=exp.Alter, read="doris"
+            ),
+        ]
+    )
+    assert call_count == 3
+    adapter.cursor.execute.side_effect = None
 
 
 def test_lance_table_reading_and_write_guard(
