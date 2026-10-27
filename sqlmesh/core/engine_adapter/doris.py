@@ -353,7 +353,6 @@ class DorisEngineAdapter(
 
     _READ_ONLY_EXTERNAL_FORMATS: t.ClassVar[t.Dict[str, str]] = {
         "lance": "Lance",
-        "paimon": "Paimon",
         "hudi": "Hudi",
         "deltalake": "Delta Lake",
         "delta": "Delta Lake",
@@ -412,11 +411,11 @@ class DorisEngineAdapter(
     ) -> bool:
         if self._is_lance_table(table_format=table_format, table_properties=table_properties):
             return False
-        if table_format and str(table_format).strip().lower() in ("iceberg", "hive"):
+        if table_format and str(table_format).strip().lower() in ("iceberg", "paimon", "hive"):
             return True
         if table_properties:
             engine_val = self._extract_str_value(table_properties.get("engine"))
-            if engine_val and engine_val.strip().lower() in ("iceberg", "hive"):
+            if engine_val and engine_val.strip().lower() in ("iceberg", "paimon", "hive"):
                 return True
         effective_catalog = catalog_name or self.default_catalog
         if effective_catalog and str(effective_catalog).strip().lower() != "internal":
@@ -5454,23 +5453,28 @@ class DorisEngineAdapter(
             table_properties=table_properties_copy,
         )
 
-        # Pop Iceberg/Hive engine property if present so it is not duplicated in PROPERTIES (...)
+        # Pop Iceberg/Paimon/Hive engine property if present so it is not duplicated in PROPERTIES (...)
         explicit_engine = self._extract_str_value(table_properties_copy.pop("engine", None)) or (
             str(table_format).strip().lower() if table_format else None
         )
+        engine_lower = explicit_engine.strip().lower() if explicit_engine else None
         if is_iceberg and is_schema_ddl:
-            engine_name = (
-                "hive"
-                if explicit_engine and explicit_engine.strip().lower() == "hive"
-                else "iceberg"
-            )
+            engine_name = engine_lower if engine_lower in ("hive", "paimon") else "iceberg"
             properties.append(exp.EngineProperty(this=exp.var(engine_name)))
 
         if storage_format and not is_materialized_view:
             sf_str = str(storage_format).strip().strip("'").strip('"')
             if sf_str:
                 if is_iceberg:
-                    if (
+                    if engine_lower == "paimon":
+                        table_properties_copy.setdefault(
+                            "file.format", exp.Literal.string(sf_str.lower())
+                        )
+                    elif engine_lower == "hive":
+                        table_properties_copy.setdefault(
+                            "file_format", exp.Literal.string(sf_str.lower())
+                        )
+                    elif (
                         "write-format" not in table_properties_copy
                         and "write.format.default" not in table_properties_copy
                     ):
@@ -5612,6 +5616,24 @@ class DorisEngineAdapter(
                 partitioned_by = (
                     chosen_part_by if isinstance(chosen_part_by, list) else [chosen_part_by]
                 )
+
+        if (
+            is_iceberg
+            and engine_lower == "paimon"
+            and unique_key_cols
+            and "primary-key" not in table_properties_copy
+        ):
+            paimon_pk_cols = [col_by_lower.get(k.lower(), k) for k in unique_key_cols]
+            if partitioned_by:
+                parsed_paimon_part, _ = self._parse_partition_expressions(partitioned_by)
+                pk_lower_set = {k.lower() for k in paimon_pk_cols}
+                for expr in parsed_paimon_part:
+                    for col_node in expr.find_all(exp.Column):
+                        part_col_name = col_by_lower.get(col_node.name.lower(), col_node.name)
+                        if part_col_name.lower() not in pk_lower_set:
+                            paimon_pk_cols.append(part_col_name)
+                            pk_lower_set.add(part_col_name.lower())
+            table_properties_copy["primary-key"] = exp.Literal.string(",".join(paimon_pk_cols))
 
         if not is_iceberg:
             specified_key_types = [

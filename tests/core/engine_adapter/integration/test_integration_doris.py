@@ -105,6 +105,47 @@ def test_doris_iceberg_local_catalog(ctx: TestContext):
             read="doris",
         )
         adapter.execute(compact_expr, quote_identifiers=False)
+
+        # Also verify writable Apache Paimon local catalog DDL & schema evolution on Doris 4.1+
+        paimon_cat = f"local_paimon_{ctx.test_id}"
+        paimon_db = f"paimon_db_{ctx.test_id}"
+        paimon_tbl = f"{paimon_cat}.{paimon_db}.orders"
+        try:
+            adapter.execute(
+                f"""
+                CREATE CATALOG IF NOT EXISTS `{paimon_cat}` PROPERTIES (
+                    'type' = 'paimon',
+                    'warehouse' = 'file:///tmp/doris_paimon_warehouse/{paimon_cat}'
+                )
+                """,
+                quote_identifiers=False,
+            )
+            adapter.create_schema(f"{paimon_cat}.{paimon_db}")
+            adapter.create_table(
+                paimon_tbl,
+                {
+                    "id": exp.DataType.build("int"),
+                    "ds": exp.DataType.build("date"),
+                },
+                table_format="paimon",
+                storage_format="parquet",
+                partitioned_by=[exp.to_column("ds")],
+                unique_key=[exp.to_column("id")],
+            )
+            paimon_cols = adapter.columns(paimon_tbl)
+            assert "id" in paimon_cols
+            assert "ds" in paimon_cols
+        finally:
+            try:
+                adapter.drop_schema(
+                    f"{paimon_cat}.{paimon_db}", ignore_if_not_exists=True, cascade=True
+                )
+            except Exception:
+                pass
+            try:
+                adapter.execute(f"DROP CATALOG IF EXISTS `{paimon_cat}`", quote_identifiers=False)
+            except Exception:
+                pass
     finally:
         try:
             adapter.drop_schema(

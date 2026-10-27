@@ -440,9 +440,34 @@ SQLMesh's Doris dialect natively parses and transpiles Apache Iceberg snapshot t
   );
   ```
 
-### Pattern 4: Reading External Lance Tables & Catalogs (Doris 4.1+)
+### Pattern 4: Reading & Writing External Apache Paimon and Apache Hive Catalogs
 
-Apache Doris 4.1+ supports reading multimodal and vector datasets stored in **Lance** format via external Lance catalogs (`'type' = 'lance'`) or table-valued functions (`'format' = 'lance'`).
+In addition to Apache Iceberg, `DorisEngineAdapter` supports reading and writing external **Apache Paimon** (`'type' = 'paimon'`, `table_format paimon`) and **Apache Hive** (`'type' = 'hms'`, `table_format hive`) catalogs:
+
+- **Apache Paimon (`table_format paimon`)**: Emits `ENGINE=paimon`, maps `storage_format` to `'file.format'` (`'parquet'` or `'orc'`), and automatically populates Paimon's `'primary-key'` property from `unique_key` (including partition columns when `partitioned_by` is set) so Doris 4.1+ row-level `DELETE` and `MERGE INTO` work out of the box.
+- **Apache Hive (`table_format hive`)**: Emits `ENGINE=hive` and maps `storage_format` to `'file_format'` (`'parquet'`, `'orc'`, or `'text'`). Supports `FULL` (`INSERT OVERWRITE TABLE`) and append workloads (`INCREMENTAL_UNMANAGED`), while row-level `DELETE` and `MERGE INTO` are not supported by Hive catalogs in Doris.
+
+```sql
+MODEL (
+  name paimon_catalog.silver.orders_paimon,
+  kind INCREMENTAL_BY_UNIQUE_KEY (
+    unique_key order_id
+  ),
+  table_format paimon,
+  storage_format parquet,
+  partitioned_by (ds)
+);
+
+SELECT
+  order_id::BIGINT AS order_id,
+  amount::DECIMAL(18, 2) AS amount,
+  ds::DATE AS ds
+FROM hive_catalog.raw.orders;
+```
+
+### Pattern 5: Reading External Lance, Hudi & Delta Lake Tables (Doris 4.1+)
+
+Apache Doris 4.1+ supports reading multimodal and vector datasets stored in **Lance** format (`'type' = 'lance'` catalog or `s3(...)` / `gcs(...)` / `hdfs(...)` / `local(...)` table-valued functions with `'format' = 'lance'`), as well as external **Apache Hudi** (`'type' = 'hudi'`) and **Delta Lake** (`'type' = 'deltalake'`) catalogs.
 
 ```yaml
 # config.yaml
@@ -472,8 +497,8 @@ SELECT
 FROM lance_catalog.multimodal.clip_embeddings;
 ```
 
-!!! warning "Lance Tables are Read-Only in Doris 4.1"
-    Doris 4.1 supports Lance catalogs and `format = 'lance'` table-valued functions for reading only (`CREATE TABLE`, `INSERT`, and `CTAS` are not supported by Doris on Lance catalogs). If a SQLMesh model is configured to materialize into a Lance catalog or sets `table_format = 'lance'`, `DorisEngineAdapter` raises a descriptive `SQLMeshError` directing you to materialize into the `internal` OLAP catalog or an `iceberg` catalog instead.
+!!! warning "Lance, Hudi, and Delta Lake Tables are Read-Only in Doris"
+    Doris supports Lance, Hudi, Delta Lake, and LakeSoul catalogs and `format = 'lance'` table-valued functions for reading only (`CREATE TABLE`, `INSERT`, and `CTAS` are not supported by Doris on those formats). If a SQLMesh model sets `table_format` (or `engine`) to `lance`, `hudi`, `deltalake`, or `lakesoul`, `DorisEngineAdapter` raises a descriptive `SQLMeshError` directing you to materialize into the `internal` OLAP catalog or a writable external catalog (`iceberg`, `paimon`, or `hive`).
 
 ---
 
@@ -746,18 +771,18 @@ MODEL (
 
 ## Supported Model Kinds & Catalog Matrix
 
-| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal` on Local Disk or S3/GCS Storage Vault) | External Apache Iceberg Catalog (`table_format iceberg` on S3/GCS/HDFS) | External Read-Only Lakehouse Catalogs (`lance`, `paimon`, `hudi`, `deltalake`) |
-| --- | :---: | :---: | :---: |
-| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported (Read-Only via Catalog or S3/GCS TVF) |
-| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris (Write Guarded) |
-| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`; requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
-| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`; requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
-| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (`INSERT OVERWRITE` on Doris 2.1+; partition `DELETE` + `INSERT` requires Doris 4.1.0+ & Iceberg v2) | Read-Only in Doris (Write Guarded) |
-| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported (Requires Doris 4.1.0+ & Iceberg v2 for row-level `DELETE`) | Read-Only in Doris (Write Guarded) |
-| `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) | Requires `internal` catalog (`environment_catalog_mapping`) |
-| `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs | Not supported by Doris inside external catalogs |
-| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported | Read-Only in Doris (Write Guarded) |
-| `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported | Not supported (Read-Only) |
+| SQLMesh Model Kind | Doris Internal OLAP Catalog (`internal` on Local Disk or S3/GCS Storage Vault) | External Iceberg & Paimon Catalogs (`table_format iceberg \| paimon` on S3/GCS/HDFS) | External Hive Catalog (`table_format hive` on S3/GCS/HDFS) | External Read-Only Lakehouse Catalogs (`lance`, `hudi`, `deltalake`, `lakesoul`) |
+| --- | :---: | :---: | :---: | :---: |
+| Source / Upstream `SELECT` | Supported | Supported (incl. `FOR TIME/VERSION AS OF`, `@branch`, `@tag`) | Supported | Supported (Read-Only via Catalog or S3/GCS TVF) |
+| `FULL` | Supported (`CREATE TABLE ... AS SELECT` / `DELETE` + `INSERT`) | Supported (`CREATE TABLE ... ENGINE=iceberg\|paimon` / `INSERT OVERWRITE TABLE`) | Supported (`CREATE TABLE ... ENGINE=hive` / `INSERT OVERWRITE TABLE`) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_TIME_RANGE` | Supported (`DELETE WHERE time_col >= low AND time_col <= high` + `INSERT`) | Supported (`DELETE` + `INSERT`; requires Doris 4.1.0+ & Iceberg v2 / Paimon PK) | Not supported by Hive in Doris (No row-level `DELETE`) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_UNIQUE_KEY` | Supported (Auto-promotes `unique_key` to `UNIQUE KEY`, `DELETE ... USING` + `INSERT` or native `MERGE INTO` when `when_matched` / `merge_filter` is specified) | Supported (Batched key `DELETE` + `INSERT` or native `MERGE INTO`; requires Doris 4.1.0+ & Iceberg v2 / Paimon PK) | Not supported by Hive in Doris (No `DELETE` / `MERGE INTO`) | Read-Only in Doris (Write Guarded) |
+| `INCREMENTAL_BY_PARTITION` | Supported (Column & time-truncation range `DELETE` + `INSERT`) | Supported (Partition `DELETE` + `INSERT`; requires Doris 4.1.0+ & Iceberg v2 / Paimon PK) | Not supported by Hive in Doris (No `DELETE`) | Read-Only in Doris (Write Guarded) |
+| `SCD_TYPE_2_BY_TIME` / `SCD_TYPE_2_BY_COLUMN` | Supported | Supported (Requires Doris 4.1.0+ & Iceberg v2 / Paimon PK for row-level `DELETE`) | Not supported by Hive in Doris (No `DELETE`) | Read-Only in Doris (Write Guarded) |
+| `VIEW` | Supported (`CREATE OR REPLACE VIEW`) | Requires `internal` catalog (`environment_catalog_mapping`) | Requires `internal` catalog (`environment_catalog_mapping`) | Requires `internal` catalog (`environment_catalog_mapping`) |
+| `VIEW (materialized true)` | Supported (Async MTMV & Sync MV with `materialized_type = 'SYNC'`) | Not supported by Doris inside external catalogs | Not supported by Doris inside external catalogs | Not supported by Doris inside external catalogs |
+| `SEED` / Python DataFrame Models | Supported (Automatic `VARCHAR(255)` OLAP key coercion) | Supported | Supported | Read-Only in Doris (Write Guarded) |
+| `CUSTOM ('doris_ddl_only')` | Supported (DDL + `ALTER TABLE` schema evolution only) | Supported | Supported | Not supported (Read-Only) |
 
 ---
 

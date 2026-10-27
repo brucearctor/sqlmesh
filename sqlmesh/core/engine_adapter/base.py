@@ -526,23 +526,37 @@ class EngineAdapter:
             target_columns_to_types = self.columns(target_table)
         query = source_queries[0].query_factory()
 
-        default_catalog = self.default_catalog
+        quoted_target = quote_identifiers(target_table.copy())
+        default_catalog: t.Optional[str] = None
+        default_catalog_loaded = False
+        qualified_target: t.Optional[exp.Table] = None
 
-        def _qualified(table: exp.Table) -> exp.Table:
+        def _qualified(table: exp.Table, catalog: str) -> exp.Table:
             table = table.copy()
-            if default_catalog and not table.catalog and table.db:
-                table.set("catalog", exp.parse_identifier(default_catalog))
+            if not table.catalog and table.db:
+                table.set("catalog", exp.parse_identifier(catalog))
             return quote_identifiers(table)
 
-        quoted_target = quote_identifiers(target_table.copy())
-        qualified_target = _qualified(target_table)
-
         def _is_target_table(node: exp.Expr) -> bool:
+            nonlocal default_catalog, default_catalog_loaded, qualified_target
             if not isinstance(node, exp.Table):
                 return False
-            if quote_identifiers(node.copy()) == quoted_target:
+            quoted_node = quote_identifiers(node.copy())
+            if quoted_node == quoted_target:
                 return True
-            return bool(default_catalog) and _qualified(node) == qualified_target
+            if quoted_node.this != quoted_target.this or quoted_node.args.get(
+                "db"
+            ) != quoted_target.args.get("db"):
+                return False
+            if not default_catalog_loaded:
+                default_catalog = self.default_catalog
+                default_catalog_loaded = True
+                if default_catalog:
+                    qualified_target = _qualified(target_table, default_catalog)
+            return (
+                default_catalog is not None
+                and _qualified(node, default_catalog) == qualified_target
+            )
 
         self_referencing = any(_is_target_table(table) for table in query.find_all(exp.Table))
         # If a query references itself then it must have a table created regardless of approach used.

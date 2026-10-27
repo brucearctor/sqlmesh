@@ -4875,14 +4875,32 @@ def test_lance_table_reading_and_write_guard(
             table_properties={"engine": exp.Literal.string("lance")},
         )
 
-    with pytest.raises(SQLMeshError, match="Doris Paimon tables are read-only"):
+    with pytest.raises(SQLMeshError, match="Doris Hudi tables are read-only"):
         adapter.create_table(
-            "paimon_cat.ml_db.out_tbl",
+            "hudi_cat.ml_db.out_tbl",
             target_columns_to_types={"id": exp.DataType.build("INT", dialect="doris")},
-            table_format="paimon",
+            table_format="hudi",
         )
 
-    # 4. External Hive catalog table creation emits ENGINE=hive and skips OLAP key reordering
+    # 4. External Paimon catalog table creation emits ENGINE=paimon, 'file.format', and 'primary-key'
+    adapter.cursor.execute.reset_mock()
+    adapter.create_table(
+        "paimon_cat.silver.orders",
+        target_columns_to_types={
+            "payload": exp.DataType.build("STRING", dialect="doris"),
+            "id": exp.DataType.build("INT", dialect="doris"),
+            "ds": exp.DataType.build("DATE", dialect="doris"),
+        },
+        table_format="paimon",
+        storage_format="parquet",
+        partitioned_by=[exp.to_column("ds")],
+        unique_key=[exp.to_column("id")],
+    )
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `paimon_cat`.`silver`.`orders` (`payload` STRING, `id` INT, `ds` DATE) ENGINE=paimon PARTITION BY LIST (`ds`) () PROPERTIES ('file.format'='parquet', 'primary-key'='id,ds')"
+    ]
+
+    # 5. External Hive catalog table creation emits ENGINE=hive, 'file_format', and skips OLAP key reordering
     adapter.cursor.execute.reset_mock()
     adapter.create_table(
         "hive_cat.raw_db.events",
@@ -4891,9 +4909,10 @@ def test_lance_table_reading_and_write_guard(
             "id": exp.DataType.build("INT", dialect="doris"),
         },
         table_format="hive",
+        storage_format="orc",
     )
     assert to_sql_calls(adapter) == [
-        "CREATE TABLE IF NOT EXISTS `hive_cat`.`raw_db`.`events` (`payload` STRING, `id` INT) ENGINE=hive"
+        "CREATE TABLE IF NOT EXISTS `hive_cat`.`raw_db`.`events` (`payload` STRING, `id` INT) ENGINE=hive PROPERTIES ('file_format'='orc')"
     ]
 
 
